@@ -21,6 +21,7 @@ EXPECTED_RUFF_POLICY: Final[dict[str, object]] = {
         'build',
         'dist',
         'tests',
+        'demo',
     ],
     'select': [
         'E',

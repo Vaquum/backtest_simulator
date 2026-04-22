@@ -4,11 +4,9 @@ Honest, gate-enforced backtester for unmodified Nexus strategies against unmodif
 
 The simulator runs strategies through the same paper-trading engine that drives live execution, against historical market data on hourly bars. Honesty gates fail fast, hard, and loud on look-ahead leakage, conservation violations, non-determinism, parity drift between live and replay, and worker-budget overruns. Statistical methodology — Combinatorial Purged Cross-Validation, Deflated Sharpe, Probability of Backtest Overfitting — follows López de Prado.
 
-See [SPEC.md](SPEC.md) for the full design.
-
 ## Status
 
-Bootstrap. The CI scaffolding (gate scripts, contract tests, ruleset, budget ratchets) is in place; the runtime layer lives in `demo/` as proof-of-concept and has not yet been promoted into `backtest_simulator/`.
+Bootstrap. The CI scaffolding (gate scripts, contract tests, ruleset, budget ratchets) is in place; the `backtest_simulator/` package is an empty placeholder waiting for the runtime layer.
 
 ## Layout
 
@@ -17,8 +15,6 @@ Bootstrap. The CI scaffolding (gate scripts, contract tests, ruleset, budget rat
 - `tests/tools/` — contract tests for the gates.
 - `tests/fixtures/` — fixtures for gate unit tests.
 - `.github/` — workflows, rulesets, issue/PR templates, budget files.
-- `demo/` — phase-by-phase validation of the Nexus / Praxis / Limen integration.
-- `SPEC.md` — design specification.
 
 ## Governance
 

@@ -75,6 +75,7 @@ exclude = [
   "build",
   "dist",
   "tests",
+  "demo",
 ]
 
 [tool.ruff.format]
