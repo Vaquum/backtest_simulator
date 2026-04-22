@@ -616,7 +616,7 @@ def gate_budget_source(
         ]
 
     try:
-        base_budget = json.loads(base_path.read_text())
+        base_budget = json.loads(base_path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError) as exc:
         return [f'typing_gate: cannot read base budget {base_path}: {exc}']
 
