@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "quickstart_etl"
+name = "backtest_simulator"
 version = "1.3.3"
 description = "Trades Warehouse Control Plane"
 readme = "README.md"
@@ -29,12 +29,12 @@ dev = ["dagster-webserver", "pytest"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["tdw_control_plane*"]
+include = ["backtest_simulator*"]
 exclude = ["quickstart_etl_tests*"]
 
 [tool.dagster]
-module_name = "tdw_control_plane.definitions"
-code_location_name = "tdw_control_plane"
+module_name = "backtest_simulator.definitions"
+code_location_name = "backtest_simulator"
 
 # --------------------------------------------------------------------
 # Pyright strict configuration.
@@ -56,7 +56,7 @@ code_location_name = "tdw_control_plane"
 [tool.pyright]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
-include = ["tdw_control_plane"]
+include = ["backtest_simulator"]
 exclude = [
   "**/__pycache__",
   "build",
@@ -111,4 +111,4 @@ ignore = [
 "quickstart_etl_tests/**/*.py" = ["S101", "ANN", "BLE001"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["tdw_control_plane"]
+known-first-party = ["backtest_simulator"]
