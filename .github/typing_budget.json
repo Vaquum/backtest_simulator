@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "package_root": "tdw_control_plane",
+  "package_root": "backtest_simulator",
   "excludes": [
     "__pycache__",
     "quickstart_etl_tests",

@@ -32,6 +32,10 @@ jobs:
         run: .venv-ruleset/bin/python -m pytest tests/tools/test_cc_gate.py tests/tools/test_ruleset_gate.py tests/tools/test_ci_contract.py tests/tools/test_lint_ci_contract.py -q
 
       - name: Compare live ruleset to checked-in snapshot
+        # Placeholder: the hardcoded ruleset_id was tdw-specific (5406599).
+        # This step is skipped until `vars.RULESET_ID` is set on this repo.
+        # See: https://github.com/Vaquum/backtest_simulator/issues (search "RULESET_ID")
+        if: vars.RULESET_ID != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 tools/ruleset_gate.py --ruleset-file .github/rulesets/main.json --repo "${{ github.repository }}" --ruleset-id 5406599
+        run: python3 tools/ruleset_gate.py --ruleset-file .github/rulesets/main.json --repo "${{ github.repository }}" --ruleset-id ${{ vars.RULESET_ID }}

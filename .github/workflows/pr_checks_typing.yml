@@ -10,7 +10,7 @@ name: pr_checks_typing
 #      reportMissingParameterType, reportConstantRedefinition,
 #      reportImportCycles -- all "error"). No report* key may be set
 #      to none/warning/info/false. pyright.include must equal
-#      ["tdw_control_plane"]. pyrightconfig.json must not exist
+#      ["backtest_simulator"]. pyrightconfig.json must not exist
 #      outside vendored paths. Note: pyright 1.1.408 ignores
 #      reportExplicitAny at runtime; the Any enforcement is the AST
 #      ratchet below, not this config key.
