@@ -1,0 +1,58 @@
+{
+  "schema_version": 2,
+  "package_root": "tdw_control_plane",
+  "excludes": [
+    "__pycache__",
+    "quickstart_etl_tests",
+    "build",
+    "dist"
+  ],
+  "patterns": {
+    "any_annotation": {
+      "pattern": ":\\s*Any\\b",
+      "total": 0
+    },
+    "any_return": {
+      "pattern": "->\\s*Any\\b",
+      "total": 0
+    },
+    "any_import": {
+      "pattern": "from typing import[^\\n]*\\bAny\\b",
+      "total": 0
+    },
+    "cast_any": {
+      "pattern": "cast\\([^)]*\\bAny\\b",
+      "total": 0
+    },
+    "dict_any": {
+      "pattern": "dict\\[[^]]*\\bAny\\b",
+      "total": 0
+    },
+    "list_any": {
+      "pattern": "list\\[\\s*Any\\b",
+      "total": 0
+    },
+    "tuple_any": {
+      "pattern": "tuple\\[[^]]*\\bAny\\b",
+      "total": 0
+    },
+    "type_ignore": {
+      "pattern": "#\\s*type:\\s*ignore",
+      "total": 0
+    },
+    "pyright_ignore": {
+      "pattern": "#\\s*pyright:\\s*ignore",
+      "total": 0
+    },
+    "noqa": {
+      "pattern": "#\\s*noqa",
+      "total": 0
+    }
+  },
+  "pyright_errors": {
+    "total": 1213
+  },
+  "any_references": {
+    "total": 0
+  }
+}

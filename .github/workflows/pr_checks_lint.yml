@@ -1,0 +1,27 @@
+name: pr_checks_lint
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pr_checks_lint:
+    name: pr_checks_lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Set up lint venv
+        run: python -m venv .venv-lint
+      - name: Install Ruff
+        run: .venv-lint/bin/python -m pip install --upgrade pip 'ruff==0.15.11'
+      - name: Run Ruff lint gate
+        run: .venv-lint/bin/python -m ruff check tools tests/tools

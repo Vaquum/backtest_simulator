@@ -1,0 +1,114 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quickstart_etl"
+version = "1.3.3"
+description = "Trades Warehouse Control Plane"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "dagster",
+  "dagster-cloud",
+  "boto3",
+  "pandas",
+  "requests",
+  "matplotlib",
+  "clickhouse-driver",
+  "clickhouse_connect",
+  "polars",
+  "pyarrow",
+  "huggingface_hub",
+  "lz4>=4.0.0",
+  "clickhouse-cityhash>=1.0.2",
+]
+
+[project.optional-dependencies]
+dev = ["dagster-webserver", "pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tdw_control_plane*"]
+exclude = ["quickstart_etl_tests*"]
+
+[tool.dagster]
+module_name = "tdw_control_plane.definitions"
+code_location_name = "tdw_control_plane"
+
+# --------------------------------------------------------------------
+# Pyright strict configuration.
+#
+# Every report* key here is either "error" or absent (to inherit the
+# strict default). The pr_checks_typing workflow asserts this config
+# on every PR; weakening any of these values, or removing any required
+# key, fails the build.
+#
+# Note on reportExplicitAny: pyright 1.1.408 (the pinned toolchain
+# version) emits `Config contains unrecognized setting` for this key
+# and does not honor it. We keep it here as a forward-compatible
+# config-presence requirement for the day pyright respects it. The
+# Any escape hatch is enforced today by the AST-based sub-gate in
+# tools/typing_gate.py (gate_any_references_ast), which resolves
+# every surface form including module-level assignment aliases.
+# --------------------------------------------------------------------
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+include = ["tdw_control_plane"]
+exclude = [
+  "**/__pycache__",
+  "build",
+  "dist",
+  "quickstart_etl_tests",
+]
+reportExplicitAny = "error"
+reportMissingImports = "error"
+reportMissingTypeStubs = "error"
+reportUnknownArgumentType = "error"
+reportUnknownMemberType = "error"
+reportUnknownVariableType = "error"
+reportUnknownLambdaType = "error"
+reportUnknownParameterType = "error"
+reportMissingParameterType = "error"
+reportConstantRedefinition = "error"
+reportImportCycles = "error"
+
+# --------------------------------------------------------------------
+# Ruff configuration — style + lint gate that pairs with pyright.
+# --------------------------------------------------------------------
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = [
+  ".git",
+  "__pycache__",
+  "build",
+  "dist",
+  "quickstart_etl_tests",
+]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.ruff.lint]
+select = [
+  "E",     # pycodestyle errors
+  "F",     # pyflakes
+  "I",     # isort
+  "UP",    # pyupgrade
+  "RUF",   # ruff-specific
+  "BLE",   # flake8-blind-except -- always raise, never bare except
+  "ANN",   # flake8-annotations -- catches missing type annotations
+]
+ignore = [
+  "E501",   # line length handled by formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"quickstart_etl_tests/**/*.py" = ["S101", "ANN", "BLE001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tdw_control_plane"]

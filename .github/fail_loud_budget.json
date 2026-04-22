@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "package_root": "tdw_control_plane",
+  "excludes": [
+    "__pycache__",
+    "quickstart_etl_tests",
+    "build",
+    "dist"
+  ],
+  "categories": {
+    "bare_except": {
+      "total": 4
+    },
+    "empty_pass": {
+      "total": 6
+    },
+    "empty_ellipsis": {
+      "total": 0
+    },
+    "empty_return_none": {
+      "total": 0
+    },
+    "empty_continue_break": {
+      "total": 1
+    },
+    "contextlib_suppress": {
+      "total": 0
+    },
+    "errors_ignore_kwarg": {
+      "total": 0
+    }
+  }
+}

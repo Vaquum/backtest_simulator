@@ -1,0 +1,37 @@
+name: pr_checks_ruleset
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pr_checks_ruleset:
+    name: pr_checks_ruleset
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up contract venv
+        run: python -m venv .venv-ruleset
+
+      - name: Install contract dependencies
+        run: .venv-ruleset/bin/python -m pip install --upgrade pip pytest 'ruff==0.15.11'
+
+      - name: Run CI contract tests
+        run: .venv-ruleset/bin/python -m pytest tests/tools/test_cc_gate.py tests/tools/test_ruleset_gate.py tests/tools/test_ci_contract.py tests/tools/test_lint_ci_contract.py -q
+
+      - name: Compare live ruleset to checked-in snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tools/ruleset_gate.py --ruleset-file .github/rulesets/main.json --repo "${{ github.repository }}" --ruleset-id 5406599

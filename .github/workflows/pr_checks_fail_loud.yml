@@ -1,0 +1,93 @@
+name: pr_checks_fail_loud
+
+# Mechanical fail-loud gate. Seven silent-fallback categories
+# ratcheted against .github/fail_loud_budget.json. Every PR that
+# raises any category's total fails and is blocked from merge.
+#
+# Categories enforced (tools/fail_loud_gate.py for the exact AST):
+#
+#   1. bare_except           -- `except:` without a type
+#   2. empty_pass            -- `except X: pass`
+#   3. empty_ellipsis        -- `except X: ...`
+#   4. empty_return_none     -- `except X: return` / `return None`
+#   5. empty_continue_break  -- `except X: continue` / `break`
+#   6. contextlib_suppress   -- `contextlib.suppress(...)` calls
+#                               (resolves aliased imports)
+#   7. errors_ignore_kwarg   -- any call with `errors='ignore'`
+#
+# Same base-vs-head discipline as pr_checks_typing: the head budget
+# cannot be weakened in the same PR that gates against it. The
+# workflow fetches the base-ref budget via `git show` and passes it
+# as --base-budget to the gate script.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pr_checks_fail_loud:
+    name: pr_checks_fail_loud
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: ${{ github.event_name == 'pull_request' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Resolve base ref and fetch base-ref budget
+        id: base
+        run: |
+          # Mirror pr_checks_typing: if base has the budget, fetch it;
+          # otherwise the head must introduce it (bootstrap path,
+          # verified mechanically via git diff).
+          set -euo pipefail
+          BASE_REV="origin/${{ github.base_ref }}"
+          git fetch origin "${{ github.base_ref }}" --depth=1
+          git rev-parse --verify "$BASE_REV" >/dev/null
+
+          if git show "$BASE_REV:.github/fail_loud_budget.json" > base_budget.json 2>/dev/null; then
+            echo "mode=compare" >> "$GITHUB_OUTPUT"
+            echo "base budget fetched ($(wc -c < base_budget.json) bytes)"
+          else
+            rm -f base_budget.json
+            CHANGED="$(git diff --name-only "$BASE_REV"...HEAD)"
+            if echo "$CHANGED" | grep -qx '.github/fail_loud_budget.json'; then
+              echo "mode=bootstrap" >> "$GITHUB_OUTPUT"
+              echo "::warning::bootstrap commit: base ref has no fail_loud_budget.json; HEAD introduces it."
+            else
+              echo "::error::base ref has no .github/fail_loud_budget.json and this commit does not introduce it. The budget was deleted from the protected base ref; restore it before merging."
+              exit 1
+            fi
+          fi
+
+      - name: Run fail-loud gate
+        run: |
+          set -euo pipefail
+          case "${{ steps.base.outputs.mode }}" in
+            compare)
+              python tools/fail_loud_gate.py --base-budget base_budget.json
+              ;;
+            bootstrap)
+              python tools/fail_loud_gate.py --bootstrap
+              ;;
+            *)
+              echo "::error::base step did not set mode; refusing to run gate"
+              exit 2
+              ;;
+          esac

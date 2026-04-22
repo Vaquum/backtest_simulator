@@ -1,0 +1,172 @@
+name: pr_checks_typing
+
+# Mechanical typing gate. The gate is tools/typing_gate.py; this
+# workflow invokes it. The deterministic rules the gate enforces
+# are listed in full in the PR description; a summary follows.
+#
+#   1. Pyright config audit. Required keys must be present with their
+#      required values (typeCheckingMode=strict, reportExplicitAny,
+#      reportMissingImports, reportMissingTypeStubs, reportUnknown*,
+#      reportMissingParameterType, reportConstantRedefinition,
+#      reportImportCycles -- all "error"). No report* key may be set
+#      to none/warning/info/false. pyright.include must equal
+#      ["tdw_control_plane"]. pyrightconfig.json must not exist
+#      outside vendored paths. Note: pyright 1.1.408 ignores
+#      reportExplicitAny at runtime; the Any enforcement is the AST
+#      ratchet below, not this config key.
+#
+#   2. Escape-hatch regex ratchet. Counts `: Any`, `-> Any`,
+#      `cast(Any, ...)`, `dict[..., Any]`, `list[Any]`, `tuple[..., Any]`,
+#      `from typing import ... Any`, `# type: ignore`, `# pyright: ignore`,
+#      `# noqa` across the package. Any file-system-wide increase fails.
+#
+#   3. AST Any-reference ratchet. Parses each file and counts every
+#      reference to typing.Any: bare `Any`, `typing.Any`, `t.Any`,
+#      aliased imports (`from typing import Any as X`), and module-
+#      level assignment aliases (`A = typing.Any`, chained `B = A`).
+#      Any increase fails. This is the primary Any enforcement today.
+#
+#   4. Pyright error-count ratchet. summary.errorCount from
+#      `pyright --outputjson` must not increase over base.
+#
+#   5. filesAnalyzed ratchet. pyright must analyze at least as many
+#      files as the gate finds under package_root.
+#
+#   6. Budget-source ratchet. The head-ref budget cannot raise any
+#      number vs the base-ref budget, cannot delete a pattern key,
+#      cannot change package_root, cannot add excludes, and cannot
+#      rewrite a per-pattern regex. Only reductions are allowed.
+#
+# Philosophy: gates, not language. The gate is what the PR must pass.
+# The comment here describes intent for humans reviewing the workflow;
+# the source of truth for rules is tools/typing_gate.py.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pr_checks_typing:
+    name: pr_checks_typing
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history, so we can read the budget at base ref
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Install pyright
+        run: pip install 'pyright==1.1.408'
+
+      - name: Resolve base ref and fetch base-ref budget
+        id: base
+        run: |
+          # The base-ref budget is the protected oracle. If the base has the
+          # file, normal path: fetch it and the gate runs base-vs-head.
+          # If the base does NOT have the file, the only legitimate reason
+          # is that THIS commit adds the file to main for the first time.
+          # The workflow verifies that mechanically by diffing against the
+          # base ref; if the head does not add the file, the gate step
+          # hard-fails. There is no graceful skip and no silent fetch
+          # failure -- if we cannot reach the base ref, the job fails with
+          # the fetch error visible, not on a downstream misbehavior.
+          set -euo pipefail
+          if [ -n "${{ github.base_ref }}" ]; then
+            BASE_REV="origin/${{ github.base_ref }}"
+            git fetch origin "${{ github.base_ref }}" --depth=1
+          else
+            BASE_REV="HEAD~1"
+          fi
+          echo "base rev: $BASE_REV"
+
+          # Verify BASE_REV actually resolves now; if not, the fetch above
+          # produced no usable ref and we must fail loudly rather than
+          # mis-route the downstream compare/bootstrap decision.
+          git rev-parse --verify "$BASE_REV" >/dev/null
+
+          if git show "$BASE_REV:.github/typing_budget.json" > base_budget.json 2>/dev/null; then
+            echo "mode=compare" >> "$GITHUB_OUTPUT"
+            echo "base budget fetched ($(wc -c < base_budget.json) bytes)"
+          else
+            # Base has no budget. Is THIS commit adding it?
+            rm -f base_budget.json
+            # Changed files between base and HEAD
+            CHANGED="$(git diff --name-only "$BASE_REV"...HEAD)"
+            if echo "$CHANGED" | grep -qx '.github/typing_budget.json'; then
+              echo "mode=bootstrap" >> "$GITHUB_OUTPUT"
+              echo "::warning::bootstrap commit: base ref has no typing_budget.json; HEAD introduces it."
+            else
+              echo "::error::base ref has no .github/typing_budget.json and this commit does not introduce it. The budget was deleted from the protected base ref; restore it before merging."
+              exit 1
+            fi
+          fi
+
+      - name: Run pyright strict (capture JSON)
+        run: |
+          set +e
+          pyright --outputjson > pyright_output.json
+          pyright_exit=$?
+          set -e
+          echo "pyright exit code: $pyright_exit"
+          python <<'PY'
+          import json, pathlib, sys
+          p = pathlib.Path('pyright_output.json')
+          if not p.exists() or p.stat().st_size == 0:
+              print('::error::pyright produced no output', file=sys.stderr)
+              sys.exit(2)
+          d = json.loads(p.read_text())
+          s = d.get('summary', {})
+          print(f"pyright: files={s.get('filesAnalyzed')} errors={s.get('errorCount')} warnings={s.get('warningCount')}")
+          PY
+
+      - name: Run typing gate
+        run: |
+          # The previous step decided 'compare' (base ref has the budget)
+          # or 'bootstrap' (this commit introduces it). The two flags are
+          # mutually exclusive; the gate fails if neither is given.
+          case "${{ steps.base.outputs.mode }}" in
+            compare)
+              python tools/typing_gate.py \
+                --pyright-json pyright_output.json \
+                --base-budget base_budget.json
+              ;;
+            bootstrap)
+              python tools/typing_gate.py \
+                --pyright-json pyright_output.json \
+                --bootstrap
+              ;;
+            *)
+              echo "::error::base step did not set mode; refusing to run gate"
+              exit 2
+              ;;
+          esac
+
+      - name: Upload pyright output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyright-output
+          path: pyright_output.json
+          retention-days: 14
