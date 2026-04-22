@@ -818,7 +818,7 @@ DEFAULT_PATTERNS: Final[dict[str, dict[str, object]]] = {
 
 def update_budget(pyright_json_path: str | None) -> None:
     if BUDGET_PATH.exists():
-        budget = json.loads(BUDGET_PATH.read_text())
+        budget = json.loads(BUDGET_PATH.read_text(encoding='utf-8'))
     else:
         budget = {
             'schema_version': 2,
@@ -845,7 +845,7 @@ def update_budget(pyright_json_path: str | None) -> None:
 
     if pyright_json_path is not None:
         try:
-            data = json.loads(Path(pyright_json_path).read_text())
+            data = json.loads(Path(pyright_json_path).read_text(encoding='utf-8'))
             summary = data.get('summary', {})
             budget['pyright_errors']['total'] = int(summary.get('errorCount', 0))
         except (OSError, json.JSONDecodeError) as e:

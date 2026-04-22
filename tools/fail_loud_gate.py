@@ -460,7 +460,7 @@ def main() -> int:
         base_path = Path(args.base_budget)
         if not base_path.is_file():
             print(
-                'SLICE-FAIL-LOUD GATE -- FAIL',
+                'FAIL-LOUD GATE -- FAIL',
                 '',
                 '  gate: runtime-args',
                 f'    - base-ref budget not found at {base_path}. '
