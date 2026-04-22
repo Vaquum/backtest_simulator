@@ -421,7 +421,7 @@ def main() -> int:
     parser.add_argument(
         '--repo',
         required=True,
-        help='GitHub repository in owner/name form (e.g. Vaquum/tdw-control-plane).',
+        help='GitHub repository in owner/name form (e.g. Vaquum/backtest_simulator).',
     )
     args = parser.parse_args()
 

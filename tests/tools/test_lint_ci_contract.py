@@ -20,7 +20,7 @@ EXPECTED_RUFF_POLICY: Final[dict[str, object]] = {
         '__pycache__',
         'build',
         'dist',
-        'quickstart_etl_tests',
+        'tests',
     ],
     'select': [
         'E',
@@ -33,7 +33,7 @@ EXPECTED_RUFF_POLICY: Final[dict[str, object]] = {
     ],
     'ignore': ['E501'],
     'per-file-ignores': {
-        'quickstart_etl_tests/**/*.py': ['S101', 'ANN', 'BLE001'],
+        'tests/**/*.py': ['S101', 'ANN', 'BLE001'],
     },
 }
 

@@ -823,7 +823,7 @@ def update_budget(pyright_json_path: str | None) -> None:
         budget = {
             'schema_version': 2,
             'package_root': 'backtest_simulator',
-            'excludes': ['__pycache__', 'quickstart_etl_tests', 'build', 'dist'],
+            'excludes': ['__pycache__', 'build', 'dist'],
             'patterns': {k: dict(v) for k, v in DEFAULT_PATTERNS.items()},
             'any_references': {'total': 0},
             'pyright_errors': {'total': 0},
