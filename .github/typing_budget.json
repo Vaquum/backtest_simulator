@@ -3,7 +3,6 @@
   "package_root": "backtest_simulator",
   "excludes": [
     "__pycache__",
-    "quickstart_etl_tests",
     "build",
     "dist"
   ],
@@ -49,10 +48,10 @@
       "total": 0
     }
   },
-  "pyright_errors": {
-    "total": 1213
-  },
   "any_references": {
+    "total": 0
+  },
+  "pyright_errors": {
     "total": 0
   }
 }

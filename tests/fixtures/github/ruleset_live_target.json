@@ -1,9 +1,9 @@
 {
-  "id": 5406599,
+  "id": 15401332,
   "name": "Protect-Main",
   "target": "branch",
   "source_type": "Repository",
-  "source": "Vaquum/tdw-control-plane",
+  "source": "Vaquum/backtest_simulator",
   "enforcement": "active",
   "conditions": {
     "ref_name": {
@@ -13,7 +13,6 @@
       ]
     }
   },
-  "bypass_actors": [],
   "rules": [
     {
       "type": "deletion"
@@ -24,24 +23,15 @@
     {
       "type": "pull_request",
       "parameters": {
-        "required_approving_review_count": 0,
+        "required_approving_review_count": 1,
         "dismiss_stale_reviews_on_push": false,
         "required_reviewers": [],
         "require_code_owner_review": false,
         "require_last_push_approval": false,
         "required_review_thread_resolution": true,
         "allowed_merge_methods": [
-          "merge",
-          "squash",
-          "rebase"
+          "merge"
         ]
-      }
-    },
-    {
-      "type": "copilot_code_review",
-      "parameters": {
-        "review_on_push": true,
-        "review_draft_pull_requests": false
       }
     },
     {
@@ -55,11 +45,15 @@
             "integration_id": 15368
           },
           {
-            "context": "pr_checks_typing",
+            "context": "pr_checks_cc",
             "integration_id": 15368
           },
           {
-            "context": "pr_checks_cc",
+            "context": "pr_checks_lint",
+            "integration_id": 15368
+          },
+          {
+            "context": "pr_checks_ruleset",
             "integration_id": 15368
           },
           {
@@ -71,31 +65,35 @@
             "integration_id": 15368
           },
           {
+            "context": "pr_checks_typing",
+            "integration_id": 15368
+          },
+          {
             "context": "pr_checks_version",
-            "integration_id": 15368
-          },
-          {
-            "context": "pr_checks_ruleset",
-            "integration_id": 15368
-          },
-          {
-            "context": "pr_checks_lint",
             "integration_id": 15368
           }
         ]
       }
+    },
+    {
+      "type": "copilot_code_review",
+      "parameters": {
+        "review_on_push": true,
+        "review_draft_pull_requests": false
+      }
     }
   ],
-  "node_id": "RRS_lACqUmVwb3NpdG9yec45yhnhzgBSf4c",
-  "created_at": "2025-05-11T20:27:04.532+03:00",
-  "updated_at": "2026-04-22T08:00:00.000+03:00",
+  "node_id": "RRS_lACqUmVwb3NpdG9yec5ImFJGzgDrAXQ",
+  "created_at": "2026-04-22T15:18:31.320+03:00",
+  "updated_at": "2026-04-22T17:07:30.593+03:00",
+  "bypass_actors": [],
   "current_user_can_bypass": "never",
   "_links": {
     "self": {
-      "href": "https://api.github.com/repos/Vaquum/tdw-control-plane/rulesets/5406599"
+      "href": "https://api.github.com/repos/Vaquum/backtest_simulator/rulesets/15401332"
     },
     "html": {
-      "href": "https://github.com/Vaquum/tdw-control-plane/rules/5406599"
+      "href": "https://github.com/Vaquum/backtest_simulator/rules/15401332"
     }
   }
 }

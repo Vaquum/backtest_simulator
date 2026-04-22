@@ -10,7 +10,6 @@
       ]
     }
   },
-  "bypass_actors": [],
   "rules": [
     {
       "type": "deletion"
@@ -21,24 +20,15 @@
     {
       "type": "pull_request",
       "parameters": {
-        "required_approving_review_count": 0,
+        "required_approving_review_count": 1,
         "dismiss_stale_reviews_on_push": false,
         "required_reviewers": [],
         "require_code_owner_review": false,
         "require_last_push_approval": false,
         "required_review_thread_resolution": true,
         "allowed_merge_methods": [
-          "merge",
-          "squash",
-          "rebase"
+          "merge"
         ]
-      }
-    },
-    {
-      "type": "copilot_code_review",
-      "parameters": {
-        "review_on_push": true,
-        "review_draft_pull_requests": false
       }
     },
     {
@@ -52,11 +42,15 @@
             "integration_id": 15368
           },
           {
-            "context": "pr_checks_typing",
+            "context": "pr_checks_cc",
             "integration_id": 15368
           },
           {
-            "context": "pr_checks_cc",
+            "context": "pr_checks_lint",
+            "integration_id": 15368
+          },
+          {
+            "context": "pr_checks_ruleset",
             "integration_id": 15368
           },
           {
@@ -68,19 +62,23 @@
             "integration_id": 15368
           },
           {
+            "context": "pr_checks_typing",
+            "integration_id": 15368
+          },
+          {
             "context": "pr_checks_version",
-            "integration_id": 15368
-          },
-          {
-            "context": "pr_checks_ruleset",
-            "integration_id": 15368
-          },
-          {
-            "context": "pr_checks_lint",
             "integration_id": 15368
           }
         ]
       }
+    },
+    {
+      "type": "copilot_code_review",
+      "parameters": {
+        "review_on_push": true,
+        "review_draft_pull_requests": false
+      }
     }
-  ]
+  ],
+  "bypass_actors": []
 }
