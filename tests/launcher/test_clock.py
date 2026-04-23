@@ -6,6 +6,8 @@ import itertools
 import time
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from backtest_simulator.launcher.clock import accelerated_clock
 
 
@@ -59,27 +61,30 @@ def test_zero_sleep_does_not_tick() -> None:
     assert now == start, f'zero-sleep moved clock to {now}'
 
 
-def test_sleep_restoration_after_block() -> None:
-    original = asyncio.sleep
+def test_asyncio_sleep_is_permanently_wrapped() -> None:
+    # The conditional wrapper is installed at module import — not restored
+    # on context-manager exit — so sleeps scheduled BEFORE a freezer
+    # engages still pick it up once it does. The wrapper falls through
+    # to real-time behavior when no freezer is active.
+    from backtest_simulator.launcher.clock import _conditional_sleep
+    assert asyncio.sleep is _conditional_sleep
+
+
+def test_accelerated_clock_is_not_reentrant() -> None:
     start = datetime(2021, 1, 1, tzinfo=UTC)
-
-    with accelerated_clock(start):
-        assert asyncio.sleep is not original
-
-    assert asyncio.sleep is original
+    with accelerated_clock(start), pytest.raises(RuntimeError, match='not re-entrant'):
+        with accelerated_clock(start):
+            pass
 
 
-def test_exception_inside_block_still_restores_sleep() -> None:
-    original = asyncio.sleep
+def test_exception_inside_block_releases_freezer() -> None:
     start = datetime(2021, 1, 1, tzinfo=UTC)
-
-    try:
+    with pytest.raises(RuntimeError, match='injected'):
         with accelerated_clock(start):
             raise RuntimeError('injected')
-    except RuntimeError:
-        pass
-
-    assert asyncio.sleep is original
+    # If the freezer was released, the next entry succeeds.
+    with accelerated_clock(start):
+        assert datetime.now(UTC) == start
 
 
 def test_sleep_returns_configured_result() -> None:
@@ -92,3 +97,52 @@ def test_sleep_returns_configured_result() -> None:
         value = asyncio.run(take_result())
 
     assert value == 'sentinel'
+
+
+def test_threading_timer_is_permanently_patched() -> None:
+    # The Timer.run patch is installed at module import (not just inside
+    # accelerated_clock) so Timers scheduled BEFORE a freezer engages
+    # still fire based on frozen-time delta accumulation once the block
+    # opens. PredictLoop schedules its tick Timer during boot under real
+    # time; that Timer has to keep polling frozen-time once the backtest
+    # transitions to accelerated_clock, or no tick ever fires.
+    import threading
+    from backtest_simulator.launcher.clock import _frozen_aware_timer_run
+    assert threading.Timer.run is _frozen_aware_timer_run
+
+
+def test_pre_scheduled_sleep_catches_late_freezer() -> None:
+    # The load-bearing guarantee for BacktestLauncher: a sleep scheduled
+    # BEFORE `accelerated_clock` engages must still be picked up by the
+    # freezer on its next poll once the block opens. This is what lets
+    # PredictLoop start under real time (avoiding the Trainer SSL issue)
+    # and then have its pending interval sleep catch the freezer when
+    # the outer loop transitions to accelerated time.
+    start = datetime(2021, 1, 1, tzinfo=UTC)
+
+    async def driver() -> datetime:
+        # Start a long sleep BEFORE engaging the freezer. The task is
+        # already awaiting `_conditional_sleep(60)` in its poll loop
+        # when the freezer below engages; the next poll iteration picks
+        # it up and ticks the remainder.
+        async def sleep_task() -> datetime:
+            await asyncio.sleep(60)
+            return datetime.now(UTC)
+
+        task = asyncio.create_task(sleep_task())
+        # Yield enough that the task hits its first poll step (50ms).
+        await asyncio.sleep(0)
+        with accelerated_clock(start):
+            return await task
+
+    real_start = time.monotonic()
+    observed = asyncio.run(driver())
+    real_elapsed = time.monotonic() - real_start
+
+    # The frozen clock should have advanced by ~60s, not by the real
+    # seconds waited.
+    elapsed_frozen = observed - start
+    assert elapsed_frozen >= timedelta(seconds=59)
+    assert elapsed_frozen <= timedelta(seconds=61)
+    # Real wall clock should be well under the 60-second sleep.
+    assert real_elapsed < 5.0, f'real elapsed {real_elapsed:.2f}s > 5s'

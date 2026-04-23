@@ -5,6 +5,8 @@ import json
 import logging
 from decimal import Decimal
 
+from nexus.core.domain.enums import OrderSide
+from nexus.core.domain.order_types import ExecutionMode, OrderType
 from nexus.infrastructure.praxis_connector.trade_outcome import TradeOutcome
 from nexus.strategy.action import Action, ActionType
 from nexus.strategy.base import Strategy as _StrategyBase
@@ -68,28 +70,42 @@ class Strategy(_StrategyBase):
         self, signal: Signal, params: StrategyParams, context: StrategyContext,
     ) -> list[Action]:
         del params
+        _log.info('on_signal fired: values=%s', dict(signal.values))
         prob = signal.values.get(self._config.prob_key)
         if prob is None:
+            _log.info('signal missing prob_key %r; keys=%s',
+                      self._config.prob_key, list(signal.values))
             return []
         if float(prob) < self._config.enter_threshold:
+            _log.info('prob %s below threshold %s', prob, self._config.enter_threshold)
             return []
         if any(p.symbol == self._config.symbol for p in context.positions):
             return []
-        reference = Decimal(str(signal.values.get('close', 0)))
-        if reference <= 0:
-            return []
-        stop = reference * (Decimal('1') - self._config.stop_bps / Decimal('10000'))
+        # Nexus's `produce_signal` doesn't include the current close in
+        # `signal.values` (it carries only the model's predict-dict output),
+        # so `reference_price` is intentionally None here. The venue
+        # adapter fills MARKET orders at the next-trade price from the
+        # historical stream regardless of what reference we pass — this
+        # keeps the strategy honest without requiring a synthesized
+        # close. A richer strategy would read the price from a side
+        # channel (context or a per-tick market_data provider).
+        side = OrderSide.BUY if self._config.side == 'BUY' else OrderSide.SELL
         return [Action(
             action_type=ActionType.ENTER,
-            direction=None, size=self._config.qty,
-            execution_mode=None, order_type=None,
+            direction=side, size=self._config.qty,
+            execution_mode=ExecutionMode.SINGLE_SHOT,
+            order_type=OrderType.MARKET,
             execution_params={
-                'declared_stop_price': stop,
                 'symbol': self._config.symbol,
-                'side': self._config.side,
+                'stop_bps': str(self._config.stop_bps),
             },
-            deadline=None, trade_id=None, command_id=None,
-            maker_preference=None, reference_price=reference,
+            # Deadline is a future epoch-ms timestamp; 60s from now gives
+            # the venue a reasonable window to fill before the order
+            # expires. The concrete value is less important than its
+            # presence — Nexus's ENTER validator requires a non-null.
+            deadline=int((signal.timestamp.timestamp() + 60) * 1000),
+            trade_id=None, command_id=None,
+            maker_preference=None, reference_price=None,
         )]
 
     def on_outcome(

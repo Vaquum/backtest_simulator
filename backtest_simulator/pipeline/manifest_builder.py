@@ -30,7 +30,9 @@ class StrategyParamsSpec:
     stop_bps: Decimal
     qty: Decimal
     side: str = 'BUY'
-    prob_key: str = 'probability'
+    # Limen's Sensor.predict returns `_probs` (single binary class probability).
+    # `_extract_values` in Nexus carries that key through to `Signal.values`.
+    prob_key: str = '_probs'
 
 
 @dataclass(frozen=True)

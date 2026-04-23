@@ -37,6 +37,60 @@ def test_poller_get_market_data_returns_empty_for_unknown_size() -> None:
     assert result.is_empty()
 
 
+def test_kline_size_from_experiment_dir_returns_none_for_missing() -> None:
+    # The kline-size resolver walks metadata.json -> sfd_module ->
+    # manifest() -> data_source_config. Each step can legitimately fail
+    # (missing file, missing key, unimportable module); the resolver
+    # returns None in every case rather than raising, letting the
+    # launcher continue with an empty kline set for that sensor.
+    from pathlib import Path
+    result = BacktestLauncher._kline_size_from_experiment_dir(Path('/tmp/no-such-dir-XYZ'))  # noqa: SLF001, S108
+    assert result is None
+
+
+def test_kline_size_from_experiment_dir_parses_real_metadata(tmp_path: Path) -> None:
+    import json
+    meta_path = tmp_path / 'metadata.json'
+    # `limen.sfd.logreg_binary` resolves via __init__'s re-export; the
+    # canonical dotted module path (what `HistoricalData.__name__` stores
+    # in metadata.json under MSQ writes) is the foundational path.
+    meta_path.write_text(
+        json.dumps({'sfd_module': 'limen.sfd.foundational_sfd.logreg_binary'}),
+        encoding='utf-8',
+    )
+    result = BacktestLauncher._kline_size_from_experiment_dir(tmp_path)  # noqa: SLF001
+    assert result == 3600, f'expected 3600 from logreg_binary manifest, got {result}'
+
+
+def test_nexus_running_handler_releases_event_on_expected_count() -> None:
+    from backtest_simulator.launcher.launcher import _NexusRunningHandler
+    import logging
+    import threading
+    event = threading.Event()
+    handler = _NexusRunningHandler(event, expected=2)
+    for _ in range(2):
+        rec = logging.LogRecord(
+            name='praxis.launcher', level=logging.INFO, pathname='', lineno=0,
+            msg='nexus instance running', args=(), exc_info=None,
+        )
+        handler.emit(rec)
+    assert event.is_set()
+
+
+def test_nexus_running_handler_ignores_unrelated_logs() -> None:
+    from backtest_simulator.launcher.launcher import _NexusRunningHandler
+    import logging
+    import threading
+    event = threading.Event()
+    handler = _NexusRunningHandler(event, expected=1)
+    rec = logging.LogRecord(
+        name='praxis.launcher', level=logging.INFO, pathname='', lineno=0,
+        msg='trading started', args=(), exc_info=None,
+    )
+    handler.emit(rec)
+    assert not event.is_set()
+
+
 def test_instance_config_construction_is_stable() -> None:
     # Shim contract: we pass real InstanceConfig values to Launcher.
     # Construct one with plausible paths; no disk read required.
