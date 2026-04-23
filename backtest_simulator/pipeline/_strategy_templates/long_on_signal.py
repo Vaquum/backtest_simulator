@@ -1,36 +1,68 @@
-"""Long-on-signal strategy: ENTER when sensor probability crosses threshold, with declared stop."""
+"""Long-on-signal strategy template — `__BTS_PARAMS__` is substituted by ManifestBuilder."""
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass
 from decimal import Decimal
 
 from nexus.infrastructure.praxis_connector.trade_outcome import TradeOutcome
 from nexus.strategy.action import Action, ActionType
-from nexus.strategy.base import Strategy
+from nexus.strategy.base import Strategy as _StrategyBase
 from nexus.strategy.context import StrategyContext
 from nexus.strategy.params import StrategyParams
 from nexus.strategy.signal import Signal
 
 _log = logging.getLogger(__name__)
 
+# Baked-in config. ManifestBuilder substitutes this literal JSON string
+# when copying the template; before substitution the strategy would
+# still parse cleanly but would exit early at on_startup.
+_BAKED_CONFIG: dict[str, object] = json.loads('__BTS_PARAMS__')
 
-@dataclass
+
 class _Config:
-    symbol: str
-    side: str
-    enter_threshold: float
-    stop_bps: Decimal
-    qty: Decimal
-    prob_key: str
+    # Plain class (not @dataclass): Nexus's dynamic strategy loader runs
+    # `exec_module` without registering the module in `sys.modules`, so
+    # `@dataclass` fails at class-definition time when it tries
+    # `sys.modules.get(cls.__module__).__dict__`.
+
+    def __init__(
+        self, symbol: str, side: str, enter_threshold: float,
+        stop_bps: Decimal, qty: Decimal, prob_key: str,
+    ) -> None:
+        self.symbol = symbol
+        self.side = side
+        self.enter_threshold = enter_threshold
+        self.stop_bps = stop_bps
+        self.qty = qty
+        self.prob_key = prob_key
 
 
-class LongOnSignal(Strategy):
-    """ENTER on probability > threshold; Nexus enforces stop via declared_stop_price."""
+class Strategy(_StrategyBase):
+    """ENTER on probability > threshold; Nexus enforces stop via declared_stop_price.
 
-    def on_startup(self, params: StrategyParams) -> None:
-        self._config = _parse_config(params)
-        _log.info('LongOnSignal startup', extra={'config': self._config})
+    Class name is `Strategy` because Nexus's loader looks up that exact
+    module attribute; the base is aliased `_StrategyBase` to avoid collision.
+    """
+
+    def on_startup(
+        self, params: StrategyParams, context: StrategyContext,
+    ) -> list[Action]:
+        # Nexus currently constructs `StrategyParams(raw={})` and does not
+        # pass per-strategy YAML params through; `_BAKED_CONFIG` above is
+        # the mechanism ManifestBuilder uses to carry per-instance config
+        # to each strategy file.
+        del params, context
+        self._config = _Config(
+            symbol=str(_BAKED_CONFIG['symbol']),
+            side=str(_BAKED_CONFIG.get('side', 'BUY')),
+            enter_threshold=float(_BAKED_CONFIG['enter_threshold']),
+            stop_bps=Decimal(str(_BAKED_CONFIG['stop_bps'])),
+            qty=Decimal(str(_BAKED_CONFIG['qty'])),
+            prob_key=str(_BAKED_CONFIG.get('prob_key', 'probability')),
+        )
+        _log.info('LongOnSignal startup', extra={'symbol': self._config.symbol})
+        return []
 
     def on_signal(
         self, signal: Signal, params: StrategyParams, context: StrategyContext,
@@ -72,14 +104,11 @@ class LongOnSignal(Strategy):
         del timer_id, params, context
         return []
 
+    def on_load(self, blob: bytes) -> None:
+        del blob
 
-def _parse_config(params: StrategyParams) -> _Config:
-    raw = params.raw
-    return _Config(
-        symbol=str(raw['symbol']),
-        side=str(raw.get('side', 'BUY')),
-        enter_threshold=float(raw['enter_threshold']),
-        stop_bps=Decimal(str(raw['stop_bps'])),
-        qty=Decimal(str(raw['qty'])),
-        prob_key=str(raw.get('prob_key', 'probability')),
-    )
+    def on_save(self) -> bytes:
+        return b''
+
+    def on_shutdown(self) -> None:
+        pass

@@ -21,6 +21,7 @@ from backtest_simulator.launcher.poller import BacktestMarketDataPoller
 _log = logging.getLogger(__name__)
 
 _BOOT_TIMEOUT_SECONDS = 30
+_NEXUS_BOOT_SETTLE_SECONDS = 60
 _POLL_INTERVAL_SECONDS = 0.05
 _HEARTBEAT_DELTA = timedelta(seconds=1)
 _SHUTDOWN_TIMEOUT_SECONDS = 30
@@ -95,10 +96,14 @@ class BacktestLauncher(Launcher):
     def run_window(self, start: datetime, end: datetime) -> None:
         """Run the backtest from `start` to `end` with an accelerated clock.
 
-        Spawns `launch()` on a daemon thread under the accelerated-clock
-        block, waits for Trading to come up, then blocks until the
-        frozen clock reaches `end` (driven forward by PredictLoop /
-        TimerLoop's native interval sleeps), and requests a clean stop.
+        Booting happens under real wall time (Limen Trainer fetches
+        training data via HTTPS and SSL validation would fail inside
+        an active freeze_time block where the frozen clock sits years
+        before the cert's notBefore). Once Trading + Nexus instances
+        are fully up, we transition into accelerated_clock for the
+        actual time-compressed run. PredictLoop's next `asyncio.sleep`
+        call is intercepted by the monkey-patch, ticking the frozen
+        clock from `start` forward.
         """
         if end <= start:
             msg = f'run_window: end {end} must be after start {start}'
@@ -107,14 +112,33 @@ class BacktestLauncher(Launcher):
         launch_thread = threading.Thread(
             target=self.launch, daemon=True, name='backtest-launch',
         )
+        launch_thread.start()
+        self._wait_until_trading_ready()
+        self._wait_for_nexus_boot_complete()
         with accelerated_clock(start) as freezer:
-            launch_thread.start()
-            self._wait_until_trading_ready()
             self._advance_clock_until(end, freezer)
             self.request_stop()
         launch_thread.join(timeout=_SHUTDOWN_TIMEOUT_SECONDS)
         if launch_thread.is_alive():
             _log.warning('backtest launch thread did not terminate within shutdown timeout')
+
+    def _wait_for_nexus_boot_complete(self) -> None:
+        # Trading being ready is not enough — each Nexus StartupSequencer
+        # thread must finish `_wire_sensors` (Limen Trainer + HuggingFace
+        # data fetch) and `_dispatch_startup` (strategy on_startup) before
+        # we freeze the clock. Running Trainer under a frozen clock with
+        # the clock in the past (e.g. 2021) breaks SSL validation on the
+        # HF-dataset fetch. The settle window is real wall-clock seconds
+        # and should exceed the Trainer + fetch time budget. If a Nexus
+        # thread dies during bootstrap, we exit the wait early and
+        # downstream code will see it dead.
+        boot_settle = os.times()[4] + _NEXUS_BOOT_SETTLE_SECONDS
+        while os.times()[4] < boot_settle:
+            if not self._nexus_threads or not all(
+                t.is_alive() for t in self._nexus_threads
+            ):
+                return
+            time.sleep(_POLL_INTERVAL_SECONDS)
 
     def _wait_until_trading_ready(self) -> None:
         # freezegun patches every public `time.*` clock (time.monotonic,

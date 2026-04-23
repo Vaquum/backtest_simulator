@@ -12,6 +12,8 @@ from typing import Any
 
 import polars as pl
 from limen import Sensor, Trainer, UniversalExperimentLoop
+from limen.experiment.param_domain import ParamDomain
+from limen.experiment.param_search import RandomStrategy
 from limen.sfd import logreg_binary
 
 _log = logging.getLogger(__name__)
@@ -82,24 +84,33 @@ class ExperimentPipeline:
         experiment_name: str,
         n_permutations: int = 100,
         *,
-        prep_each_round: bool = True,
+        seed: int = 42,
         resume: bool = False,
     ) -> Path:
-        """Run `UniversalExperimentLoop.run`; persist `experiment_log` to results.csv."""
+        """Run UEL via the MSQ path; persists every artifact Trainer needs.
+
+        The legacy UEL path keeps results in-memory and does NOT write
+        `metadata.json`, `round_data.jsonl`, or the per-permutation model
+        artifacts. Only the MSQ (search-strategy) path writes them, and
+        `Trainer` hard-requires all three. So we always go through MSQ
+        — a `RandomStrategy` constructed from the user's `params()` dict
+        is the thinnest wrapper that unlocks the full persistence.
+
+        Every param-grid coordinate still comes from the user's experiment
+        file: `ParamDomain(experiment_file.params())` is authoritative.
+        """
         self._experiment_dir.mkdir(parents=True, exist_ok=True)
-        uel = UniversalExperimentLoop(sfd=self._sfd, experiment_dir=self._experiment_dir)
-        uel.run(
-            experiment_name=experiment_name, n_permutations=n_permutations,
-            prep_each_round=prep_each_round, resume=resume,
-            params=experiment_file.params,
+        domain = ParamDomain(experiment_file.params())
+        strategy = RandomStrategy(domain, seed=seed)
+        uel = UniversalExperimentLoop(
+            sfd=self._sfd, search_strategy=strategy,
+            experiment_dir=self._experiment_dir,
         )
-        # UEL's default path keeps results in `uel.experiment_log` as an
-        # in-memory Polars DataFrame; only the MSQ/search-strategy path
-        # auto-persists to disk. Write it ourselves so `read_results()`
-        # sees the same file regardless of which UEL mode ran.
-        log = getattr(uel, 'experiment_log', None)
-        if isinstance(log, pl.DataFrame) and not log.is_empty():
-            log.write_csv(self._experiment_dir / 'results.csv')
+        uel.run(
+            experiment_name=experiment_name,
+            n_permutations=n_permutations,
+            resume=resume,
+        )
         _log.info(
             'experiment finished',
             extra={'dir': str(self._experiment_dir), 'n_permutations': n_permutations},

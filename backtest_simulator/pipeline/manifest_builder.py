@@ -1,8 +1,8 @@
 """ManifestBuilder — write Nexus manifest YAML + strategy file for a filtered sensor set."""
 from __future__ import annotations
 
+import json
 import logging
-import shutil
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -85,16 +85,6 @@ class ManifestBuilder:
         """
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
-        strategy_file = self._output_dir / self._template_path.name
-        shutil.copyfile(self._template_path, strategy_file)
-
-        manifest = _assemble_manifest(
-            account_id=account_id, allocated_capital=allocated_capital,
-            capital_pool=capital_pool, strategy_id=strategy_id,
-            sensor=sensor, capital_pct=capital_pct,
-            strategy_file=strategy_file.name,
-        )
-
         raw_params = {
             'symbol': strategy_params.symbol,
             'side': strategy_params.side,
@@ -103,6 +93,25 @@ class ManifestBuilder:
             'qty': str(strategy_params.qty),
             'prob_key': strategy_params.prob_key,
         }
+        # Nexus's StrategySpec schema has no `params` field, and its
+        # startup sequencer constructs `StrategyParams(raw={})` — there's
+        # no runtime channel for per-instance config. We work around it
+        # by templating the strategy .py file with the config inlined:
+        # the `__BTS_PARAMS__` sentinel in the template is replaced
+        # with a JSON string that the strategy parses at on_startup.
+        template_source = self._template_path.read_text(encoding='utf-8')
+        strategy_file = self._output_dir / self._template_path.name
+        strategy_file.write_text(
+            template_source.replace('__BTS_PARAMS__', json.dumps(raw_params)),
+            encoding='utf-8',
+        )
+
+        manifest = _assemble_manifest(
+            account_id=account_id, allocated_capital=allocated_capital,
+            capital_pool=capital_pool, strategy_id=strategy_id,
+            sensor=sensor, capital_pct=capital_pct,
+            strategy_file=strategy_file.name,
+        )
 
         yaml_payload = _manifest_to_yaml(manifest, strategy_params=raw_params)
         manifest_path = self._output_dir / 'manifest.yaml'
