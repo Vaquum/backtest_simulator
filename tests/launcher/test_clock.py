@@ -107,6 +107,7 @@ def test_threading_timer_is_permanently_patched() -> None:
     # time; that Timer has to keep polling frozen-time once the backtest
     # transitions to accelerated_clock, or no tick ever fires.
     import threading
+
     from backtest_simulator.launcher.clock import _frozen_aware_timer_run
     assert threading.Timer.run is _frozen_aware_timer_run
 

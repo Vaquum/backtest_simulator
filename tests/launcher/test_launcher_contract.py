@@ -1,6 +1,8 @@
 """Contract: BacktestLauncher is a real praxis.launcher.Launcher subclass."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from praxis.launcher import InstanceConfig, Launcher
 
@@ -44,7 +46,7 @@ def test_kline_size_from_experiment_dir_returns_none_for_missing() -> None:
     # returns None in every case rather than raising, letting the
     # launcher continue with an empty kline set for that sensor.
     from pathlib import Path
-    result = BacktestLauncher._kline_size_from_experiment_dir(Path('/tmp/no-such-dir-XYZ'))  # noqa: SLF001, S108
+    result = BacktestLauncher._kline_size_from_experiment_dir(Path('/tmp/no-such-dir-XYZ'))
     assert result is None
 
 
@@ -58,14 +60,15 @@ def test_kline_size_from_experiment_dir_parses_real_metadata(tmp_path: Path) -> 
         json.dumps({'sfd_module': 'limen.sfd.foundational_sfd.logreg_binary'}),
         encoding='utf-8',
     )
-    result = BacktestLauncher._kline_size_from_experiment_dir(tmp_path)  # noqa: SLF001
+    result = BacktestLauncher._kline_size_from_experiment_dir(tmp_path)
     assert result == 3600, f'expected 3600 from logreg_binary manifest, got {result}'
 
 
 def test_nexus_running_handler_releases_event_on_expected_count() -> None:
-    from backtest_simulator.launcher.launcher import _NexusRunningHandler
     import logging
     import threading
+
+    from backtest_simulator.launcher.launcher import _NexusRunningHandler
     event = threading.Event()
     handler = _NexusRunningHandler(event, expected=2)
     for _ in range(2):
@@ -78,9 +81,10 @@ def test_nexus_running_handler_releases_event_on_expected_count() -> None:
 
 
 def test_nexus_running_handler_ignores_unrelated_logs() -> None:
-    from backtest_simulator.launcher.launcher import _NexusRunningHandler
     import logging
     import threading
+
+    from backtest_simulator.launcher.launcher import _NexusRunningHandler
     event = threading.Event()
     handler = _NexusRunningHandler(event, expected=1)
     rec = logging.LogRecord(

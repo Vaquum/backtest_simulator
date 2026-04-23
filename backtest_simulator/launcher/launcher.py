@@ -5,23 +5,44 @@ import importlib
 import json
 import logging
 import os
+import queue
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import FrameType
 
+import polars as pl
 from limen import HistoricalData
+from nexus.core.domain.capital_state import CapitalState
+from nexus.core.domain.enums import OperationalMode
+from nexus.core.validator.pipeline_models import InstanceState
 from nexus.infrastructure.manifest import load_manifest
+from nexus.infrastructure.praxis_connector.praxis_inbound import PraxisInbound
+from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
+from nexus.infrastructure.praxis_connector.trade_outcome import TradeOutcome
+from nexus.infrastructure.state_store import StateStore
+from nexus.instance_config import InstanceConfig as NexusInstanceConfig
+from nexus.startup.sequencer import StartupSequencer
+from nexus.startup.shutdown_sequencer import ShutdownSequencer
+from nexus.strategy.context import StrategyContext
+from nexus.strategy.predict_loop import PredictLoop
+from nexus.strategy.timer_loop import TimerLoop
 from praxis.infrastructure.event_spine import EventSpine
 from praxis.infrastructure.venue_adapter import VenueAdapter
 from praxis.launcher import InstanceConfig, Launcher
 from praxis.trading_config import TradingConfig
 
+from backtest_simulator.launcher.action_submitter import build_action_submitter
 from backtest_simulator.launcher.clock import accelerated_clock
 from backtest_simulator.launcher.poller import BacktestMarketDataPoller
 
 _log = logging.getLogger(__name__)
+# Used for the 'nexus instance running' / 'nexus instance stopped' lines
+# so `_NexusRunningHandler` (attached to `praxis.launcher`) catches them
+# from the override exactly as it would from upstream Launcher.
+_nexus_lifecycle_log = logging.getLogger('praxis.launcher')
 
 _BOOT_TIMEOUT_SECONDS = 60
 _NEXUS_RUN_TIMEOUT_SECONDS = 120
@@ -171,6 +192,103 @@ class BacktestLauncher(Launcher):
     def request_stop(self) -> None:
         """Ask `launch()` to return. Outer harness uses this at window end."""
         self._stop_event.set()
+
+    def _run_nexus_instance(
+        self, inst: InstanceConfig, outcome_queue: queue.Queue[TradeOutcome],
+    ) -> None:
+        """Mirror praxis.Launcher._run_nexus_instance but wire `action_submit`.
+
+        Upstream Launcher leaves `PredictLoop(action_submit=None)`, which
+        per Nexus's docstring means "returned actions are discarded
+        (back-compat for tests that do not exercise the submission
+        path)". For a real backtest we need every ENTER/EXIT from
+        on_signal / on_timer to flow through translate + PraxisOutbound
+        into Trading + SimulatedVenueAdapter. This method is a copy of
+        the upstream body with `action_submit=build_action_submitter(...)`
+        injected into both `PredictLoop` and `TimerLoop`.
+        """
+        if self._trading is None or self._loop is None:
+            return
+        try:
+            state_store = StateStore(inst.state_dir)
+            praxis_outbound = PraxisOutbound(
+                submit_fn=self._trading.submit_command,
+                loop=self._loop,
+                register_fn=self._trading.register_account,
+                unregister_fn=self._trading.unregister_account,
+                pull_positions_fn=self._trading.pull_positions,
+            )
+            sequencer = StartupSequencer(
+                state_store=state_store,
+                manifest_path=inst.manifest_path,
+                strategies_base_path=inst.strategies_base_path,
+                strategy_state_path=inst.strategy_state_path,
+                praxis_outbound=praxis_outbound,
+            )
+            runner = sequencer.start()
+            nexus_config = self._build_nexus_instance_config(inst)
+            state = InstanceState(capital=CapitalState(capital_pool=Decimal('1000000')))
+            action_submit = build_action_submitter(
+                nexus_config=nexus_config, state=state, praxis_outbound=praxis_outbound,
+            )
+
+            def market_data_provider(kline_size: int) -> pl.DataFrame:
+                if self._poller is None:
+                    return pl.DataFrame()
+                return self._poller.get_market_data(kline_size)
+
+            def context_provider(_strategy_id: str) -> StrategyContext:
+                return StrategyContext(
+                    positions=(),
+                    capital_available=Decimal('0'),
+                    operational_mode=OperationalMode.ACTIVE,
+                )
+
+            predict_loop = PredictLoop(
+                runner=runner, wired_sensors=sequencer.wired_sensors,
+                market_data_provider=market_data_provider,
+                context_provider=context_provider,
+                action_submit=action_submit,
+            )
+            predict_loop.start()
+
+            timer_loop: TimerLoop | None = None
+            if sequencer.timer_specs:
+                timer_loop = TimerLoop(
+                    runner=runner, strategy_timers=sequencer.timer_specs,
+                    context_provider=context_provider,
+                    action_submit=action_submit,
+                )
+                timer_loop.start()
+
+            praxis_inbound = PraxisInbound(outcome_queue=outcome_queue)
+            _nexus_lifecycle_log.info('nexus instance running', extra={'account_id': inst.account_id})
+            self._stop_event.wait()
+
+            shutdown = ShutdownSequencer(
+                runner=runner,
+                manifest=sequencer._manifest,
+                state_store=state_store,
+                state=sequencer._state,
+                strategy_state_path=inst.strategy_state_path or inst.state_dir / 'strategy_state',
+                predict_loop=predict_loop,
+                timer_loop=timer_loop,
+                praxis_outbound=praxis_outbound,
+                praxis_inbound=praxis_inbound,
+                account_id=inst.account_id,
+            )
+            shutdown.shutdown()
+            _nexus_lifecycle_log.info('nexus instance stopped', extra={'account_id': inst.account_id})
+        except Exception:  # noqa: BLE001 - top-level catch for thread, must not propagate
+            _log.exception('nexus instance failed', extra={'account_id': inst.account_id})
+
+    @staticmethod
+    def _build_nexus_instance_config(inst: InstanceConfig) -> NexusInstanceConfig:
+        # translate_to_trade_command reads `config.account_id`, `config.venue`,
+        # `config.stp_mode` off this object. Default STPMode.CANCEL_TAKER
+        # mirrors production; venue string is unused by the simulated path
+        # but must be non-empty.
+        return NexusInstanceConfig(account_id=inst.account_id, venue='binance_spot_simulated')
 
     def run_window(self, start: datetime, end: datetime) -> None:
         """Run the backtest from `start` to `end`; boot then accelerate.

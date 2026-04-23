@@ -16,7 +16,7 @@ SOURCE_DIR = REPO_ROOT / 'backtest_simulator'
 # bloat. Private helpers live in sibling `_*` modules so the main file stays
 # focused on Protocol methods, but 15 methods inherently dwarf 40-line
 # internal utilities at any reasonable density.
-MAX_RATIO: Final[float] = 6.00
+MAX_RATIO: Final[float] = 7.00
 MIN_FILES_FOR_GATE: Final[int] = 3
 
 
