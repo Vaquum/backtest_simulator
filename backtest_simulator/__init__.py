@@ -12,7 +12,7 @@ from backtest_simulator.exceptions import (
     StopContractViolation,
 )
 from backtest_simulator.feed.clickhouse import ClickHouseConfig, ClickHouseFeed
-from backtest_simulator.launcher import BacktestLauncher
+from backtest_simulator.launcher import BacktestLauncher, BacktestMarketDataPoller
 from backtest_simulator.venue.fees import FeeSchedule
 from backtest_simulator.venue.filters import BinanceSpotFilters
 from backtest_simulator.venue.simulated import SimulatedVenueAdapter
@@ -20,6 +20,7 @@ from backtest_simulator.venue.types import FillModelConfig
 
 __all__ = [
     'BacktestLauncher',
+    'BacktestMarketDataPoller',
     'BinanceSpotFilters',
     'ClickHouseConfig',
     'ClickHouseFeed',
