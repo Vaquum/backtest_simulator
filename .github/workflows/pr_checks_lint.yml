@@ -3,10 +3,10 @@ name: pr_checks_lint
 on:
   pull_request:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   pr_checks_lint:
@@ -15,13 +15,60 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Set up lint venv
         run: python -m venv .venv-lint
-      - name: Install Ruff
-        run: .venv-lint/bin/python -m pip install --upgrade pip 'ruff==0.15.11'
-      - name: Run Ruff lint gate
-        run: .venv-lint/bin/python -m ruff check tools tests/tools
+
+      - name: Install gate toolchain
+        run: |
+          .venv-lint/bin/python -m pip install --upgrade pip \
+            'ruff==0.15.11' \
+            'vulture>=2.14' \
+            'coverage[toml]>=7.6' \
+            pytest
+
+      - name: Run ruff lint (bloat-mechanical rules active)
+        run: .venv-lint/bin/python -m ruff check backtest_simulator tools tests scripts
+
+      - name: Module line-count budget gate
+        run: .venv-lint/bin/python scripts/check_module_budgets.py
+
+      - name: Module docstring gate
+        run: .venv-lint/bin/python scripts/check_module_docstrings.py
+
+      - name: File size balance gate
+        run: .venv-lint/bin/python scripts/check_file_size_balance.py
+
+      - name: Test/code SLOC ratio gate
+        run: .venv-lint/bin/python scripts/check_test_code_ratio.py
+
+      - name: Dead-code (vulture)
+        run: .venv-lint/bin/python -m vulture backtest_simulator/ --min-confidence 80
+
+      - name: Coverage floor gate
+        # Hard-fail only: no soft-fail markers, no pipeline bypass. If
+        # pytest blows up during the coverage run the gate fails exactly
+        # as loudly as if coverage were below the floor — that is the
+        # point. Vacuous-pass when source has no statements (pre-M1
+        # state); the script handles that boundary.
+        run: |
+          .venv-lint/bin/python -m coverage run --branch --source=backtest_simulator \
+            -m pytest tests/ -q
+          .venv-lint/bin/python -m coverage json -o coverage.json
+          .venv-lint/bin/python scripts/check_coverage_floor.py
+
+      - name: Budget-raise ratchet gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch origin "$BASE_REF" --depth=1
+          .venv-lint/bin/python scripts/check_budget_ratchet.py \
+            --base-ref "origin/$BASE_REF" \
+            --pr-number "$PR_NUMBER"

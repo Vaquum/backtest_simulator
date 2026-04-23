@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "backtest_simulator"
-version = "1.3.4"
+version = "1.4.0"
 description = "Honest, gate-enforced backtester for unmodified Nexus strategies against unmodified Praxis."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,6 +15,8 @@ dev = [
   "pytest",
   "ruff==0.15.11",
   "pyright==1.1.408",
+  "vulture>=2.14",
+  "coverage[toml]>=7.6",
 ]
 
 [tool.setuptools.packages.find]
@@ -74,8 +76,8 @@ exclude = [
   "__pycache__",
   "build",
   "dist",
-  "tests",
   "demo",
+  "tests/fixtures",
 ]
 
 [tool.ruff.format]
@@ -90,13 +92,73 @@ select = [
   "RUF",   # ruff-specific
   "BLE",   # flake8-blind-except -- always raise, never bare except
   "ANN",   # flake8-annotations -- catches missing type annotations
+  # Bloat-mechanical law (slice #11). Enforce minimum-viable coding.
+  "C901",      # cyclomatic complexity cap
+  "PLR0912",   # too-many-branches
+  "PLR0913",   # too-many-arguments
+  "PLR0915",   # too-many-statements
+  "T201",      # no print()
+  "FIX001",    # no TODO
+  "FIX002",    # no FIXME
+  "FIX003",    # no XXX
+  "FIX004",    # no HACK
+  "ERA001",    # no commented-out code
+  "D200",      # one-line docstring should fit on one line
+  "D205",      # blank line after summary
+  "D415",      # summary ends with period/question/bang
+  "PIE790",    # unnecessary pass / docstring-only body
 ]
 ignore = [
   "E501",   # line length handled by formatter
 ]
 
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-args = 6
+max-branches = 12
+max-statements = 50
+
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["S101", "ANN", "BLE001"]
+"tests/**/*.py" = [
+  "S101", "ANN", "BLE001",
+  "PLR0912", "PLR0913", "PLR0915",
+  "D200", "D205", "D415",
+]
+# tools/ is Out of Scope for slice #11 and legitimately uses patterns
+# (print banners, dense scan loops, TODOs in imported code, etc.)
+# that the bloat rules would otherwise require editing. Exempt the
+# full set that would force modifying tools/. PIE790 stays on.
+"tools/**/*.py" = [
+  "C901", "PLR0912", "PLR0913", "PLR0915",
+  "T201",
+  "FIX001", "FIX002", "FIX003", "FIX004",
+  "ERA001", "D200", "D205", "D415",
+]
+# scripts/ hosts this slice's own gate scripts. They print banners by
+# design. Same exemption set, same rationale, same reason: the gates
+# are allowed to be the gates.
+"scripts/**/*.py" = [
+  "C901", "PLR0912", "PLR0913", "PLR0915",
+  "T201",
+  "FIX001", "FIX002", "FIX003", "FIX004",
+  "ERA001", "D200", "D205", "D415",
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["backtest_simulator"]
+
+[tool.vulture]
+paths = ["backtest_simulator"]
+min_confidence = 80
+
+[tool.coverage.run]
+branch = true
+source = ["backtest_simulator"]
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.coverage.json]
+output = "coverage.json"

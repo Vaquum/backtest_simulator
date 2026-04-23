@@ -1,3 +1,12 @@
+# v1.4.0
+
+- Hard-mechanical bloat gates (closes #11). Every subsequent PR is subject to a set of CI-enforced conditions that fail loud and hard on bloat — no warning mode, no disable flag, no environment-variable override, no conditional skip.
+- Added 7 gate scripts under `scripts/`: `check_module_budgets.py` (per-module line ceilings), `check_module_docstrings.py` (one-line module docstring required), `check_file_size_balance.py` (largest file ≤ 2.5× median), `check_test_code_ratio.py` (ratio in [0.6, 2.0]), `check_coverage_floor.py` (line ≥ 95%, branch ≥ 90%), `check_budget_ratchet.py` (budget raises require `[budget-raise: <path>: <reason>]` marker in PR body).
+- Added `.github/module_budgets.json` with 37 entries (30 prospective M1 modules under `backtest_simulator/**/*.py` — 2,840-line ceiling — plus 7 self-budgets for the gate scripts themselves).
+- Extended `pyproject.toml` `[tool.ruff.lint].select` with 14 new rules: `C901` (complexity ≤ 10), `PLR0912/13/15` (branches/args/statements caps), `T201` (no `print`), `FIX001–004` (no TODO/FIXME/XXX/HACK), `ERA001` (no commented code), `D200/D205/D415` (docstring hygiene), `PIE790`. `tools/` and `scripts/` exempted via `per-file-ignores` from every rule that would force modifying them (they legitimately print banners by design).
+- Extended `pr_checks_lint.yml` to run every new gate + vulture + `ruff check backtest_simulator tools tests scripts`. No `|| true`, no `continue-on-error`, no soft-fail anywhere.
+- Added `tests/tools/test_bloat_gates_contract.py` (12 tests) and `tests/tools/test_bloat_gate_mutation.py` (12 mutation tests) — every gate has a paired mutation test that proves it fires on the specific violation class it is supposed to catch.
+
 # v1.3.4
 
 - Post-bootstrap hardening sweep (slice #7, closes parent meta-issue #6).
