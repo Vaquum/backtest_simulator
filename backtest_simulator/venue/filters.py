@@ -1,4 +1,4 @@
-"""SymbolFilters — Binance Spot LOT_SIZE / MIN_NOTIONAL / PRICE_FILTER."""
+"""BinanceSpotFilters — Binance Spot LOT_SIZE / MIN_NOTIONAL / PRICE_FILTER."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,7 +6,7 @@ from decimal import Decimal
 
 
 @dataclass(frozen=True)
-class SymbolFilters:
+class BinanceSpotFilters:
     """Binance Spot exchange filters. Values are conservative defaults for BTCUSDT."""
 
     symbol: str
@@ -17,7 +17,7 @@ class SymbolFilters:
     tick_size: Decimal
 
     @classmethod
-    def binance_spot(cls, symbol: str = 'BTCUSDT') -> SymbolFilters:
+    def binance_spot(cls, symbol: str = 'BTCUSDT') -> BinanceSpotFilters:
         return cls(
             symbol=symbol,
             min_qty=Decimal('0.00001'),

@@ -4,10 +4,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
 
 import clickhouse_connect
 import polars as pl
+from clickhouse_connect.driver.client import Client
 
 from backtest_simulator.feed.lookahead import (
     assert_trades_causal,
@@ -74,9 +74,9 @@ class ClickHouseFeed:
     def __init__(self, config: ClickHouseConfig, symbol: str = 'BTCUSDT') -> None:
         self._config = config
         self._symbol = symbol
-        self._client: Any = None
+        self._client: Client | None = None
 
-    def _connect(self) -> Any:
+    def _connect(self) -> Client:
         # Lazy connect so construction doesn't require the DB to be reachable.
         if self._client is not None:
             return self._client
@@ -94,6 +94,7 @@ class ClickHouseFeed:
         # `limen.HistoricalData().get_spot_klines(...)` and feed the
         # resulting frame to whatever consumer needs bars. This feed
         # owns the fill-path (trades), not the feature-path (klines).
+        del kline_size, n_rows, symbol
         msg = (
             'ClickHouseFeed.get_window: klines are served by '
             'limen.HistoricalData().get_spot_klines(); this feed only '
@@ -101,14 +102,17 @@ class ClickHouseFeed:
         )
         raise NotImplementedError(msg)
 
-    def get_trades(self, symbol: str, start: datetime, end: datetime) -> pl.DataFrame:
-        assert_trades_causal(end, symbol=symbol)
+    def get_trades(
+        self, symbol: str, start: datetime, end: datetime,
+        *, venue_lookahead_seconds: int = 0,
+    ) -> pl.DataFrame:
+        assert_trades_causal(end, symbol=symbol, venue_lookahead_seconds=venue_lookahead_seconds)
         if symbol != self._symbol:
             msg = f'ClickHouseFeed configured for {self._symbol}; received {symbol}'
             raise ValueError(msg)
         client = self._connect()
         # query_arrow pulls a columnar batch -> Polars in bulk. Row-by-row
-        # conversion is O(N × Python-dispatch) and hits ~30s for an hour of
+        # conversion is O(N x Python-dispatch) and hits ~30s for an hour of
         # ticks (~50K rows). Arrow is the bulk path.
         query = (
             'SELECT datetime, price, quantity, is_buyer_maker, trade_id '
@@ -143,5 +147,8 @@ class ClickHouseFeed:
             pl.col('price').cast(pl.Float64),
             pl.col('qty').cast(pl.Float64),
         )
-        assert_window_causal(frame, symbol=symbol, column='time')
+        assert_window_causal(
+            frame, symbol=symbol, column='time',
+            venue_lookahead_seconds=venue_lookahead_seconds,
+        )
         return frame

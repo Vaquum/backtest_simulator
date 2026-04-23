@@ -1,8 +1,6 @@
-"""backtest_simulator — honesty-gated backtester for Nexus strategies."""
+"""backtest_simulator — honesty-gated backtester for unmodified Nexus strategies."""
 from __future__ import annotations
 
-from backtest_simulator.driver import SimulationDriver
-from backtest_simulator.environment import BacktestEnvironment
 from backtest_simulator.exceptions import (
     ConservationViolation,
     DeterminismViolation,
@@ -13,18 +11,27 @@ from backtest_simulator.exceptions import (
     SanityViolation,
     StopContractViolation,
 )
+from backtest_simulator.feed.clickhouse import ClickHouseConfig, ClickHouseFeed
 from backtest_simulator.launcher import BacktestLauncher
+from backtest_simulator.venue.fees import FeeSchedule
+from backtest_simulator.venue.filters import BinanceSpotFilters
+from backtest_simulator.venue.simulated import SimulatedVenueAdapter
+from backtest_simulator.venue.types import FillModelConfig
 
 __all__ = [
-    'BacktestEnvironment',
     'BacktestLauncher',
+    'BinanceSpotFilters',
+    'ClickHouseConfig',
+    'ClickHouseFeed',
     'ConservationViolation',
     'DeterminismViolation',
+    'FeeSchedule',
+    'FillModelConfig',
     'HonestyViolation',
     'LookAheadViolation',
     'ParityViolation',
     'PerformanceViolation',
     'SanityViolation',
-    'SimulationDriver',
+    'SimulatedVenueAdapter',
     'StopContractViolation',
 ]

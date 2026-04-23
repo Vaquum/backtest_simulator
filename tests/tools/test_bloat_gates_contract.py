@@ -50,12 +50,11 @@ def test_module_budgets_covers_every_m1_path_from_issue_10() -> None:
     data = json.loads(BUDGET_JSON.read_text(encoding='utf-8'))
     bts_paths = {p for p in data if p.startswith('backtest_simulator/')}
     script_paths = {p for p in data if p.startswith('scripts/')}
-    # 30 paths from issue #10 (pre-M1 slice) + any paths added by M1
-    # implementation PRs (e.g. venue/types.py in feat/m1-bootstrap).
-    # Each PR must add a budget entry for every new module and the
-    # contract test stays flexible on the upper bound as long as every
-    # new module is accounted for.
-    assert len(bts_paths) >= 30, f'expected >= 30 backtest_simulator paths, got {len(bts_paths)}'
+    # Lower bound relaxed after the fake-purge commit deleted driver.py,
+    # environment.py, and the runtime/* shim modules. Every remaining
+    # module must still have a budget entry; new modules added in future
+    # PRs bump this by their own count.
+    assert len(bts_paths) >= 22, f'expected >= 22 backtest_simulator paths, got {len(bts_paths)}'
     assert len(script_paths) == 7, f'expected 7 scripts paths, got {len(script_paths)}'
 
 

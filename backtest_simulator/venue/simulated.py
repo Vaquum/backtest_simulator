@@ -1,116 +1,244 @@
-"""SimulatedVenueAdapter — implements praxis VenueAdapter against a parquet feed."""
+"""SimulatedVenueAdapter — real Praxis VenueAdapter Protocol against historical trades."""
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
-import polars as pl
-
-from backtest_simulator.feed.protocol import HistoricalFeed
-from backtest_simulator.venue.fees import FeeSchedule
-from backtest_simulator.venue.fills import walk_trades
-from backtest_simulator.venue.filters import SymbolFilters
-from backtest_simulator.venue.types import (
-    Account,
-    FillModelConfig,
-    FillResult,
-    PendingOrder,
+from praxis.core.domain.enums import OrderSide, OrderStatus, OrderType
+from praxis.core.domain.health_snapshot import HealthSnapshot
+from praxis.infrastructure.venue_adapter import (
+    BalanceEntry,
+    CancelResult,
+    ExecutionReport,
+    NotFoundError,
+    OrderBookLevel,
+    OrderBookSnapshot,
     SubmitResult,
+    VenueOrder,
+    VenueTrade,
+)
+from praxis.infrastructure.venue_adapter import (
+    SymbolFilters as PraxisSymbolFilters,
 )
 
+from backtest_simulator.feed.protocol import HistoricalFeed
+from backtest_simulator.venue import _adapter_internals as _I
+from backtest_simulator.venue.fees import FeeSchedule
+from backtest_simulator.venue.fills import walk_trades
+from backtest_simulator.venue.filters import BinanceSpotFilters
+from backtest_simulator.venue.types import FillModelConfig, PendingOrder
 
-@dataclass
+
 class SimulatedVenueAdapter:
-    """Minimal Praxis VenueAdapter implementation for backtesting.
+    """VenueAdapter Protocol implementation backed by historical trades."""
 
-    Stop enforcement is delegated to `walk_trades`, which fills at the
-    declared stop price (rounded to tick_size) — never a post-bar-close
-    substitute. That property is what makes `R = |entry - stop| * qty`
-    mechanically truthful; it is the single load-bearing invariant of
-    this layer.
-    """
-
-    feed: HistoricalFeed
-    fees: FeeSchedule
-    filters: SymbolFilters
-    fill_config: FillModelConfig = field(default_factory=FillModelConfig)
-    trade_window_seconds: int = 3600
-    _accounts: dict[str, Account] = field(default_factory=dict)
-    _open_orders: dict[str, PendingOrder] = field(default_factory=dict)
-    _next_order_id: int = 1
+    def __init__(
+        self,
+        feed: HistoricalFeed,
+        filters: BinanceSpotFilters,
+        fees: FeeSchedule,
+        fill_config: FillModelConfig | None = None,
+        trade_window_seconds: int = 3600,
+    ) -> None:
+        self._feed = feed
+        self._filters = filters
+        self._fees = fees
+        self._fill_config = fill_config or FillModelConfig()
+        self._trade_window_seconds = trade_window_seconds
+        self._accounts: dict[str, _I.Account] = {}
+        self._symbol_filters: dict[str, BinanceSpotFilters] = {filters.symbol: filters}
+        self._next_order_seq = 1
+        self._next_trade_seq = 1
 
     def register_account(self, account_id: str, api_key: str, api_secret: str) -> None:
-        self._accounts[account_id] = Account(account_id, api_key, api_secret)
+        self._accounts[account_id] = _I.Account(
+            account_id=account_id, api_key=api_key, api_secret=api_secret,
+        )
 
     def unregister_account(self, account_id: str) -> None:
-        self._accounts.pop(account_id, None)
+        if account_id not in self._accounts:
+            msg = f'account_id {account_id!r} not registered'
+            raise KeyError(msg)
+        del self._accounts[account_id]
 
-    def attach_ws_sink(
-        self, account_id: str,
-        sink: Callable[[str, dict[str, object]], Awaitable[None]],
-    ) -> None:
-        acct = self._accounts.get(account_id)
-        if acct is not None:
-            acct.ws_sink = sink
-
-    async def submit_order(  # noqa: PLR0913 - Praxis VenueAdapter Protocol; kwargs-only
-        self, *,
-        symbol: str, side: str, order_type: str,
+    async def submit_order(  # noqa: PLR0913 - Protocol signature; every arg is Praxis-defined
+        self,
+        account_id: str,
+        symbol: str,
+        side: OrderSide,
+        order_type: OrderType,
         qty: Decimal,
-        limit_price: Decimal | None = None,
+        *,
+        price: Decimal | None = None,
         stop_price: Decimal | None = None,
-        time_in_force: str = 'GTC',
-        submit_time: datetime | None = None,
+        stop_limit_price: Decimal | None = None,
+        client_order_id: str | None = None,
+        time_in_force: str | None = None,
     ) -> SubmitResult:
-        order_id = self._allocate_order_id()
-        now = submit_time or datetime.now(UTC)
-        # For LIMIT / STOP orders we can validate notional up-front. MARKET
-        # orders skip MIN_NOTIONAL here and rely on post-fill validation via
-        # the fill-closure + fee accounting gates; a full VenueAdapter
-        # implementation with book access would validate against best bid/
-        # ask at submit time. The LOT_SIZE check still runs (qty alone).
-        reference_price = limit_price or stop_price
-        if reference_price is not None:
-            rejection = self.filters.validate(qty, reference_price)
-            if rejection is not None:
-                return SubmitResult(order_id=order_id, accepted=False, reject_reason=rejection, fills=[], fees_quote=Decimal('0'))
-        elif qty < self.filters.min_qty or qty > self.filters.max_qty:
-            reason = f'LOT_SIZE: qty {qty} outside [{self.filters.min_qty}, {self.filters.max_qty}]'
-            return SubmitResult(order_id=order_id, accepted=False, reject_reason=reason, fills=[], fees_quote=Decimal('0'))
+        del stop_limit_price  # OCO/stop-limit path not implemented in the simulated fill engine
+        account = self._require_account(account_id)
+        venue_order_id = self._mint_order_id()
+        coid = client_order_id or f'BTS-{venue_order_id}'
         order = PendingOrder(
-            order_id=order_id, side=side, order_type=order_type,
-            qty=qty, limit_price=limit_price, stop_price=stop_price,
-            time_in_force=time_in_force, submit_time=now, symbol=symbol,
+            order_id=venue_order_id, side=side.name, order_type=_I.TYPE_MAP[order_type],
+            qty=qty, limit_price=price, stop_price=stop_price,
+            time_in_force=time_in_force or 'GTC', submit_time=self._now(), symbol=symbol,
         )
-        self._open_orders[order_id] = order
-        fills = walk_trades(order, self._fetch_trades(symbol, now), self.fill_config, self.filters)
-        await asyncio.sleep(0)
-        fees_total = self._apply_fees(symbol, fills)
-        if fills:
-            self._open_orders.pop(order_id, None)
-        return SubmitResult(order_id=order_id, accepted=True, reject_reason=None, fills=fills, fees_quote=fees_total)
+        if _I.reject_reason(order, self._filters, price) is not None:
+            _I.record_rejection(account, order, coid, side, order_type, price)
+            return SubmitResult(
+                venue_order_id=venue_order_id, status=OrderStatus.REJECTED, immediate_fills=(),
+            )
+        trades = self._feed.get_trades(
+            symbol, order.submit_time,
+            order.submit_time + _I.window_seconds(self._trade_window_seconds),
+            venue_lookahead_seconds=self._trade_window_seconds,
+        )
+        fills = walk_trades(order, trades, self._fill_config, self._filters)
+        immediate = _I.record_fills(
+            account, self._fees, venue_order_id, coid,
+            symbol, side, fills, self._mint_trade_id,
+        )
+        filled_qty = sum((f.qty for f in immediate), Decimal('0'))
+        status = (
+            OrderStatus.FILLED if filled_qty >= qty
+            else OrderStatus.PARTIALLY_FILLED if filled_qty > 0
+            else OrderStatus.REJECTED
+        )
+        account.orders[venue_order_id] = VenueOrder(
+            venue_order_id=venue_order_id, client_order_id=coid,
+            status=status, symbol=symbol, side=side, order_type=order_type,
+            qty=qty, filled_qty=filled_qty, price=price,
+        )
+        return SubmitResult(
+            venue_order_id=venue_order_id, status=status, immediate_fills=immediate,
+        )
 
-    async def cancel_order(self, *, order_id: str) -> bool:
-        return self._open_orders.pop(order_id, None) is not None
+    async def cancel_order(
+        self, account_id: str, symbol: str,
+        *, venue_order_id: str | None = None, client_order_id: str | None = None,
+    ) -> CancelResult:
+        account = self._require_account(account_id)
+        vo = _I.resolve_order(account, venue_order_id, client_order_id)
+        terminal = {OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED}
+        if vo.status in terminal:
+            return CancelResult(venue_order_id=vo.venue_order_id, status=vo.status)
+        account.orders[vo.venue_order_id] = VenueOrder(
+            venue_order_id=vo.venue_order_id, client_order_id=vo.client_order_id,
+            status=OrderStatus.CANCELED, symbol=vo.symbol, side=vo.side,
+            order_type=vo.order_type, qty=vo.qty, filled_qty=vo.filled_qty, price=vo.price,
+        )
+        return CancelResult(venue_order_id=vo.venue_order_id, status=OrderStatus.CANCELED)
 
-    def _allocate_order_id(self) -> str:
-        oid = f'SIM{self._next_order_id:08d}'
-        self._next_order_id += 1
+    async def cancel_order_list(
+        self, account_id: str, symbol: str,
+        *, venue_order_id: str | None = None, client_order_id: str | None = None,
+    ) -> CancelResult:
+        return await self.cancel_order(
+            account_id, symbol, venue_order_id=venue_order_id, client_order_id=client_order_id,
+        )
+
+    async def query_order(
+        self, account_id: str, symbol: str,
+        *, venue_order_id: str | None = None, client_order_id: str | None = None,
+    ) -> VenueOrder:
+        return _I.resolve_order(
+            self._require_account(account_id), venue_order_id, client_order_id,
+        )
+
+    async def query_open_orders(self, account_id: str, symbol: str) -> list[VenueOrder]:
+        account = self._require_account(account_id)
+        live = {OrderStatus.SUBMITTING, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED}
+        return [o for o in account.orders.values() if o.symbol == symbol and o.status in live]
+
+    async def query_balance(
+        self, account_id: str, assets: frozenset[str],
+    ) -> list[BalanceEntry]:
+        account = self._require_account(account_id)
+        return [
+            BalanceEntry(
+                asset=a, free=account.balances.get(a, Decimal('0')),
+                locked=account.locked.get(a, Decimal('0')),
+            )
+            for a in sorted(assets)
+        ]
+
+    async def query_trades(
+        self, account_id: str, symbol: str,
+        *, start_time: datetime | None = None,
+    ) -> list[VenueTrade]:
+        account = self._require_account(account_id)
+        return [
+            t for t in account.trades
+            if t.symbol == symbol and (start_time is None or t.timestamp >= start_time)
+        ]
+
+    async def get_exchange_info(self, symbol: str) -> PraxisSymbolFilters:
+        f = self._symbol_filters.get(symbol)
+        if f is None:
+            msg = f'exchange_info: symbol {symbol!r} not loaded; call load_filters first'
+            raise NotFoundError(msg)
+        return PraxisSymbolFilters(
+            symbol=f.symbol, tick_size=f.tick_size, lot_step=f.step_size,
+            lot_min=f.min_qty, lot_max=f.max_qty, min_notional=f.min_notional,
+        )
+
+    async def query_order_book(self, symbol: str, *, limit: int = 20) -> OrderBookSnapshot:
+        # One-level book sourced from most recent trade. Real depth-20 needs a
+        # live book; this passes the Protocol so no hot-path consumer of the
+        # book exists in the backtest. HonestyStatus flags as ESTIMATED.
+        del limit
+        now = self._now()
+        trades = self._feed.get_trades(symbol, now - _I.window_seconds(60), now)
+        if trades.is_empty():
+            return OrderBookSnapshot(bids=(), asks=(), last_update_id=0)
+        last = trades.tail(1).row(0, named=True)
+        px, qty = Decimal(str(last['price'])), Decimal(str(last['qty']))
+        return OrderBookSnapshot(
+            bids=(OrderBookLevel(price=px, qty=qty),),
+            asks=(OrderBookLevel(price=px, qty=qty),),
+            last_update_id=int(last.get('trade_id', 0)),
+        )
+
+    async def get_server_time(self) -> int:
+        return int(self._now().timestamp() * 1000)
+
+    def get_health_snapshot(self, account_id: str) -> HealthSnapshot:
+        # Simulated venue has no network, retries, or drift. Zeros are honest.
+        return HealthSnapshot()
+
+    async def load_filters(self, symbols: Sequence[str]) -> None:
+        for sym in symbols:
+            if sym not in self._symbol_filters:
+                self._symbol_filters[sym] = BinanceSpotFilters.binance_spot(sym)
+
+    def parse_execution_report(self, data: dict[str, Any]) -> ExecutionReport:
+        del data
+        msg = (
+            'SimulatedVenueAdapter.parse_execution_report: WebSocket path is '
+            'unused in backtest; fills return inline via SubmitResult.'
+        )
+        raise NotImplementedError(msg)
+
+    def _require_account(self, account_id: str) -> _I.Account:
+        account = self._accounts.get(account_id)
+        if account is None:
+            msg = f'account_id {account_id!r} not registered'
+            raise KeyError(msg)
+        return account
+
+    def _mint_order_id(self) -> str:
+        oid = f'SIM-O-{self._next_order_seq:08d}'
+        self._next_order_seq += 1
         return oid
 
-    def _apply_fees(self, symbol: str, fills: list[FillResult]) -> Decimal:
-        return sum(
-            (self.fees.fee(symbol, f.fill_price * f.fill_qty, is_maker=f.is_maker) for f in fills),
-            Decimal('0'),
-        )
+    def _mint_trade_id(self) -> str:
+        tid = f'SIM-T-{self._next_trade_seq:08d}'
+        self._next_trade_seq += 1
+        return tid
 
-    def _fetch_trades(self, symbol: str, submit_time: datetime) -> pl.DataFrame:
-        start = submit_time
-        end = submit_time + timedelta(seconds=self.trade_window_seconds)
-        try:
-            return self.feed.get_trades(symbol, start, end)
-        except Exception:  # noqa: BLE001 - feed may legitimately have no trades for this window
-            return pl.DataFrame(schema={'time': pl.Datetime, 'price': pl.Float64, 'qty': pl.Float64})
+    @staticmethod
+    def _now() -> datetime:
+        return datetime.now(UTC)

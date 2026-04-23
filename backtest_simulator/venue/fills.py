@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import polars as pl
 
-from backtest_simulator.venue.filters import SymbolFilters
+from backtest_simulator.venue.filters import BinanceSpotFilters
 from backtest_simulator.venue.types import FillModelConfig, FillResult, PendingOrder
 
 
@@ -14,7 +14,7 @@ def walk_trades(
     order: PendingOrder,
     trades: pl.DataFrame,
     config: FillModelConfig,
-    filters: SymbolFilters,
+    filters: BinanceSpotFilters,
 ) -> list[FillResult]:
     """Match `order` against the historical `trades` stream. Stop enforcement is strict.
 
@@ -40,7 +40,7 @@ def walk_trades(
     return []
 
 
-def _walk_market(order: PendingOrder, window: pl.DataFrame, filters: SymbolFilters) -> list[FillResult]:
+def _walk_market(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFilters) -> list[FillResult]:
     remaining = order.qty
     fills: list[FillResult] = []
     for row in window.iter_rows(named=True):
@@ -56,7 +56,7 @@ def _walk_market(order: PendingOrder, window: pl.DataFrame, filters: SymbolFilte
     return fills
 
 
-def _walk_limit(order: PendingOrder, window: pl.DataFrame, filters: SymbolFilters) -> list[FillResult]:
+def _walk_limit(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFilters) -> list[FillResult]:
     if order.limit_price is None:
         return []
     first_px = Decimal(str(window.row(0, named=True)['price']))
@@ -79,7 +79,7 @@ def _walk_limit(order: PendingOrder, window: pl.DataFrame, filters: SymbolFilter
     return []
 
 
-def _walk_stop(order: PendingOrder, window: pl.DataFrame, filters: SymbolFilters) -> list[FillResult]:
+def _walk_stop(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFilters) -> list[FillResult]:
     if order.stop_price is None:
         return []
     stop = order.stop_price

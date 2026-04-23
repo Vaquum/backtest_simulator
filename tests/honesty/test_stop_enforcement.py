@@ -7,14 +7,14 @@ from decimal import Decimal
 import polars as pl
 
 from backtest_simulator.venue.fills import walk_trades
-from backtest_simulator.venue.filters import SymbolFilters
+from backtest_simulator.venue.filters import BinanceSpotFilters
 from backtest_simulator.venue.types import FillModelConfig, PendingOrder
 
 
 def test_stop_triggers_at_declared_price() -> None:
     """The invariant: when the trade stream crosses declared stop, we fill AT that stop."""
     now = datetime(2020, 4, 1, tzinfo=UTC)
-    filters = SymbolFilters.binance_spot('BTCUSDT')
+    filters = BinanceSpotFilters.binance_spot('BTCUSDT')
     config = FillModelConfig(submit_latency_ms=50)
     declared_stop = Decimal('6500.00')
 
@@ -42,7 +42,7 @@ def test_stop_triggers_at_declared_price() -> None:
 
 def test_buy_stop_triggers_when_stream_crosses_upward() -> None:
     now = datetime(2020, 4, 1, tzinfo=UTC)
-    filters = SymbolFilters.binance_spot('BTCUSDT')
+    filters = BinanceSpotFilters.binance_spot('BTCUSDT')
     config = FillModelConfig(submit_latency_ms=50)
     trades = pl.DataFrame({
         'time': [now + timedelta(seconds=i) for i in (1, 2, 3)],
@@ -62,7 +62,7 @@ def test_buy_stop_triggers_when_stream_crosses_upward() -> None:
 
 def test_stop_does_not_fire_when_stream_never_crosses() -> None:
     now = datetime(2020, 4, 1, tzinfo=UTC)
-    filters = SymbolFilters.binance_spot('BTCUSDT')
+    filters = BinanceSpotFilters.binance_spot('BTCUSDT')
     config = FillModelConfig(submit_latency_ms=50)
     trades = pl.DataFrame({
         'time': [now + timedelta(seconds=i) for i in (1, 2, 3)],

@@ -16,6 +16,20 @@ class HistoricalFeed(Protocol):
         Raises LookAheadViolation if any returned row has a timestamp
         greater than the frozen clock's current time.
         """
+        # Protocol stub — implementations supply the body. `del` keeps
+        # vulture from flagging these Protocol-required parameters as unused.
+        del symbol, kline_size, n_rows
 
-    def get_trades(self, symbol: str, start: datetime, end: datetime) -> pl.DataFrame:
-        """Return trades in [start, end]. Raises LookAheadViolation if end > now."""
+    def get_trades(
+        self, symbol: str, start: datetime, end: datetime,
+        *, venue_lookahead_seconds: int = 0,
+    ) -> pl.DataFrame:
+        """Return trades in [start, end].
+
+        Strategy-facing callers (the default) MUST have `end <= frozen_now()`
+        or LookAheadViolation is raised. The simulated venue may pass
+        `venue_lookahead_seconds > 0` to consult trades within a bounded
+        fill-simulation window past the frozen clock; the ceiling is the
+        adapter's declared `trade_window_seconds`.
+        """
+        del symbol, start, end, venue_lookahead_seconds
