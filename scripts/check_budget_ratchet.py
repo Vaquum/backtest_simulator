@@ -87,11 +87,16 @@ def main() -> int:
     ap.add_argument('--pr-number', type=int, help='PR number; requires GH_TOKEN')
     ap.add_argument('--pr-body-file', help='path to file with PR body text')
     args = ap.parse_args()
-    if (args.base_ref is None) != (args.pr_number is None and args.pr_body_file is None):
-        if args.base_ref is not None and args.pr_number is None:
+    if args.base_ref is not None:
+        if args.pr_number is None:
             ap.error('--base-ref requires --pr-number (CI mode)')
-        if args.base_file is not None and args.pr_body_file is None:
+        if args.pr_body_file is not None:
+            ap.error('cannot mix --base-ref (CI mode) with --pr-body-file (local mode)')
+    else:
+        if args.pr_body_file is None:
             ap.error('--base-file requires --pr-body-file (local mode)')
+        if args.pr_number is not None:
+            ap.error('cannot mix --base-file (local mode) with --pr-number (CI mode)')
     if args.base_ref is not None:
         base = _base_budget_from_ref(args.base_ref)
         pr_body = _pr_body_from_number(int(args.pr_number))
