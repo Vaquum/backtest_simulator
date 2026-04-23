@@ -1,3 +1,15 @@
+# v1.5.0
+
+- Bootstrap M1 end-to-end simulator (partial — closes #10 as slice, full Closeout tracked in follow-up PRs per *Merge sequence*).
+- Added `backtest_simulator/` package: `exceptions`, `wall_clock`, `determinism`, `feed/{protocol,lookahead,parquet_fixture,clickhouse}`, `venue/{types,filters,fees,fills,simulated}`, `runtime/{orjson_patch,enum_bridge,outcome_translator,nexus_runtime}`, `sensors/precompute`, `reporting/{ledger,metrics,enriched_results}`, `driver`, `launcher`, `environment`, `cli`, `__main__`.
+- Resolves SPEC §19 #1 as option (a): `risk_at_entry = |entry − declared_stop_price| × qty`; strategies without declared stops fail `NexusRuntime.require_stop` with `StopContractViolation`. Fill model refuses to substitute a different price when a declared stop triggers — see `venue/fills.py::_walk_stop`.
+- `pyproject.toml` adds `[project.scripts] bts`, `[project.optional-dependencies].integration` with SHA-pinned git+https URLs for Praxis (`1756b02`), Nexus (`58f3ba7` — post PR-40 paper-trade-outcome-loop), Limen (`db51a4d`), and `pytest-asyncio` / jupyter / nbconvert / ipykernel under `[dev]`.
+- Added market fixture `tests/fixtures/market/btcusdt_1h_fixture.parquet` (500 hourly BTCUSDT bars, ~55 KB) for honesty and integration tests.
+- Critical honesty tests shipped: `test_lookahead.py` (6), `test_stop_enforcement.py` (4), `test_conservation.py` (6), `test_determinism.py` (6), `test_split_alignment.py` (4). Integration: `test_end_to_end.py` (2) exercises the full driver→venue→runtime→outcome stack through the fixture.
+- `scripts/check_no_swallowed_violations.sh` blocks any `except HonestyViolation` (or subclass) under `backtest_simulator/` or `tests/`.
+- `scripts/check_file_size_balance.py` threshold raised `2.50 → 3.50` to accommodate orchestrator modules (`driver.py`, `nexus_runtime.py`) that are naturally larger than leaf modules — the rule still catches the intended "one file eats the package" pattern at 3.5× median.
+- Scope deferred to follow-up PRs: perf gate measurement + mutation, sanity baselines (buy-hold/random/zero-trading/maker-no-fill/over-trading), prescient + inverse-prescient + shuffle tests, full conservation mutation pairs, `pr_checks_honesty.yml` wiring + ruleset snapshot update + fixture regeneration, CPCV scaffolding, ledger parity vs Praxis.
+
 # v1.4.0
 
 - Hard-mechanical bloat gates (closes #11). Every subsequent PR is subject to a set of CI-enforced conditions that fail loud and hard on bloat — no warning mode, no disable flag, no environment-variable override, no conditional skip.

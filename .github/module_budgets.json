@@ -13,6 +13,7 @@
   "backtest_simulator/feed/parquet_fixture.py": 80,
   "backtest_simulator/venue/__init__.py": 30,
   "backtest_simulator/venue/simulated.py": 240,
+  "backtest_simulator/venue/types.py": 80,
   "backtest_simulator/venue/fills.py": 180,
   "backtest_simulator/venue/fees.py": 80,
   "backtest_simulator/venue/filters.py": 60,

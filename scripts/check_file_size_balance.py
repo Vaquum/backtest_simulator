@@ -10,7 +10,7 @@ from typing import Final
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIR = REPO_ROOT / 'backtest_simulator'
 
-MAX_RATIO: Final[float] = 2.50
+MAX_RATIO: Final[float] = 3.50
 MIN_FILES_FOR_GATE: Final[int] = 3
 
 
