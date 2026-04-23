@@ -32,15 +32,22 @@ dev = [
   "ipykernel>=6.0",
 ]
 
-# Private sibling packages installed from Vaquum GitHub, pinned by
-# commit SHA. CI configures a git credential helper with
-# ${{ secrets.SIBLING_INSTALL_TOKEN }} before running
-# `pip install -e .[integration]`. Local dev uses the same git+https
-# URL resolved via the developer's own GitHub credentials.
+# Private sibling packages installed from Vaquum GitHub. Intentionally
+# not pinned — Praxis / Nexus / Limen evolve, backtest_simulator evolves
+# with them. If a sibling breaking change lands, the fix is to update
+# the shim, not to freeze a stale SHA. CI configures a git credential
+# helper with ${{ secrets.SIBLING_INSTALL_TOKEN }} before running
+# `pip install -e '.[integration]'`.
 integration = [
-  "praxis @ git+https://github.com/Vaquum/Praxis.git@1756b0208fba132ebfeaf85e5ee8f15ec37bd37c",
-  "nexus @ git+https://github.com/Vaquum/Nexus.git@58f3ba795bea82922a27e117e26058782395d51b",
-  "limen @ git+https://github.com/Vaquum/Limen.git@db51a4d07612698ffda6d06bf962e04838364015",
+  # URLs (no .git suffix, no @ref) match the canonical forms used by
+  # Praxis and Nexus in their own pyprojects. pip's resolver treats
+  # distinct source URLs as different packages, so any variation
+  # (`.git`, `@main`, etc.) triggers a ResolutionImpossible. Leave
+  # version resolution to each repo's main branch and let pip unify
+  # on the URL string.
+  "vaquum-praxis @ git+https://github.com/Vaquum/Praxis",
+  # nexus and limen are pulled transitively by praxis. Duplicating
+  # them here would force-pin a URL form and trip the resolver.
 ]
 
 [project.scripts]
