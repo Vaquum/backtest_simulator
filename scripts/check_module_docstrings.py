@@ -12,6 +12,7 @@ SOURCE_DIR = REPO_ROOT / 'backtest_simulator'
 
 def first_statement_docstring(source: str) -> ast.Constant | None:
     # Returns the first-statement docstring node if one exists; else None.
+    # Caller is responsible for catching SyntaxError from ast.parse.
     tree = ast.parse(source)
     if not tree.body:
         return None
@@ -27,11 +28,15 @@ def check_file(path: Path) -> str | None:
     stripped = source.strip()
     if not stripped:
         return None
-    docstring = first_statement_docstring(source)
+    try:
+        docstring = first_statement_docstring(source)
+    except SyntaxError as exc:
+        return f'cannot parse as Python (SyntaxError: {exc.msg})'
     if docstring is None:
         return 'first stmt is not a string literal'
     value = docstring.value
-    assert isinstance(value, str)  # narrowed by first_statement_docstring
+    if not isinstance(value, str):
+        return 'first stmt is not a string literal'
     if '\n' in value:
         line_count = value.count('\n') + 1
         return f'module docstring spans {line_count} lines'

@@ -33,10 +33,20 @@ def main() -> int:
             f'(vacuous: only {len(sized)} source file(s), need >= {MIN_FILES_FOR_GATE})'
         )
         return 0
-    sizes = [s for _, s in sized]
+    # Exclude zero-line files from the median: a package with many
+    # empty __init__.py files would otherwise produce median=0 and
+    # ratio=inf for the smallest real file. Empty files don't have a
+    # meaningful size to balance against.
+    nonzero_sizes = [s for _, s in sized if s > 0]
+    if len(nonzero_sizes) < MIN_FILES_FOR_GATE:
+        print(
+            f'FILE SIZE BALANCE GATE -- PASS '
+            f'(vacuous: only {len(nonzero_sizes)} non-empty source file(s))'
+        )
+        return 0
     largest_path, largest_size = max(sized, key=lambda item: item[1])
-    median = statistics.median(sizes)
-    ratio = largest_size / median if median > 0 else float('inf')
+    median = statistics.median(nonzero_sizes)
+    ratio = largest_size / median
     if ratio > MAX_RATIO:
         print('FILE SIZE BALANCE GATE -- FAIL', file=sys.stderr)
         print('', file=sys.stderr)

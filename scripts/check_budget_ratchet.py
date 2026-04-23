@@ -20,11 +20,28 @@ RAISE_MARKER_RE: Final[re.Pattern[str]] = re.compile(
 )
 
 
+def _fail_setup(message: str) -> None:
+    print('BUDGET RATCHET GATE -- FAIL', file=sys.stderr)
+    print(f'  {message}', file=sys.stderr)
+    sys.exit(2)
+
+
 def _parse_budget(text: str) -> dict[str, int]:
     if not text.strip():
         return {}
-    data = json.loads(text)
-    return {str(k): int(v) for k, v in data.items()}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        _fail_setup(f'cannot parse budget JSON: {exc}')
+        raise  # unreachable
+    if not isinstance(data, dict):
+        _fail_setup('budget JSON is not an object')
+    parsed: dict[str, int] = {}
+    for key, value in data.items():
+        if not isinstance(value, int) or value <= 0:
+            _fail_setup(f'budget["{key}"] must be positive int, got {value!r}')
+        parsed[str(key)] = value
+    return parsed
 
 
 def _base_budget_from_ref(base_ref: str) -> dict[str, int]:

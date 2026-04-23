@@ -3,6 +3,10 @@ name: pr_checks_lint
 on:
   pull_request:
     branches: [main]
+    # `edited` is required so the budget-raise ratchet re-runs when a
+    # reviewer or author adds the `[budget-raise: <path>: <reason>]`
+    # marker to the PR body after the initial push.
+    types: [opened, edited, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read

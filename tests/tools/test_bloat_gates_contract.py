@@ -131,12 +131,30 @@ def test_budget_ratchet_vacuous_when_base_missing() -> None:
 
 
 def test_budget_ratchet_accepts_marker(tmp_path: Path) -> None:
-    base = tmp_path / 'base.json'
-    base.write_text(json.dumps({'backtest_simulator/foo.py': 100}), encoding='utf-8')
-    body = tmp_path / 'body.txt'
-    body.write_text('[budget-raise: backtest_simulator/foo.py: legitimate growth]', encoding='utf-8')
-    # Temporarily replace the head budget file is destructive; instead we
-    # verify the check() function directly using a head that lowers (free):
-    # raising a path without marker is covered by the mutation test.
-    result = _run('check_budget_ratchet.py', '--base-file', str(base), '--pr-body-file', str(body))
-    assert result.returncode == 0, result.stderr
+    # Build a self-contained repo layout in tmp_path that actually has a
+    # budget raise between base and head. Previous version ran against
+    # the real head budget, so the base's `foo.py` key never matched
+    # anything in head and the marker logic was never exercised.
+    (tmp_path / '.github').mkdir()
+    head = {'backtest_simulator/foo.py': 200}
+    base = {'backtest_simulator/foo.py': 100}
+    (tmp_path / '.github' / 'module_budgets.json').write_text(json.dumps(head), encoding='utf-8')
+    base_file = tmp_path / 'base.json'
+    base_file.write_text(json.dumps(base), encoding='utf-8')
+    body_file = tmp_path / 'body.txt'
+    body_file.write_text(
+        '[budget-raise: backtest_simulator/foo.py: legitimate growth]\n',
+        encoding='utf-8',
+    )
+    scripts_dir = tmp_path / 'scripts'
+    scripts_dir.mkdir()
+    (scripts_dir / '__init__.py').write_text('', encoding='utf-8')
+    import shutil
+    shutil.copy2(SCRIPTS_DIR / 'check_budget_ratchet.py', scripts_dir / 'check_budget_ratchet.py')
+    result = subprocess.run(
+        [sys.executable, str(scripts_dir / 'check_budget_ratchet.py'),
+         '--base-file', str(base_file), '--pr-body-file', str(body_file)],
+        check=False, capture_output=True, text=True, cwd=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert 'BUDGET RATCHET GATE -- PASS' in result.stdout
