@@ -51,17 +51,32 @@ class SimulatedVenueAdapter:
         self._symbol_filters: dict[str, BinanceSpotFilters] = {filters.symbol: filters}
         self._next_order_seq = 1
         self._next_trade_seq = 1
+        self._history: dict[str, _I.Account] = {}
 
     def register_account(self, account_id: str, api_key: str, api_secret: str) -> None:
-        self._accounts[account_id] = _I.Account(
+        # If the same account_id was registered + unregistered + re-registered,
+        # recover the prior Account so fill/order history survives the cycle.
+        # Praxis's shutdown path unregisters the account during normal
+        # teardown; post-run inspection needs the trades to still exist.
+        account = self._history.pop(account_id, None) or _I.Account(
             account_id=account_id, api_key=api_key, api_secret=api_secret,
         )
+        self._accounts[account_id] = account
 
     def unregister_account(self, account_id: str) -> None:
         if account_id not in self._accounts:
             msg = f'account_id {account_id!r} not registered'
             raise KeyError(msg)
-        del self._accounts[account_id]
+        self._history[account_id] = self._accounts.pop(account_id)
+
+    def history(self, account_id: str) -> _I.Account:
+        """Return the Account (orders + trades) whether currently registered or not."""
+        if account_id in self._accounts:
+            return self._accounts[account_id]
+        if account_id in self._history:
+            return self._history[account_id]
+        msg = f'account_id {account_id!r} never registered'
+        raise KeyError(msg)
 
     async def submit_order(  # noqa: PLR0913 - Protocol signature; every arg is Praxis-defined
         self,

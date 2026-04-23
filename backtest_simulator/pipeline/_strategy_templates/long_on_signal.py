@@ -104,11 +104,14 @@ class Strategy(_StrategyBase):
         del timer_id, params, context
         return []
 
-    def on_load(self, blob: bytes) -> None:
-        del blob
+    def on_load(self, data: bytes) -> None:
+        del data
 
     def on_save(self) -> bytes:
         return b''
 
-    def on_shutdown(self) -> None:
-        pass
+    def on_shutdown(
+        self, params: StrategyParams, context: StrategyContext,
+    ) -> list[Action]:
+        del params, context
+        return []
