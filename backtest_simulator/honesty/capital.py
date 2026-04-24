@@ -278,7 +278,9 @@ class CapitalLifecycleTracker:
                     # We only raise on structural / invariant-breach
                     # categories; EXPECTED_MISS (order already done)
                     # is silently tolerated.
-                    if cancel_result.category.name != 'EXPECTED_MISS':
+                    category = cancel_result.category
+                    category_name = category.name if category is not None else ''
+                    if category_name != 'EXPECTED_MISS':
                         msg = (
                             f'CapitalController.order_cancel failed releasing '
                             f'terminal-partial residual for '

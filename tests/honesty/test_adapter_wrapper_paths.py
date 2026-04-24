@@ -49,10 +49,14 @@ def _tracker_with_pending(
     command_id: str = 'cmd-1',
     notional: Decimal = Decimal('1000'),
 ) -> CapitalLifecycleTracker:
-    # Build a real pipeline so the controller has a live reservation.
-    _pipeline, controller, _state = build_validation_pipeline(
-        capital_pool=Decimal('100000'),
-    )
+    # Bind the tracker's internal `CapitalController` to the SAME
+    # `capital_state` the test asserts on. The earlier helper built
+    # its own state inside `build_validation_pipeline`, leaving the
+    # test's passed-in state untouched — so assertions on
+    # `capital_state.position_notional` were checking a different
+    # object from the one the wrapper was mutating.
+    from nexus.core.validator.capital_stage import CapitalController
+    controller = CapitalController(capital_state)
     # Short-circuit: directly call check_and_reserve so we get a real
     # reservation_id without going through the full ValidationPipeline
     # (which would also require InstanceState etc.).
