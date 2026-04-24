@@ -70,12 +70,26 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          # 3.12 matches pr_checks_honesty / pr_checks_lint. Praxis
+          # requires-python>=3.12; without it `pip install '.[integration]'`
+          # below would fail and pyright would have no resolvable types
+          # for the sibling libs, producing 800+ reportUnknown* errors.
+          python-version: '3.12'
 
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e .
+          # Install integration extras so pyright can resolve nexus /
+          # praxis / limen imports. Without these every `from nexus
+          # import X` becomes reportMissingImports and every X.method()
+          # cascades into reportUnknownMemberType — blocking the
+          # error-count ratchet at ~880 errors that have nothing to do
+          # with this PR's actual typing discipline.
+          # SIBLING_INSTALL_TOKEN is the same fine-grained PAT the
+          # honesty and lint gates already use.
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.SIBLING_INSTALL_TOKEN }}@github.com" > ~/.git-credentials
+          pip install -e '.[integration]'
 
       - name: Install pyright
         run: pip install 'pyright==1.1.408'
