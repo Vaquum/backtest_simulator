@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import cast
 
 import clickhouse_connect
 import polars as pl
@@ -192,25 +191,31 @@ def _format_datetime64(value: datetime) -> str:
 # as "partially unknown". These thin wrappers fix the function
 # signature at the boundary: we pass through only the named args we
 # actually use, so the call site itself is fully typed.
+_GetClientFn = Callable[..., Client]
+_QueryArrowFn = Callable[..., object]
+
+
 def _make_client(
     *, host: str, port: int, username: str, password: str, database: str,
 ) -> Client:
-    return cast(
-        'Client',
-        clickhouse_connect.get_client(
-            host=host, port=port, username=username,
-            password=password, database=database,
-        ),
+    # `clickhouse_connect.get_client` has `**kwargs` in its signature
+    # which makes pyright flag the attribute reference as
+    # `partially unknown`. Take a typed Callable handle to it once so
+    # the call sites read clean.
+    get_client: _GetClientFn = clickhouse_connect.get_client
+    return get_client(
+        host=host, port=port, username=username,
+        password=password, database=database,
     )
 
 
 def _query_arrow(
     client: Client, query: str, *, parameters: Mapping[str, str],
 ) -> pa.Table:
-    raw_result = cast(
-        'pa.Table | object',
-        client.query_arrow(query, parameters=dict(parameters)),
-    )
+    # Same `**kwargs` story for `Client.query_arrow`; bind a typed
+    # Callable so the call site reads clean.
+    query_arrow: _QueryArrowFn = client.query_arrow
+    raw_result = query_arrow(query, parameters=dict(parameters))
     if not isinstance(raw_result, pa.Table):
         msg = (
             f'ClickHouseFeed._query_arrow: expected pyarrow.Table '

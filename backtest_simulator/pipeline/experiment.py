@@ -250,11 +250,8 @@ def _run_uel(
     # `uel.run`'s signature includes `Callable | None` / `dict | None`
     # parameters that pyright reads as partially-unknown. We don't pass
     # those, but the bare attribute reference still trips the gate.
-    # Use a typed Callable cast so pyright sees a concrete signature.
-    run_fn = cast(
-        'Callable[..., None]',
-        uel.run,
-    )
+    # Bind a typed Callable handle so the call site reads clean.
+    run_fn: Callable[..., None] = uel.run
     run_fn(
         experiment_name=experiment_name,
         n_permutations=n_permutations,

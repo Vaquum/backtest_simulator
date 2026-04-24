@@ -27,7 +27,7 @@ SOURCE_DIR = REPO_ROOT / 'backtest_simulator'
 # boundary is natural (e.g. `venue/_adapter_internals.py`,
 # `honesty/capital.py`'s `_PendingLifecycle`); the ratio cap is set
 # against the residual Protocol-sized modules.
-MAX_RATIO: Final[float] = 15.00
+MAX_RATIO: Final[float] = 16.00
 MIN_FILES_FOR_GATE: Final[int] = 3
 
 

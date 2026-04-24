@@ -658,11 +658,13 @@ class BacktestLauncher(Launcher):
             timer_loop.start()
 
         # PraxisInbound and praxis.Launcher use distinct TradeOutcome
-        # classes from different modules but the same shape; cast at the
-        # boundary so pyright accepts the assignment.
-        praxis_inbound = PraxisInbound(
-            outcome_queue=cast('queue.Queue[NexusTradeOutcome]', outcome_queue),
+        # classes from different modules but the same shape; assign
+        # to a typed local at the boundary so pyright accepts both
+        # ends of the queue.
+        nexus_outcome_queue: queue.Queue[NexusTradeOutcome] = cast(
+            'queue.Queue[NexusTradeOutcome]', outcome_queue,
         )
+        praxis_inbound = PraxisInbound(outcome_queue=nexus_outcome_queue)
         # Direct event signal — no log-message interception. The running
         # event is initialised in `run_window` on `self._nexus_running`.
         self._nexus_running.set()
