@@ -61,11 +61,17 @@ def build_enriched_table(
 ) -> pl.DataFrame:
     """Join Limen's `results.csv` with the sweep's `backtest_results.parquet`.
 
-    Keyed on `round_id`. Every decoder in Limen's `round_data.jsonl` MUST
-    have exactly one row in the enriched output; missing rows or extra
-    rows raise `ValueError`. Column order: Limen-original columns first,
-    then the appended backtest columns in the order declared in
-    `ENRICHED_COLUMNS`.
+    Keyed on `round_id`. Missing-parquet path: if
+    `backtest_results_parquet` does not exist, `bt` is an empty frame,
+    `backtest_ids` is empty, `_assert_bijection` passes (empty-vs-
+    whatever is accepted), and the enriched table is produced with
+    null backtest columns. This lets downstream tooling read the
+    enriched CSV blind, whether a backtest has run yet or not.
+
+    Extra rows in the parquet that don't map to a Limen `round_id`
+    raise `ValueError` via `_assert_bijection`. Column order:
+    Limen-original columns first, then the appended backtest columns
+    declared in `_BACKTEST_COLUMN_DTYPES`.
     """
     limen_results = _read_limen_results(experiment_dir)
     bt = pl.read_parquet(backtest_results_parquet) if backtest_results_parquet.is_file() else pl.DataFrame()

@@ -21,7 +21,7 @@ def _to_int(value: object) -> int:
         raise TypeError(msg)
     if isinstance(value, int):
         return value
-    if isinstance(value, str | float):
+    if isinstance(value, (str, float)):
         return int(value)
     msg = f'_to_int: cannot narrow {type(value).__name__} to int'
     raise TypeError(msg)

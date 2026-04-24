@@ -8,7 +8,7 @@ The plan: drive the existing pipeline (UEL → ManifestBuilder → BacktestLaunc
 
 ## Part 1 — pipeline behaves like the real market, results visible
 
-- [x] **SSH tunnel preflight.** `ssh -fN -L 18123:127.0.0.1:8123 root@37.27.112.167` opens a tunnel; the profile script verifies the tunnel by querying ClickHouse for one recent BTCUSDT trade before booting the launcher. If the tunnel is down, fail loud with the exact reopen command.
+- [x] **SSH tunnel preflight.** The profile script opens an SSH tunnel to the internal ClickHouse host and verifies the tunnel by querying ClickHouse for one recent BTCUSDT trade before booting the launcher. If the tunnel is down, the script fails loud with the exact reopen command. Connection details live in operator-local environment/config, not in the repo.
 - [x] **ClickHouseFeed wired to `origo.binance_daily_spot_trades`.** `database='origo'`, `table='binance_daily_spot_trades'` defaults. Format datetime parameters as `'%Y-%m-%d %H:%M:%S.%f'` (DateTime64(6) rejects ISO-T+timezone). Real Binance ticks reach the venue adapter.
 - [x] **Strategy template — preds-based binary regime, long-only.** `self._long: bool` state, persisted via `on_save`/`on_load`. `preds=1` AND flat → ENTER BUY. `preds=0` AND long → ENTER SELL with the entry qty. `preds=1` AND long → no-op. `preds=0` AND flat → no-op. No probs, no enter_threshold.
 - [x] **`StrategyParamsSpec` updated.** Drop `qty` and `enter_threshold`. Add `capital: Decimal`, `kelly_pct: Decimal`, `estimated_price: Decimal`. ManifestBuilder bakes them into the generated strategy file.

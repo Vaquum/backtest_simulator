@@ -100,7 +100,19 @@ class SimulatedVenueAdapter:
             qty=qty, limit_price=price, stop_price=stop_price,
             time_in_force=time_in_force or 'GTC', submit_time=self._now(), symbol=symbol,
         )
-        if _I.reject_reason(order, self._filters, price) is not None:
+        # Resolve the per-symbol filter record. `_symbol_filters` is the
+        # authoritative source (populated via `load_filters()` at boot
+        # and seeded from the adapter's init filter). Falling back to
+        # `self._filters` only when the symbol hasn't been registered
+        # would mask the misroute silently; raise instead.
+        symbol_filters = self._symbol_filters.get(symbol)
+        if symbol_filters is None:
+            msg = (
+                f'submit_order: symbol {symbol!r} has no registered filters; '
+                f'call load_filters([{symbol!r}]) before submitting'
+            )
+            raise ValueError(msg)
+        if _I.reject_reason(order, symbol_filters, price) is not None:
             _I.record_rejection(account, order, coid, side, order_type, price)
             return SubmitResult(
                 venue_order_id=venue_order_id, status=OrderStatus.REJECTED, immediate_fills=(),
@@ -110,7 +122,7 @@ class SimulatedVenueAdapter:
             order.submit_time + _I.window_seconds(self._trade_window_seconds),
             venue_lookahead_seconds=self._trade_window_seconds,
         )
-        fills = walk_trades(order, trades, self._fill_config, self._filters)
+        fills = walk_trades(order, trades, self._fill_config, symbol_filters)
         immediate = _I.record_fills(
             account, self._fees,
             _I.OrderIdentity(
