@@ -86,6 +86,12 @@ exclude = [
   "tests",
   "demo",
 ]
+# Local stub directory for sibling libraries that ship without
+# py.typed AND have signatures that propagate `Any` through their
+# call sites (clickhouse_connect.get_client, limen UEL.run, etc.).
+# The stubs declare only the named-keyword subset we use; pyright
+# reads the stub instead of the source so the call sites read clean.
+stubPath = "stubs"
 reportExplicitAny = "error"
 reportMissingImports = "error"
 reportMissingTypeStubs = "error"
