@@ -142,7 +142,10 @@ class SignalsTable:
             raise ValueError(msg)
         # `list` after isinstance is `list[Unknown]`; widen each cell
         # via _to_int() which validates and narrows from object → int.
-        split_config_typed: list[object] = list(split_config_raw)
+        # cast() to widen list[Unknown] → list[object] for pyright;
+        # runtime-equivalent.
+        from typing import cast
+        split_config_typed = list(cast('list[object]', split_config_raw))
         if len(split_config_typed) != 3:
             msg = (
                 f'SignalsTable.load: expected 3-element list for split_config '

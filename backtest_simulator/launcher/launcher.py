@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import FrameType
+from typing import cast
 
 import polars as pl
 from limen import HistoricalData
@@ -27,7 +28,9 @@ from nexus.core.validator.pipeline_models import (
 from nexus.infrastructure.manifest import load_manifest
 from nexus.infrastructure.praxis_connector.praxis_inbound import PraxisInbound
 from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
-from nexus.infrastructure.praxis_connector.trade_outcome import TradeOutcome
+from nexus.infrastructure.praxis_connector.trade_outcome import (
+    TradeOutcome as NexusTradeOutcome,
+)
 from nexus.infrastructure.state_store import StateStore
 from nexus.instance_config import InstanceConfig as NexusInstanceConfig
 from nexus.startup.sequencer import StartupSequencer
@@ -37,6 +40,7 @@ from nexus.strategy.context import StrategyContext
 from nexus.strategy.predict_loop import PredictLoop
 from nexus.strategy.timer_loop import TimerLoop
 from praxis.core.domain.enums import OrderSide, OrderType
+from praxis.core.domain.trade_outcome import TradeOutcome
 from praxis.infrastructure.event_spine import EventSpine
 from praxis.infrastructure.venue_adapter import SubmitResult, VenueAdapter
 from praxis.launcher import InstanceConfig, Launcher
@@ -484,11 +488,17 @@ class BacktestLauncher(Launcher):
 
     def _start_poller(self) -> None:
         kline_intervals = self._resolve_kline_intervals_from_manifests()
-        self._poller = BacktestMarketDataPoller(
+        # `BacktestMarketDataPoller` is duck-typed against the parent's
+        # `MarketDataPoller` Protocol — same public surface, different
+        # underlying source. setattr-style assignment dodges the
+        # `_poller: MarketDataPoller | None` invariant-mutable-attribute
+        # check on the parent class.
+        poller = BacktestMarketDataPoller(
             kline_intervals=kline_intervals,
             historical_data=self._historical_data,
         )
-        self._poller.start()
+        setattr(self, '_poller', poller)
+        poller.start()
         _log.info(
             'backtest poller started',
             extra={'kline_sizes': sorted(kline_intervals)},
@@ -647,7 +657,12 @@ class BacktestLauncher(Launcher):
             )
             timer_loop.start()
 
-        praxis_inbound = PraxisInbound(outcome_queue=outcome_queue)
+        # PraxisInbound and praxis.Launcher use distinct TradeOutcome
+        # classes from different modules but the same shape; cast at the
+        # boundary so pyright accepts the assignment.
+        praxis_inbound = PraxisInbound(
+            outcome_queue=cast('queue.Queue[NexusTradeOutcome]', outcome_queue),
+        )
         # Direct event signal — no log-message interception. The running
         # event is initialised in `run_window` on `self._nexus_running`.
         self._nexus_running.set()

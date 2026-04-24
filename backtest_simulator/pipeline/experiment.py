@@ -247,7 +247,15 @@ def _run_uel(
     the signature shape we actually use — positional-kwargs only, no
     dict/Callable hooks — so the usage site is fully typed.
     """
-    uel.run(
+    # `uel.run`'s signature includes `Callable | None` / `dict | None`
+    # parameters that pyright reads as partially-unknown. We don't pass
+    # those, but the bare attribute reference still trips the gate.
+    # Use a typed Callable cast so pyright sees a concrete signature.
+    run_fn = cast(
+        'Callable[..., None]',
+        uel.run,
+    )
+    run_fn(
         experiment_name=experiment_name,
         n_permutations=n_permutations,
         resume=resume,
