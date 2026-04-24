@@ -35,6 +35,20 @@ jobs:
             'vulture>=2.14' \
             'coverage[toml]>=7.6' \
             pytest
+          # The coverage step runs `pytest tests/` across every test
+          # file, including the honesty and launcher suites that import
+          # nexus / praxis / limen / polars at module scope. Without the
+          # sibling-library install we'd collect 0 tests from those
+          # paths (via tests/conftest.py's collect_ignore_glob skip),
+          # which drops coverage to 0% and fails the floor gate. Install
+          # the `.[integration]` extra so the lint gate sees the same
+          # test surface as the honesty gate.
+          # Credential helper: SIBLING_INSTALL_TOKEN is provisioned in
+          # Repo Settings → Secrets; the extra pins Praxis/Nexus/Limen
+          # via git+https URLs that resolve through that PAT.
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.SIBLING_INSTALL_TOKEN }}@github.com" > ~/.git-credentials
+          .venv-lint/bin/python -m pip install '.[integration]'
 
       - name: Run ruff lint (bloat-mechanical rules active)
         run: .venv-lint/bin/python -m ruff check backtest_simulator tools tests scripts
