@@ -59,7 +59,13 @@ def _read_limen_results(experiment_dir: Path) -> pl.DataFrame:
     results_csv = experiment_dir / 'results.csv'
     round_data_jsonl = experiment_dir / 'round_data.jsonl'
     if results_csv.is_file():
-        return pl.read_csv(results_csv)
+        df = pl.read_csv(results_csv)
+        # Limen's own `results.csv` uses `id` as the decoder identifier;
+        # older round_data.jsonl used `round_id`. We normalise to
+        # `round_id` so the rest of the enrichment path is column-stable.
+        if 'round_id' not in df.columns and 'id' in df.columns:
+            df = df.rename({'id': 'round_id'})
+        return df
     if round_data_jsonl.is_file():
         rows = [json.loads(line) for line in round_data_jsonl.read_text(encoding='utf-8').splitlines() if line.strip()]
         return pl.DataFrame({

@@ -57,11 +57,27 @@ def _walk_market(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpot
     # breach. A BUY stop is below the entry and protects a long —
     # a tick AT or BELOW stop_price means the protective stop
     # triggered before the walk could fill the target qty. The fill
-    # is closed at `stop_price` (rounded to tick_size) with the
-    # remaining qty, and the reason is `market_stopped`. This
-    # produces an honest `r_per_trade` when computed later from
-    # |entry - stop| * qty — the fill NEVER silently slides past
-    # the stop and back into VWAP territory.
+    # is closed AT `stop_price` (rounded to tick_size) with the
+    # remaining qty, reason=`market_stopped`.
+    #
+    # HONESTY NOTE: this is a "declared-R cap" model — realised
+    # risk per trade equals the strategy's declared stop, capped.
+    # It is OPTIMISTIC versus real market-gap execution where a
+    # stop triggered on a gapping tape fills at the next available
+    # price (possibly much worse than stop_price). Production-
+    # grade fill modelling would use the NEXT tick after the breach
+    # as the fill price, not the stop itself. Part 2 accepts the
+    # declared-R cap because:
+    #   1. Honesty for `r_per_trade` requires a deterministic
+    #      denominator tied to the DECLARED stop, not to realised
+    #      gap-slippage (which is a separate HonestyStatus axis).
+    #   2. The VWAP-aggregated walk already filled everything before
+    #      the breach at real tape prices — only the residual
+    #      post-breach qty is capped at stop. In a liquid BTCUSDT
+    #      window the residual is usually tiny.
+    # A future honesty gate may replace this with gap-aware fills
+    # plus a `gap_slippage_bps` column; the declared-R cap stays
+    # as the honest `r_per_trade` reference regardless.
     stop_price = order.stop_price
     remaining = order.qty
     consumed_qty = Decimal('0')

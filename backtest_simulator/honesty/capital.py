@@ -149,6 +149,16 @@ class CapitalLifecycleTracker:
             entry = self._pending.get(command_id)
             return entry.declared_stop_price if entry is not None else None
 
+    def declared_reservation_for_command(self, command_id: str) -> Decimal | None:
+        """Lookup the reserved notional for a still-pending command_id.
+
+        The launcher's adapter wrapper uses this to fail loud on
+        capital overshoot without reading the tracker's private dict.
+        """
+        with self._lock:
+            entry = self._pending.get(command_id)
+            return entry.notional if entry is not None else None
+
     def record_sent(self, command_id: str, venue_order_id: str) -> None:
         """Transition reservation → in_flight via `send_order`."""
         with self._lock:

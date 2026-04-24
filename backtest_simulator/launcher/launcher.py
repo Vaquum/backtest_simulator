@@ -102,6 +102,28 @@ class DrainTimeoutError(RuntimeError):
     """
 
 
+class CapitalOvershootError(RuntimeError):
+    """Raised when a fill's realised notional exceeds the reservation.
+
+    The action-submitter reserves `reference_price * size * (1 + buffer)`
+    at validation time. Actual fills that overshoot that buffered
+    amount indicate the strategy used more capital than the CAPITAL
+    stage gated — silently capping the ledger fill to the reservation
+    would bypass the gate. Raising here surfaces the overshoot so
+    the operator can raise the buffer or tighten the strategy.
+    """
+
+
+class CapitalPartialFillError(RuntimeError):
+    """Raised when a submit returns `PARTIALLY_FILLED`.
+
+    Part 2 lifecycle expects terminal FILLED or REJECTED — the VWAP
+    MARKET walk produces one or the other. A PARTIALLY_FILLED status
+    means residual working-notional will remain after we pop the
+    lifecycle, silently under-counting committed capital.
+    """
+
+
 def _extract_declared_stop_price(action: 'Action') -> Decimal | None:
     """Pull `declared_stop_price` from the Nexus Action's
     `execution_params` dict. Returns None when absent or blank.
@@ -163,7 +185,20 @@ def _install_capital_adapter_wrapper(
                 kwargs['stop_price'] = declared_stop
                 if isinstance(client_order_id, str):
                     declared_stops[client_order_id] = declared_stop
-        result = await original_submit(*args, **kwargs)
+        # If the original adapter raises mid-submit we MUST release
+        # the capital reservation — otherwise the reservation stays
+        # locked forever and the lifecycle tracker never pops it,
+        # failing the `pending_count == 0` terminal check.
+        try:
+            result = await original_submit(*args, **kwargs)
+        except Exception:
+            if pre_match_command_id is not None:
+                tracker.record_rejection(pre_match_command_id, '')
+                assert_conservation(
+                    capital_state, initial_pool,
+                    context=f'adapter_raised command_id={pre_match_command_id}',
+                )
+            raise
         # The Nexus command_id is embedded in the client_order_id as
         # the `SS-<command_id-prefix>-<sequence>` format Nexus generates
         # in `generate_client_order_id`. The prefix is the leading 16
@@ -200,27 +235,45 @@ def _install_capital_adapter_wrapper(
         for fill in getattr(result, 'immediate_fills', ()):
             fill_notional += Decimal(str(fill.qty)) * Decimal(str(fill.price))
             fill_fees += Decimal(str(fill.fee))
-        # `order_fill` in Nexus's CapitalController rejects
-        # `fill_notional > remaining_notional`. Real fills on a
-        # MARKET order walk the tape at prices that differ from the
-        # strategy's `reference_price`, so the actual notional can
-        # overshoot the reservation. The overshoot is price slippage —
-        # honestly, the strategy used more capital than it reserved.
-        # The backtest's capital ledger can still stay balanced if we
-        # CAP the ledger fill to the reserved amount; anything above
-        # that is slippage that didn't cost the ledger (which the
-        # strategy *should* fix by reserving more up-front). We also
-        # surface the cap event in the log so a persistent gap can be
-        # investigated.
-        pending = tracker._pending.get(command_id)  # noqa: SLF001
-        if pending is not None and fill_notional > pending.notional:
-            slippage = fill_notional - pending.notional
-            _log.warning(
-                'capital lifecycle: fill_notional=%s exceeds reservation=%s '
-                'by %s (slippage); capping to reservation for ledger',
-                fill_notional, pending.notional, slippage,
+        # Fail loud on capital overshoot. The action-submitter
+        # reserves `reference_price * size * (1 + buffer)` at
+        # validation time; actual fills that exceed that buffered
+        # amount mean a real slippage blow-up the strategy didn't
+        # budget for. Honesty demands we surface it rather than
+        # silently capping the ledger fill — bumping the buffer in
+        # action_submitter is the right response, not hiding.
+        reservation_notional = tracker.declared_reservation_for_command(
+            command_id,
+        )
+        if reservation_notional is not None and fill_notional > reservation_notional:
+            slippage = fill_notional - reservation_notional
+            msg = (
+                f'capital overshoot: fill_notional={fill_notional} exceeds '
+                f'reserved={reservation_notional} for command_id={command_id} '
+                f'by {slippage}. Raise `_NOTIONAL_RESERVATION_BUFFER` in '
+                f'backtest_simulator.launcher.action_submitter to absorb this '
+                f'slippage honestly; silently capping here would bypass '
+                f'CAPITAL gating.'
             )
-            fill_notional = pending.notional
+            raise CapitalOvershootError(msg)
+        # Status gate: Part 2 honesty requires terminal states after
+        # each submit. REJECTED already handled above. PARTIALLY_FILLED
+        # would leave residual working-notional after we pop the
+        # lifecycle, hiding the fact that the remainder never
+        # completed. The VWAP aggregator in `FillModel._walk_market`
+        # produces a single fill for the whole qty or `REJECTED` via
+        # filter rules, so PARTIALLY_FILLED shouldn't reach us — but
+        # we assert it explicitly to catch any future path that does.
+        if status_name == 'PARTIALLY_FILLED':
+            msg = (
+                f'PARTIALLY_FILLED command_id={command_id} venue_order_id='
+                f'{venue_order_id}: Part 2 lifecycle expects terminal '
+                f'FILLED or REJECTED. Partial residual working-notional '
+                f'would not be drained and the capital ledger would '
+                f'under-count. Investigate why the MARKET walk did not '
+                f'fully fill the order.'
+            )
+            raise CapitalPartialFillError(msg)
         tracker.record_ack_and_fill(
             command_id, venue_order_id, fill_notional, fill_fees,
         )

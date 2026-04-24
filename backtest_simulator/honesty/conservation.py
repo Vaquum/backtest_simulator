@@ -12,8 +12,11 @@ draw from `capital_pool` depending on adapter accounting).
 The Part 2 honesty invariants this module enforces after every
 CapitalController transition:
 
-  INV-1  capital_pool stays constant or decreases only (no free
-         capital appearing).
+  INV-1  capital_pool is monotonically non-increasing event-to-event
+         (no free capital appearing anywhere on the timeline — the
+         launcher tracks the PREVIOUS snapshot per account and this
+         function compares new_pool to prev_pool, not only to
+         initial_pool).
   INV-2  every component is non-negative (no negative balances).
   INV-3  total_deployed = position + working + in_flight + reservation
          never exceeds capital_pool (no overcommitment).
@@ -26,6 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from threading import Lock
 
 from nexus.core.domain.capital_state import CapitalState
 
@@ -77,6 +81,30 @@ def capital_totals(state: CapitalState) -> CapitalTotals:
     )
 
 
+class _PrevPoolTracker:
+    """Per-process record of the most recent `capital_pool` snapshot,
+    keyed by the `id()` of the CapitalState object.
+
+    INV-1 ("capital_pool is monotonically non-increasing") requires
+    comparing new pool to PREVIOUS pool, not only to initial pool.
+    Checking only initial would miss a sequence like
+    `100_000 -> 99_900 -> 99_950` — the final value is still below
+    initial but the middle transition grew the pool, which is a
+    violation. Storing the previous value per CapitalState id
+    catches that.
+    """
+
+    _lock = Lock()
+    _prev: dict[int, Decimal] = {}
+
+    @classmethod
+    def snapshot_and_record(cls, state: CapitalState) -> Decimal:
+        with cls._lock:
+            prev = cls._prev.get(id(state), state.capital_pool)
+            cls._prev[id(state)] = state.capital_pool
+            return prev
+
+
 def assert_conservation(
     state: CapitalState,
     initial_pool: Decimal,
@@ -87,8 +115,11 @@ def assert_conservation(
     """Raise `ConservationViolation` on any Part 2 invariant breach.
 
     Checks:
-      INV-1  `state.capital_pool` has not increased above
-             `initial_pool` (it may decrease as fees are paid).
+      INV-1  `state.capital_pool` has not increased relative to either
+             `initial_pool` OR the most recent snapshot of this state.
+             Both bounds matter — a pool that grows and then shrinks
+             back would pass the initial-only check but still violate
+             event-to-event monotonicity.
       INV-2  No component is negative beyond `tolerance`.
       INV-3  `total_deployed <= capital_pool + tolerance` — the
              CapitalController's gating logic uses this; if it's ever
@@ -98,14 +129,25 @@ def assert_conservation(
     the cent level. Anything bigger signals a real ledger bug.
     """
     totals = capital_totals(state)
+    prev_pool = _PrevPoolTracker.snapshot_and_record(state)
 
-    # INV-1: capital_pool monotonically non-increasing.
-    pool_growth = totals.capital_pool - initial_pool
-    if pool_growth > tolerance:
+    # INV-1a: capital_pool must not exceed initial_pool.
+    pool_vs_initial = totals.capital_pool - initial_pool
+    if pool_vs_initial > tolerance:
         msg = (
             f'conservation INV-1 violated after {context}: '
             f'capital_pool={totals.capital_pool} > initial_pool={initial_pool} '
-            f'(growth={pool_growth}); capital cannot appear from nothing.'
+            f'(growth={pool_vs_initial}); capital cannot appear from nothing.'
+        )
+        raise ConservationViolation(msg)
+    # INV-1b: capital_pool must not grow from one event to the next.
+    pool_vs_prev = totals.capital_pool - prev_pool
+    if pool_vs_prev > tolerance:
+        msg = (
+            f'conservation INV-1 violated after {context}: '
+            f'capital_pool={totals.capital_pool} > previous={prev_pool} '
+            f'(event-to-event growth={pool_vs_prev}); capital_pool '
+            f'must be monotonically non-increasing.'
         )
         raise ConservationViolation(msg)
 

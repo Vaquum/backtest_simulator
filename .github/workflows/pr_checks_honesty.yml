@@ -1,0 +1,43 @@
+name: pr_checks_honesty
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr_checks_honesty:
+    name: pr_checks_honesty
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Set up honesty test venv
+        run: python -m venv .venv-honesty
+      - name: Install project + deps
+        # Installs the package in editable mode so the tests import
+        # `backtest_simulator.honesty` from source. The honesty
+        # module only depends on `nexus.core.*` plus standard
+        # library; no ClickHouse / Praxis runtime is required for
+        # the unit-level gate.
+        run: |
+          .venv-honesty/bin/python -m pip install --upgrade pip
+          .venv-honesty/bin/python -m pip install -e '.[integration]'
+          .venv-honesty/bin/python -m pip install pytest
+      - name: Run honesty gate suite
+        # Every test in `tests/honesty/` pins one Part 2 invariant
+        # (capital conservation, lifecycle, declared-stop, r_per_trade,
+        # determinism, lookahead, split alignment). Plus the mutation
+        # tests injected alongside. A red here blocks merge.
+        run: |
+          .venv-honesty/bin/python -m pytest tests/honesty/ -v --tb=short

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from nexus.core.domain.enums import OrderSide
 from nexus.core.domain.order_types import ExecutionMode, OrderType
@@ -102,9 +102,17 @@ class Strategy(_StrategyBase):
             preds, signal.values.get('_probs'), was_long,
         )
         if preds == 1 and not was_long:
-            qty = (
+            qty_raw = (
                 self._config.capital * self._config.kelly_pct / Decimal('100')
             ) / self._config.estimated_price
+            # Round DOWN to Binance's BTCUSDT step_size of 0.00001 so
+            # the venue adapter's lot-size filter accepts the qty and
+            # the full amount fills (no PARTIALLY_FILLED from a qty
+            # that doesn't land on a step boundary). A fractional
+            # residue beyond 5 decimals silently turns cmd.qty >
+            # filled_qty into a partial status even when the walk
+            # consumed everything that was step-legal.
+            qty = qty_raw.quantize(Decimal('0.00001'), rounding=ROUND_DOWN)
             self._long = True
             self._entry_qty = qty
             _log.info('ENTER BUY: qty=%s was_long=False -> long=True', qty)

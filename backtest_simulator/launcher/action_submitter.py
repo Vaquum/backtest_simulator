@@ -374,10 +374,15 @@ def _build_context(
     # it) when `order_fill` runs.
     symbol = _extract_symbol(action)
     order_size = action.size or Decimal('0')
-    order_notional = (
+    # Reserve `reference_price * size * (1 + buffer)` so real fills at
+    # slightly worse prices fit within the reservation. The lifecycle
+    # wrapper fails loud if actual fills STILL exceed this buffered
+    # amount — no more silently capping capital overshoot.
+    base_notional = (
         order_size * action.reference_price
         if action.reference_price is not None else Decimal('0')
     )
+    order_notional = base_notional * (Decimal('1') + _NOTIONAL_RESERVATION_BUFFER)
     estimated_fees = order_notional * _FEE_ESTIMATE_RATE
     return ValidationRequestContext(
         strategy_id=strategy_id,
@@ -400,6 +405,22 @@ def _build_context(
 # `fee_reserve` side of the reservation has headroom for maker/taker
 # mix and minor slippage.
 _FEE_ESTIMATE_RATE = Decimal('0.002')
+
+# Notional reservation buffer — reserve 7% more notional than the
+# `reference_price * size` estimate to absorb the price drift between
+# reservation time and actual fill time. Without this buffer, real
+# fills at higher prices would overshoot the reservation and
+# silently bypass CAPITAL gating. We use a concrete buffer here and
+# fail-loud in the lifecycle wrapper on any further overshoot (see
+# `_install_capital_adapter_wrapper`).
+#
+# The 7% ceiling is bounded from above by Nexus's per-trade allocation
+# gate (15% of strategy_budget). Raw Kelly for the selected decoder
+# sits at ~14%, so buffer > ~7.6% trips that gate and every entry is
+# denied. If a larger buffer is needed (e.g. volatile windows with >7%
+# drift), the strategy's Kelly% must shrink or the strategy_budget
+# concept needs a formal lift above the current allocated_capital.
+_NOTIONAL_RESERVATION_BUFFER = Decimal('0.07')
 
 
 def _check_declared_stop(

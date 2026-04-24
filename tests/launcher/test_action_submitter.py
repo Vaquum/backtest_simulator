@@ -1,4 +1,7 @@
-"""ActionSubmitter contract: build_action_submitter returns a correct Callable."""
+"""ActionSubmitter contract — Part 2: the submitter runs the real
+ValidationPipeline, carries the declared stop on the side, and
+propagates fail-loud on per-action errors.
+"""
 from __future__ import annotations
 
 from decimal import Decimal
@@ -12,6 +15,7 @@ from nexus.core.validator.pipeline_models import InstanceState
 from nexus.instance_config import InstanceConfig as NexusInstanceConfig
 from nexus.strategy.action import Action, ActionType
 
+from backtest_simulator.honesty import build_validation_pipeline
 from backtest_simulator.launcher.action_submitter import build_action_submitter
 
 
@@ -24,7 +28,10 @@ class _OutboundStub:
 
     def send_command(self, cmd: Any) -> str:
         self.commands.append(cmd)
-        return cmd.command_id
+        # Generate a command_id — Praxis does this server-side but the
+        # outbound stub needs to hand one back.
+        import uuid
+        return str(uuid.uuid4())
 
     def send_abort(self, **kwargs: Any) -> None:
         self.aborts.append(kwargs)
@@ -34,19 +41,48 @@ def _nexus_config() -> NexusInstanceConfig:
     return NexusInstanceConfig(account_id='bts-acct', venue='binance_spot_simulated')
 
 
-def _instance_state() -> InstanceState:
-    return InstanceState(capital=CapitalState(capital_pool=Decimal('100000')))
+def _pipeline_and_state() -> tuple[Any, InstanceState]:
+    # Build a Part 2-shaped pipeline that shares the same CapitalState
+    # the InstanceState carries — that's the invariant the real
+    # launcher enforces and what the CAPITAL validator reads from.
+    pipeline, _controller, capital_state = build_validation_pipeline(
+        capital_pool=Decimal('100000'),
+    )
+    state = InstanceState(capital=capital_state)
+    return pipeline, state
 
 
 def _enter_action() -> Action:
+    """BUY ENTER with a declared stop — the Part 2 INTAKE hook accepts it."""
     return Action(
         action_type=ActionType.ENTER,
         direction=OrderSide.BUY,
         size=Decimal('0.001'),
         execution_mode=ExecutionMode.SINGLE_SHOT,
         order_type=OrderType.MARKET,
+        execution_params={
+            'symbol': 'BTCUSDT',
+            'stop_bps': '50',
+            'stop_price': '49750',
+        },
+        deadline=60,
+        trade_id=None,
+        command_id=None,
+        maker_preference=None,
+        reference_price=Decimal('50000'),
+    )
+
+
+def _sell_action() -> Action:
+    """SELL exit — no stop_price, per Part 2 long-only convention."""
+    return Action(
+        action_type=ActionType.ENTER,
+        direction=OrderSide.SELL,
+        size=Decimal('0.001'),
+        execution_mode=ExecutionMode.SINGLE_SHOT,
+        order_type=OrderType.MARKET,
         execution_params={'symbol': 'BTCUSDT'},
-        deadline=1_700_000_000_000,
+        deadline=60,
         trade_id=None,
         command_id=None,
         maker_preference=None,
@@ -56,33 +92,77 @@ def _enter_action() -> Action:
 
 def test_builder_returns_callable() -> None:
     outbound = _OutboundStub()
+    pipeline, state = _pipeline_and_state()
     submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=_instance_state(),
-        praxis_outbound=outbound,  # type: ignore[arg-type]
+        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
+        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
     )
     assert callable(submit)
 
 
-def test_enter_action_gets_translated_and_sent() -> None:
+def test_enter_with_declared_stop_passes_validation_and_sends() -> None:
     outbound = _OutboundStub()
+    pipeline, state = _pipeline_and_state()
     submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=_instance_state(),
-        praxis_outbound=outbound,  # type: ignore[arg-type]
+        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
+        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
     )
     submit([_enter_action()], 'long_on_signal')
     assert len(outbound.commands) == 1
     cmd = outbound.commands[0]
     assert cmd.account_id == 'bts-acct'
     assert cmd.symbol == 'BTCUSDT'
-    assert cmd.side == OrderSide.BUY
+    # `_to_praxis_enums` converts the cmd's side to Praxis OrderSide,
+    # which is a different class than Nexus OrderSide. Compare by name.
+    assert cmd.side.name == OrderSide.BUY.name
     assert cmd.size == Decimal('0.001')
+
+
+def test_buy_entry_without_declared_stop_is_rejected_by_intake() -> None:
+    # Part 2 INTAKE gate — no stop, no entry.
+    outbound = _OutboundStub()
+    pipeline, state = _pipeline_and_state()
+    submit = build_action_submitter(
+        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
+        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
+    )
+    action_no_stop = Action(
+        action_type=ActionType.ENTER,
+        direction=OrderSide.BUY,
+        size=Decimal('0.001'),
+        execution_mode=ExecutionMode.SINGLE_SHOT,
+        order_type=OrderType.MARKET,
+        execution_params={'symbol': 'BTCUSDT'},
+        deadline=60,
+        trade_id=None, command_id=None,
+        maker_preference=None, reference_price=Decimal('50000'),
+    )
+    submit([action_no_stop], 'long_on_signal')
+    # INTAKE denies → no command reaches Praxis.
+    assert len(outbound.commands) == 0
+
+
+def test_sell_exit_without_stop_is_accepted() -> None:
+    # Long-only convention — SELL closes an existing long and is itself
+    # the risk close, so no stop_price is required.
+    outbound = _OutboundStub()
+    pipeline, state = _pipeline_and_state()
+    submit = build_action_submitter(
+        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
+        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
+    )
+    submit([_sell_action()], 'long_on_signal')
+    assert len(outbound.commands) == 1
+    # `_to_praxis_enums` converts side to Praxis OrderSide; compare by name.
+    assert outbound.commands[0].side.name == OrderSide.SELL.name
 
 
 def test_abort_action_routed_to_send_abort() -> None:
     outbound = _OutboundStub()
+    pipeline, state = _pipeline_and_state()
     submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=_instance_state(),
-        praxis_outbound=outbound,  # type: ignore[arg-type]
+        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
+        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
     )
     abort = Action(
         action_type=ActionType.ABORT,
@@ -98,86 +178,67 @@ def test_abort_action_routed_to_send_abort() -> None:
     assert outbound.aborts[0]['account_id'] == 'bts-acct'
 
 
-def test_submission_propagates_per_action_errors(monkeypatch: Any) -> None:
-    # The backtest action submitter does NOT swallow per-action errors.
-    # A failure in `send_command` must surface to `PredictLoop._tick`'s
-    # own logging/abort path — silently dropping ENTER/SELL actions
-    # would hide bugs and produce a misleading trade summary. The
-    # fail-loud contract matches the CLAUDE.md law 4 stance: no silent
-    # handlers in the action-submit path.
+def test_submission_propagates_per_action_errors() -> None:
+    # Fail-loud contract: a RuntimeError from send_command must NOT
+    # be swallowed. The PredictLoop's own `action_submit raised`
+    # handler catches at a higher level; silencing here would hide
+    # bugs.
     class _RaisingOutbound(_OutboundStub):
         def send_command(self, cmd: Any) -> str:
             raise RuntimeError('injected')
     outbound = _RaisingOutbound()
+    pipeline, state = _pipeline_and_state()
     submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=_instance_state(),
-        praxis_outbound=outbound,  # type: ignore[arg-type]
+        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
+        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
     )
     with pytest.raises(RuntimeError, match='injected'):
-        submit([_enter_action(), _enter_action()], 'long_on_signal')
+        submit([_enter_action()], 'long_on_signal')
+    # No command got through; the capture happens inside the outbound
+    # stub only when send_command returns successfully (which it doesn't).
     assert len(outbound.commands) == 0
 
 
-def test_sell_side_passed_through() -> None:
+def test_on_reservation_hook_receives_decision_with_reservation() -> None:
+    # The launcher's CapitalLifecycleTracker feeds off this hook — it's
+    # how the `check_and_reserve → send_order → order_ack → order_fill`
+    # chain ties command_id to its reservation. Part 2 requires the
+    # decision to carry a `reservation` so downstream send_order/ack
+    # calls can reference it.
     outbound = _OutboundStub()
-    submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=_instance_state(),
-        praxis_outbound=outbound,  # type: ignore[arg-type]
-    )
-    sell_action = Action(
-        action_type=ActionType.ENTER,
-        direction=OrderSide.SELL,
-        size=Decimal('0.001'),
-        execution_mode=ExecutionMode.SINGLE_SHOT,
-        order_type=OrderType.MARKET,
-        execution_params={'symbol': 'BTCUSDT'},
-        deadline=1_700_000_000_000,
-        trade_id=None, command_id=None,
-        maker_preference=None, reference_price=Decimal('50000'),
-    )
-    submit([sell_action], 'long_on_signal')
-    assert outbound.commands[0].side == OrderSide.SELL
+    pipeline, state = _pipeline_and_state()
+    captured: list[Any] = []
 
+    def on_reservation(command_id: str, decision: Any, context: Any, action: Any) -> None:
+        captured.append((command_id, decision, context, action))
 
-def test_trade_id_and_command_id_generated_when_missing() -> None:
-    outbound = _OutboundStub()
     submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=_instance_state(),
-        praxis_outbound=outbound,  # type: ignore[arg-type]
+        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
+        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
+        on_reservation=on_reservation,
     )
     submit([_enter_action()], 'long_on_signal')
-    cmd = outbound.commands[0]
-    assert cmd.trade_id is not None and cmd.trade_id.startswith('bts-')
-    assert cmd.command_id is not None and cmd.command_id.startswith('bts-cmd-')
+    assert len(captured) == 1
+    command_id, decision, context, action = captured[0]
+    assert decision.allowed is True
+    assert decision.reservation is not None
+    assert decision.reservation.notional > 0
+    assert context.command_id is not None
+    assert action.action_type == ActionType.ENTER
 
 
-def test_multiple_actions_processed_in_order() -> None:
+def test_on_submit_hook_fires_with_command_id() -> None:
+    # The `on_submit` hook is how the launcher bumps its
+    # `submitted_commands` counter for the synchronous drain. It
+    # must fire exactly once per action that reached Praxis.
     outbound = _OutboundStub()
+    pipeline, state = _pipeline_and_state()
+    submitted: list[str] = []
     submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=_instance_state(),
-        praxis_outbound=outbound,  # type: ignore[arg-type]
+        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
+        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
+        on_submit=submitted.append,
     )
-    submit([_enter_action(), _enter_action(), _enter_action()], 'long_on_signal')
-    assert len(outbound.commands) == 3
-
-
-def test_symbol_falls_back_to_btcusdt_when_missing() -> None:
-    outbound = _OutboundStub()
-    submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=_instance_state(),
-        praxis_outbound=outbound,  # type: ignore[arg-type]
-    )
-    action_no_symbol = Action(
-        action_type=ActionType.ENTER,
-        direction=OrderSide.BUY,
-        size=Decimal('0.001'),
-        execution_mode=ExecutionMode.SINGLE_SHOT,
-        order_type=OrderType.MARKET,
-        execution_params={},
-        deadline=1_700_000_000_000,
-        trade_id=None, command_id=None,
-        maker_preference=None,
-        reference_price=Decimal('50000'),
-    )
-    submit([action_no_symbol], 'long_on_signal')
-    assert outbound.commands[0].symbol == 'BTCUSDT'
+    submit([_enter_action(), _sell_action()], 'long_on_signal')
+    assert len(submitted) == 2
+    assert all(isinstance(cmd_id, str) for cmd_id in submitted)
