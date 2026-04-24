@@ -171,3 +171,44 @@ def test_rpertrade_distinct_orders_are_independent() -> None:
     assert a.r == Decimal('10')
     assert b.r == Decimal('10')
     assert a.client_order_id != b.client_order_id
+
+
+def test_compute_r_zero_qty_is_zero_not_none() -> None:
+    # qty=0 produces R=0 (no risk because no exposure), distinct
+    # from a missing stop (None). The launcher could conceivably
+    # report a zero-qty fill if the venue dust-rounds the order
+    # away; the helper must return a meaningful value.
+    r = compute_r(
+        entry_price=Decimal('70000'),
+        declared_stop_price=Decimal('69000'),
+        qty=Decimal('0'),
+    )
+    assert r == Decimal('0')
+
+
+def test_rpertrade_repr_mentions_client_order_id() -> None:
+    # `RPerTrade` is a frozen dataclass; its repr() must include the
+    # client_order_id so log output identifies the trade unambiguously.
+    # Pin this so a future refactor that strips the field doesn't
+    # silently lose the identifier in trade-log audits.
+    r = RPerTrade(
+        client_order_id='SS-repr-001', side='BUY',
+        entry_price=Decimal('70000'),
+        declared_stop_price=Decimal('69000'),
+        qty=Decimal('0.1'),
+    )
+    representation = repr(r)
+    assert 'SS-repr-001' in representation
+    assert 'BUY' in representation
+
+
+def test_compute_r_extreme_small_qty_decimal_safe() -> None:
+    # Sub-satoshi qty (10^-12) on BTC pricing should still produce
+    # a well-defined Decimal R without overflow/underflow.
+    entry = Decimal('100000')
+    stop = Decimal('99000')
+    qty = Decimal('1E-12')
+    r = compute_r(entry_price=entry, declared_stop_price=stop, qty=qty)
+    assert r is not None
+    assert r == Decimal('1000') * qty
+    assert r > 0

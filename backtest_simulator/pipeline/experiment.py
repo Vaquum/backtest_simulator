@@ -85,7 +85,7 @@ class ExperimentPipeline:
             raise ValueError(msg)
 
         def params_fn() -> dict[str, list[object]]:
-            result = params_fn_raw()
+            result: object = params_fn_raw()
             if not isinstance(result, dict):
                 msg = (
                     f'experiment file {source_path}: params() must return '
@@ -93,7 +93,12 @@ class ExperimentPipeline:
                 )
                 raise TypeError(msg)
             typed: dict[str, list[object]] = {}
-            for key, value in result.items():
+            # `result` is dict[Unknown, Unknown] from pyright's view;
+            # cast each key/value at the boundary so the typed map
+            # below reads as dict[str, list[object]] without `Any`.
+            for raw_key, raw_value in result.items():
+                key: object = raw_key
+                value: object = raw_value
                 if not isinstance(key, str):
                     msg = (
                         f'experiment file {source_path}: params() keys must '
@@ -163,11 +168,20 @@ class ExperimentPipeline:
         if 'round_params' not in df.columns:
             return df
 
-        parsed = [json.loads(s) if isinstance(s, str) else {} for s in df['round_params']]
+        parsed: list[dict[str, object]] = []
+        for s in df['round_params']:
+            if isinstance(s, str):
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    parsed.append({str(k): v for k, v in obj.items()})
+                else:
+                    parsed.append({})
+            else:
+                parsed.append({})
         if not parsed:
             return df
-        keys = sorted({k for row in parsed for k in row})
-        new_cols = {
+        keys: list[str] = sorted({k for row in parsed for k in row})
+        new_cols: dict[str, list[object]] = {
             k: [row.get(k) for row in parsed]
             for k in keys if k not in df.columns
         }
