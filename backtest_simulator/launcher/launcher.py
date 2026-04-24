@@ -35,6 +35,12 @@ from praxis.infrastructure.venue_adapter import VenueAdapter
 from praxis.launcher import InstanceConfig, Launcher
 from praxis.trading_config import TradingConfig
 
+from backtest_simulator.honesty import (
+    CapitalLifecycleTracker,
+    assert_conservation,
+    build_validation_pipeline,
+    capital_totals,
+)
 from backtest_simulator.launcher.action_submitter import build_action_submitter
 from backtest_simulator.launcher.clock import accelerated_clock
 from backtest_simulator.launcher.poller import BacktestMarketDataPoller
@@ -94,6 +100,164 @@ class DrainTimeoutError(RuntimeError):
     moment of failure. The backtest then unwinds cleanly instead of
     spinning on repeat-warnings for the rest of the frozen window.
     """
+
+
+def _extract_declared_stop_price(action: 'Action') -> Decimal | None:
+    """Pull `declared_stop_price` from the Nexus Action's
+    `execution_params` dict. Returns None when absent or blank.
+
+    The strategy template writes `execution_params['stop_price']` as a
+    string for YAML roundtrip; this function coerces to Decimal.
+    `execution_params` is a `MappingProxyType`, not a `dict`, so we
+    use the `collections.abc.Mapping` protocol.
+    """
+    from collections.abc import Mapping
+    params = action.execution_params
+    if not isinstance(params, Mapping):
+        return None
+    raw = params.get('stop_price')
+    if raw is None or str(raw).strip() in ('', 'None'):
+        return None
+    return Decimal(str(raw))
+
+
+def _install_capital_adapter_wrapper(
+    adapter: 'VenueAdapter',
+    tracker: 'CapitalLifecycleTracker',
+    capital_state: 'CapitalState',
+    initial_pool: Decimal,
+    declared_stops: dict[str, Decimal],
+) -> None:
+    """Wrap `adapter.submit_order` so the capital lifecycle completes in-line.
+
+    The 4-step lifecycle is `check_and_reserve → send_order → order_ack
+    → order_fill`. `check_and_reserve` happens in the action_submitter
+    (CAPITAL stage); the remaining three must fire once the venue has
+    produced its SubmitResult. Because `SimulatedVenueAdapter.submit_order`
+    is synchronous from the caller's point of view — fills are returned
+    inline on the same await — we collapse send_order + order_ack +
+    order_fill into one wrapper around submit_order.
+
+    The original `submit_order` is called normally; we inspect the
+    `SubmitResult`, look up the pending reservation by `client_order_id`
+    (which embeds the Nexus `command_id`), and feed the lifecycle
+    events into the tracker in order. Conservation is asserted after
+    each transition so any drift fails loud at the offending boundary.
+    """
+    original_submit = adapter.submit_order
+
+    async def wrapped_submit(*args: object, **kwargs: object) -> object:
+        # Inject the declared_stop_price we stashed on the tracker at
+        # reservation time. Praxis's `validate_trade_command` strips
+        # stop_price from MARKET orders before the command reaches
+        # here, so the `stop_price` kwarg is always None on a MARKET
+        # command. We look up the command via its client_order_id and
+        # inject the honest declared stop so FillModel.apply_stop
+        # can enforce it during the trade walk.
+        client_order_id = kwargs.get('client_order_id')
+        pre_match_command_id = _match_command_id(tracker, client_order_id)
+        if pre_match_command_id is not None and kwargs.get('stop_price') is None:
+            declared_stop = tracker.declared_stop_for_command(pre_match_command_id)
+            if declared_stop is not None:
+                kwargs = dict(kwargs)  # shallow copy
+                kwargs['stop_price'] = declared_stop
+                if isinstance(client_order_id, str):
+                    declared_stops[client_order_id] = declared_stop
+        result = await original_submit(*args, **kwargs)
+        # The Nexus command_id is embedded in the client_order_id as
+        # the `SS-<command_id-prefix>-<sequence>` format Nexus generates
+        # in `generate_client_order_id`. The prefix is the leading 16
+        # hex chars of the command_id stripped of dashes.
+        command_id = _match_command_id(tracker, client_order_id)
+        if command_id is None:
+            _log.warning(
+                'capital lifecycle: no pending command matches '
+                'client_order_id=%s; pending_keys=%s',
+                client_order_id, list(tracker._pending.keys()),  # noqa: SLF001
+            )
+            return result
+        status = getattr(result, 'status', None)
+        venue_order_id = getattr(result, 'venue_order_id', '')
+        status_name = getattr(status, 'name', '') if status is not None else ''
+        if status_name == 'REJECTED':
+            tracker.record_rejection(command_id, venue_order_id)
+            assert_conservation(
+                capital_state, initial_pool,
+                context=f'order_reject command_id={command_id}',
+            )
+            _log.info(
+                'capital lifecycle: command_id=%s REJECTED (reservation released)',
+                command_id,
+            )
+            return result
+        tracker.record_sent(command_id, venue_order_id)
+        assert_conservation(
+            capital_state, initial_pool,
+            context=f'send_order command_id={command_id}',
+        )
+        fill_notional = Decimal('0')
+        fill_fees = Decimal('0')
+        for fill in getattr(result, 'immediate_fills', ()):
+            fill_notional += Decimal(str(fill.qty)) * Decimal(str(fill.price))
+            fill_fees += Decimal(str(fill.fee))
+        # `order_fill` in Nexus's CapitalController rejects
+        # `fill_notional > remaining_notional`. Real fills on a
+        # MARKET order walk the tape at prices that differ from the
+        # strategy's `reference_price`, so the actual notional can
+        # overshoot the reservation. The overshoot is price slippage —
+        # honestly, the strategy used more capital than it reserved.
+        # The backtest's capital ledger can still stay balanced if we
+        # CAP the ledger fill to the reserved amount; anything above
+        # that is slippage that didn't cost the ledger (which the
+        # strategy *should* fix by reserving more up-front). We also
+        # surface the cap event in the log so a persistent gap can be
+        # investigated.
+        pending = tracker._pending.get(command_id)  # noqa: SLF001
+        if pending is not None and fill_notional > pending.notional:
+            slippage = fill_notional - pending.notional
+            _log.warning(
+                'capital lifecycle: fill_notional=%s exceeds reservation=%s '
+                'by %s (slippage); capping to reservation for ledger',
+                fill_notional, pending.notional, slippage,
+            )
+            fill_notional = pending.notional
+        tracker.record_ack_and_fill(
+            command_id, venue_order_id, fill_notional, fill_fees,
+        )
+        assert_conservation(
+            capital_state, initial_pool,
+            context=f'order_fill command_id={command_id}',
+        )
+        _log.info(
+            'capital lifecycle: command_id=%s reserve→send→ack→fill '
+            'venue_order_id=%s fill_notional=%s fees=%s',
+            command_id, venue_order_id, fill_notional, fill_fees,
+        )
+        return result
+
+    adapter.submit_order = wrapped_submit  # type: ignore[method-assign]
+
+
+def _match_command_id(tracker: 'CapitalLifecycleTracker', client_order_id: object) -> str | None:
+    """Map Nexus's `SS-<command_prefix>-<seq>` client_order_id back to
+    the full `command_id` the tracker recorded.
+
+    Nexus's `generate_client_order_id` takes the original `command_id`
+    and strips dashes, then uses the first 16 hex chars as the prefix.
+    We match by checking whether any pending command_id starts with
+    that prefix when dashes are removed.
+    """
+    if not isinstance(client_order_id, str):
+        return None
+    parts = client_order_id.split('-')
+    if len(parts) < 3:
+        return None
+    prefix = parts[1]
+    with tracker._lock:  # noqa: SLF001 - backtest-internal coordination
+        for command_id in tracker._pending:  # noqa: SLF001
+            if command_id.replace('-', '').startswith(prefix):
+                return command_id
+    return None
 
 
 def _wipe_event_spine_artifacts(db_path: Path) -> None:
@@ -264,9 +428,39 @@ class BacktestLauncher(Launcher):
         )
         runner = sequencer.start()
         nexus_config = self._build_nexus_instance_config(inst)
-        state = InstanceState(capital=CapitalState(capital_pool=Decimal('1000000')))
+        # Part 2: real CAPITAL ValidationPipeline + 4-step lifecycle. The
+        # `capital_pool` is the manifest's `allocated_capital` (that is
+        # the total capital this backtest is allowed to deploy on the
+        # account). The InstanceState holds the SAME CapitalState the
+        # CAPITAL validator guards — Nexus's `validate_capital_stage`
+        # reads via `context.state.capital`, so we wire both sides to
+        # one shared `CapitalState` object.
+        manifest = load_manifest(inst.manifest_path)
+        allocated_capital = manifest.allocated_capital
+        pipeline, controller, capital_state = build_validation_pipeline(
+            capital_pool=allocated_capital,
+        )
+        state = InstanceState(capital=capital_state)
+        self._capital_state = capital_state
+        self._capital_initial_pool = capital_state.capital_pool
+        self._capital_initial_total = capital_totals(capital_state).total
+        self._capital_tracker = CapitalLifecycleTracker(controller)
+        # Per-trade honesty record: client_order_id -> declared_stop_price.
+        # Populated at reservation time; read by `compute_r_per_trade`
+        # post-run to produce the Part 2 honest-R metric.
+        self._declared_stops: dict[str, Decimal] = {}
+        _install_capital_adapter_wrapper(
+            adapter=self._venue_adapter,
+            tracker=self._capital_tracker,
+            capital_state=capital_state,
+            initial_pool=self._capital_initial_pool,
+            declared_stops=self._declared_stops,
+        )
         action_submit = build_action_submitter(
             nexus_config=nexus_config, state=state, praxis_outbound=praxis_outbound,
+            validation_pipeline=pipeline,
+            strategy_budget=allocated_capital,
+            on_reservation=self._record_reservation,
             on_submit=self._record_submitted_command,
         )
 
@@ -457,6 +651,50 @@ class BacktestLauncher(Launcher):
         del command_id
         with self._submit_lock:
             self._submitted_commands += 1
+
+    def _record_reservation(
+        self,
+        command_id: str,
+        decision: 'ValidationDecision',
+        context: 'ValidationRequestContext',
+        action: 'Action',
+    ) -> None:
+        # Called by action_submitter's `on_reservation` hook after a
+        # successful CAPITAL validation. Feeds the
+        # `CapitalLifecycleTracker` so the later `adapter.submit_order`
+        # callback can match command_id → reservation for
+        # `send_order` / `order_ack` / `order_fill`. Conservation is
+        # also asserted here — the reservation stage has mutated the
+        # CapitalState and the component totals must still balance.
+        #
+        # `declared_stop_price` is read from the Nexus Action's
+        # `execution_params` (not the Praxis cmd, which strips it for
+        # MARKET orders) and carried through the lifecycle so the
+        # venue adapter's `FillModel.apply_stop` can enforce it during
+        # the trade walk.
+        reservation = decision.reservation
+        if reservation is None:
+            return
+        declared_stop_price = _extract_declared_stop_price(action)
+        self._capital_tracker.record_reservation(
+            command_id=command_id,
+            reservation_id=reservation.reservation_id,
+            strategy_id=context.strategy_id,
+            notional=reservation.notional,
+            estimated_fees=reservation.estimated_fees,
+            declared_stop_price=declared_stop_price,
+        )
+        _log.info(
+            'capital lifecycle: check_and_reserve command_id=%s '
+            'reservation_id=%s notional=%s declared_stop=%s',
+            command_id, reservation.reservation_id, reservation.notional,
+            declared_stop_price,
+        )
+        assert_conservation(
+            self._capital_state,
+            self._capital_initial_pool,
+            context=f'check_and_reserve command_id={command_id}',
+        )
 
     def _delivered_command_count(self) -> int:
         # Every `adapter.submit_order` call terminates by assigning into

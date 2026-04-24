@@ -51,15 +51,45 @@ def _walk_market(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpot
     #      drain budget. Aggregating keeps the backtest honest on total
     #      cost/qty (VWAP preserves both) while staying realistic on
     #      fill-event shape.
+    #
+    # Declared-stop enforcement (Part 2): if the order carries a
+    # `stop_price`, the walk monitors each tape tick for a stop
+    # breach. A BUY stop is below the entry and protects a long —
+    # a tick AT or BELOW stop_price means the protective stop
+    # triggered before the walk could fill the target qty. The fill
+    # is closed at `stop_price` (rounded to tick_size) with the
+    # remaining qty, and the reason is `market_stopped`. This
+    # produces an honest `r_per_trade` when computed later from
+    # |entry - stop| * qty — the fill NEVER silently slides past
+    # the stop and back into VWAP territory.
+    stop_price = order.stop_price
     remaining = order.qty
     consumed_qty = Decimal('0')
     consumed_notional = Decimal('0')
     last_time: datetime | None = None
+    stop_triggered = False
     for row in window.iter_rows(named=True):
         if remaining <= 0:
             break
-        take = min(remaining, Decimal(str(row['qty'])))
         px = Decimal(str(row['price']))
+        if stop_price is not None:
+            breaches = (
+                (order.side == 'BUY' and px <= stop_price)
+                or (order.side == 'SELL' and px >= stop_price)
+            )
+            if breaches:
+                # Close at the declared stop — honest R. The
+                # remaining qty is filled at `stop_price`, not at
+                # `px` (which is already past it). This keeps
+                # `|entry - stop| * qty` accurate as the realised
+                # risk regardless of where the tape crossed.
+                consumed_qty += remaining
+                consumed_notional += remaining * stop_price
+                last_time = _ts(row['time'])
+                remaining = Decimal('0')
+                stop_triggered = True
+                break
+        take = min(remaining, Decimal(str(row['qty'])))
         consumed_qty += take
         consumed_notional += take * px
         last_time = _ts(row['time'])
@@ -67,11 +97,12 @@ def _walk_market(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpot
     if consumed_qty == 0 or last_time is None:
         return []
     vwap = consumed_notional / consumed_qty
+    reason = 'market_stopped' if stop_triggered else 'market_vwap'
     return [FillResult(
         fill_time=last_time,
         fill_price=filters.round_price(vwap),
         fill_qty=filters.round_qty(consumed_qty),
-        is_maker=False, reason='market_vwap',
+        is_maker=False, reason=reason,
     )]
 
 

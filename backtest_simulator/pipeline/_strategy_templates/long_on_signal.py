@@ -119,15 +119,34 @@ class Strategy(_StrategyBase):
 
     def _build_action(self, side: OrderSide, qty: Decimal, signal: Signal) -> Action:
         del signal
+        # Declared-stop enforcement (Part 2): every OPEN-position ENTER
+        # must carry a concrete `stop_price`. For long-only we only
+        # open on BUY; SELL here is the EXIT leg of an already-open
+        # position and doesn't need a new stop (the SELL itself is the
+        # risk close). The stop sits `stop_bps` basis points BELOW the
+        # reference price for a BUY — e.g. with `stop_bps=50` and
+        # `estimated_price=70000`, `stop_price=69650`. The venue
+        # adapter's `FillModel.apply_stop` enforces the stop during
+        # the trade walk: if a tick breaches the stop during fill,
+        # the fill lands at the stop, not at VWAP.
+        stop_price: Decimal | None = None
+        if side == OrderSide.BUY:
+            bps = self._config.stop_bps
+            stop_price = self._config.estimated_price * (
+                Decimal('1') - bps / Decimal('10000')
+            )
+        execution_params: dict[str, object] = {
+            'symbol': self._config.symbol,
+            'stop_bps': str(self._config.stop_bps),
+        }
+        if stop_price is not None:
+            execution_params['stop_price'] = str(stop_price)
         return Action(
             action_type=ActionType.ENTER,
             direction=side, size=qty,
             execution_mode=ExecutionMode.SINGLE_SHOT,
             order_type=OrderType.MARKET,
-            execution_params={
-                'symbol': self._config.symbol,
-                'stop_bps': str(self._config.stop_bps),
-            },
+            execution_params=execution_params,
             # `deadline` is a DURATION in seconds (not an epoch timestamp).
             # Praxis computes the concrete deadline as
             # `cmd.created_at + timedelta(seconds=timeout)`, where
@@ -135,7 +154,17 @@ class Strategy(_StrategyBase):
             # 60s is a reasonable fill window for a backtest MARKET order.
             deadline=60,
             trade_id=None, command_id=None,
-            maker_preference=None, reference_price=None,
+            maker_preference=None,
+            # `reference_price` is what the action-submitter multiplies
+            # by `size` to produce the order's notional for the CAPITAL
+            # validator. The backtest uses `estimated_price` baked at
+            # manifest-build time (ClickHouse seed price at window
+            # start) rather than trying to read live book here — the
+            # strategy is notified only of the prediction, not the
+            # current tick. Real fills come from the venue adapter's
+            # historical trade walk regardless; this price is a sizing
+            # hint only.
+            reference_price=self._config.estimated_price,
         )
 
     def on_outcome(
