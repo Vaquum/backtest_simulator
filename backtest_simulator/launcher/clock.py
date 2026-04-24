@@ -70,18 +70,31 @@ def _frozen_aware_timer_run(self: threading.Timer) -> None:
     # the target when `now` appears to be `> interval * 2` earlier than
     # the current target — that's the fingerprint of a freeze transition,
     # not a clock step that ever happens mid-backtest.
-    interval_seconds = int(self.interval)
-    interval = timedelta(seconds=interval_seconds)
+    interval_seconds_raw = float(self.interval)
+    interval = timedelta(seconds=interval_seconds_raw)
+    # Epoch alignment is only meaningful — and only safe from
+    # zero-division on `elapsed_whole // interval_seconds` — for
+    # positive-integer second intervals. Sub-second or fractional
+    # intervals fall back to a simple relative target (`now + interval`)
+    # on the first iteration; their firing points then include one
+    # real-time poll-interval of jitter but sub-second Timers are
+    # never the deterministic backtest seam anyway (PredictLoop
+    # schedules hourly/daily ticks).
+    interval_seconds_int = int(interval_seconds_raw)
+    use_epoch_align = interval_seconds_int >= 1 and interval_seconds_int == interval_seconds_raw
     target: datetime | None = None
     while True:
         if self.finished.wait(_TIMER_POLL_INTERVAL_SECONDS):
             return
         now = datetime.now(UTC)
         if target is None or now < target - interval * 2:
-            epoch = datetime(1970, 1, 1, tzinfo=UTC)
-            elapsed_whole = int((now - epoch).total_seconds())
-            next_boundary = (elapsed_whole // interval_seconds + 1) * interval_seconds
-            target = epoch + timedelta(seconds=next_boundary)
+            if use_epoch_align:
+                epoch = datetime(1970, 1, 1, tzinfo=UTC)
+                elapsed_whole = int((now - epoch).total_seconds())
+                next_boundary = (elapsed_whole // interval_seconds_int + 1) * interval_seconds_int
+                target = epoch + timedelta(seconds=next_boundary)
+            else:
+                target = now + interval
         if now >= target:
             break
     if not self.finished.is_set():

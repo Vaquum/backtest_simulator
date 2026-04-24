@@ -1,73 +1,32 @@
-"""accelerated_clock: asyncio.sleep(N) ticks the frozen clock by N seconds."""
+"""accelerated_clock: main-thread freezer drive + frozen-aware threading.Timer.
+
+Design note: `clock.py` deliberately DOES NOT patch `asyncio.sleep`.
+Main is the sole driver of frozen time; asyncio and Timer threads are
+readers that wait for frozen time to reach their targets. The previous
+`_conditional_sleep` patch compounded frozen-time advancement with
+main's ticks and produced huge drift, which made the e2e flaky. Only
+`threading.Timer.run` is patched — the backtest's sensor PredictLoop
+schedules ticks via `threading.Timer`, so that's the seam that needs
+frozen-aware waiting.
+"""
 from __future__ import annotations
 
-import asyncio
-import itertools
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from backtest_simulator.launcher.clock import accelerated_clock
+from backtest_simulator.launcher.clock import (
+    _frozen_aware_timer_run,
+    accelerated_clock,
+)
 
 
-def test_asyncio_sleep_advances_frozen_clock() -> None:
+def test_accelerated_clock_pins_datetime() -> None:
     start = datetime(2021, 1, 1, tzinfo=UTC)
-
-    async def tick() -> datetime:
-        await asyncio.sleep(3600)
-        return datetime.now(UTC)
-
-    real_start = time.monotonic()
     with accelerated_clock(start):
-        after_one_tick = asyncio.run(tick())
-    real_elapsed = time.monotonic() - real_start
-
-    assert after_one_tick == start + timedelta(hours=1), after_one_tick
-    # 3600 frozen seconds must compress into well under 1 real second.
-    assert real_elapsed < 1.0, f'took {real_elapsed:.2f}s real time'
-
-
-def test_multiple_sleeps_compose() -> None:
-    start = datetime(2021, 6, 15, 12, 0, tzinfo=UTC)
-
-    async def drive() -> list[datetime]:
-        out = [datetime.now(UTC)]
-        for _ in range(24):
-            await asyncio.sleep(3600)
-            out.append(datetime.now(UTC))
-        return out
-
-    with accelerated_clock(start):
-        timestamps = asyncio.run(drive())
-
-    assert timestamps[0] == start
-    assert timestamps[-1] == start + timedelta(hours=24)
-    # Monotone strictly increasing — one hour per tick.
-    for prev, nxt in itertools.pairwise(timestamps):
-        assert nxt - prev == timedelta(hours=1)
-
-
-def test_zero_sleep_does_not_tick() -> None:
-    start = datetime(2021, 1, 1, tzinfo=UTC)
-
-    async def tick() -> datetime:
-        await asyncio.sleep(0)
-        return datetime.now(UTC)
-
-    with accelerated_clock(start):
-        now = asyncio.run(tick())
-
-    assert now == start, f'zero-sleep moved clock to {now}'
-
-
-def test_asyncio_sleep_is_permanently_wrapped() -> None:
-    # The conditional wrapper is installed at module import — not restored
-    # on context-manager exit — so sleeps scheduled BEFORE a freezer
-    # engages still pick it up once it does. The wrapper falls through
-    # to real-time behavior when no freezer is active.
-    from backtest_simulator.launcher.clock import _conditional_sleep
-    assert asyncio.sleep is _conditional_sleep
+        assert datetime.now(UTC) == start
 
 
 def test_accelerated_clock_is_not_reentrant() -> None:
@@ -87,63 +46,65 @@ def test_exception_inside_block_releases_freezer() -> None:
         assert datetime.now(UTC) == start
 
 
-def test_sleep_returns_configured_result() -> None:
-    start = datetime(2021, 1, 1, tzinfo=UTC)
-
-    async def take_result() -> str:
-        return await asyncio.sleep(5, result='sentinel')
-
-    with accelerated_clock(start):
-        value = asyncio.run(take_result())
-
-    assert value == 'sentinel'
-
-
 def test_threading_timer_is_permanently_patched() -> None:
     # The Timer.run patch is installed at module import (not just inside
     # accelerated_clock) so Timers scheduled BEFORE a freezer engages
-    # still fire based on frozen-time delta accumulation once the block
-    # opens. PredictLoop schedules its tick Timer during boot under real
-    # time; that Timer has to keep polling frozen-time once the backtest
-    # transitions to accelerated_clock, or no tick ever fires.
-    import threading
-
-    from backtest_simulator.launcher.clock import _frozen_aware_timer_run
+    # still fire based on frozen-time once the block opens. PredictLoop
+    # schedules its tick Timer during boot under real time; that Timer
+    # has to keep polling frozen-time once the backtest transitions to
+    # accelerated_clock, or no tick ever fires.
     assert threading.Timer.run is _frozen_aware_timer_run
 
 
-def test_pre_scheduled_sleep_catches_late_freezer() -> None:
-    # The load-bearing guarantee for BacktestLauncher: a sleep scheduled
-    # BEFORE `accelerated_clock` engages must still be picked up by the
-    # freezer on its next poll once the block opens. This is what lets
-    # PredictLoop start under real time (avoiding the Trainer SSL issue)
-    # and then have its pending interval sleep catch the freezer when
-    # the outer loop transitions to accelerated time.
-    start = datetime(2021, 1, 1, tzinfo=UTC)
+def test_timer_fires_at_epoch_aligned_boundary() -> None:
+    # Under `accelerated_clock`, `datetime.now(UTC)` is frozen. The
+    # patched Timer waits for the NEXT epoch-aligned interval boundary
+    # and fires there, not at `start + interval`. At start=02:23:15
+    # with interval=3600s, the first boundary is 03:00:00. Epoch
+    # alignment removes per-run drift and makes strategy tick times
+    # deterministic across runs.
+    start = datetime(2021, 1, 1, 2, 23, 15, tzinfo=UTC)
+    fired_at: list[datetime] = []
+    done = threading.Event()
 
-    async def driver() -> datetime:
-        # Start a long sleep BEFORE engaging the freezer. The task is
-        # already awaiting `_conditional_sleep(60)` in its poll loop
-        # when the freezer below engages; the next poll iteration picks
-        # it up and ticks the remainder.
-        async def sleep_task() -> datetime:
-            await asyncio.sleep(60)
-            return datetime.now(UTC)
-
-        task = asyncio.create_task(sleep_task())
-        # Yield enough that the task hits its first poll step (50ms).
-        await asyncio.sleep(0)
-        with accelerated_clock(start):
-            return await task
+    def on_fire() -> None:
+        fired_at.append(datetime.now(UTC))
+        done.set()
 
     real_start = time.monotonic()
-    observed = asyncio.run(driver())
-    real_elapsed = time.monotonic() - real_start
+    with accelerated_clock(start) as freezer:
+        timer = threading.Timer(3600.0, on_fire)
+        timer.start()
+        # Drive the frozen clock forward in small increments until the
+        # Timer fires. Main is the sole driver of frozen time, so
+        # without this push nothing advances.
+        while not done.is_set():
+            freezer.tick(timedelta(seconds=60))
+            time.sleep(0.001)
+            if time.monotonic() - real_start > 5.0:
+                pytest.fail('Timer did not fire within 5s real time')
 
-    # The frozen clock should have advanced by ~60s, not by the real
-    # seconds waited.
-    elapsed_frozen = observed - start
-    assert elapsed_frozen >= timedelta(seconds=59)
-    assert elapsed_frozen <= timedelta(seconds=61)
-    # Real wall clock should be well under the 60-second sleep.
-    assert real_elapsed < 5.0, f'real elapsed {real_elapsed:.2f}s > 5s'
+    assert fired_at, 'Timer.on_fire never ran'
+    # Fires AT 03:00:00 UTC — the next epoch-aligned 3600s boundary
+    # strictly after `start`. Allow one main-tick overshoot (60s)
+    # because the Timer poll loop checks once per iteration.
+    expected_min = datetime(2021, 1, 1, 3, 0, 0, tzinfo=UTC)
+    expected_max = expected_min + timedelta(seconds=61)
+    assert expected_min <= fired_at[0] <= expected_max, fired_at[0]
+
+
+def test_timer_cancel_stops_wait() -> None:
+    start = datetime(2021, 1, 1, tzinfo=UTC)
+    ran = threading.Event()
+
+    def on_fire() -> None:
+        ran.set()
+
+    with accelerated_clock(start):
+        timer = threading.Timer(3600.0, on_fire)
+        timer.start()
+        timer.cancel()
+        # Give the wait loop a chance to observe the cancel.
+        time.sleep(0.05)
+
+    assert not ran.is_set(), 'Timer fired despite being cancelled'

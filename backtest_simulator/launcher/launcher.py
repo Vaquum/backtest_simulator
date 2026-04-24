@@ -349,9 +349,12 @@ class BacktestLauncher(Launcher):
           2. A log handler keyed on that message releases a barrier
              once all instances are up.
           3. We enter `accelerated_clock(start)` at that point. The
-             very next `asyncio.sleep(kline_size)` from PredictLoop /
-             TimerLoop hits the monkey-patch and advances frozen time
-             from `start` forward in kline-sized chunks.
+             main thread is now the sole driver of frozen time:
+             `_advance_clock_until` ticks the freezer by
+             `_CLOCK_TICK_SECONDS` per iteration while asyncio sleeps
+             and `threading.Timer.run` wait (via the frozen-aware
+             patch in `clock.py`) for the frozen clock to reach their
+             targets.
           4. Main thread blocks until `datetime.now(UTC) >= end`, then
              calls `request_stop()`. A real-wall-clock cap protects
              against runs that never produce a sleep.
@@ -491,9 +494,12 @@ class BacktestLauncher(Launcher):
         account_loop to pick up the queued command and for
         `adapter.submit_order` to write the resulting order entry.
 
-        A truly stuck command (adapter.submit_order raises into the task
-        and never stores an order) is bounded by `_DRAIN_TIMEOUT_SECONDS`
-        with a warning for the operator.
+        A truly stuck command (adapter.submit_order raises into the
+        task and never stores an order) is bounded by
+        `_DRAIN_TIMEOUT_SECONDS`; on timeout the drain raises
+        `DrainTimeoutError` carrying the per-account queue state so
+        the run aborts instead of silently burning frozen time into
+        a grey zone.
         """
         drain_start = os.times()[4]
         while True:

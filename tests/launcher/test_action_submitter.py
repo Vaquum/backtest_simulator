@@ -4,6 +4,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
+import pytest
 from nexus.core.domain.capital_state import CapitalState
 from nexus.core.domain.enums import OrderSide
 from nexus.core.domain.order_types import ExecutionMode, OrderType
@@ -97,10 +98,13 @@ def test_abort_action_routed_to_send_abort() -> None:
     assert outbound.aborts[0]['account_id'] == 'bts-acct'
 
 
-def test_submission_swallows_per_action_errors(monkeypatch: Any) -> None:
-    # A failure in translate or send_command for one action must not abort
-    # the iteration — Nexus's own submit_actions has the same per-action
-    # isolation semantics and PredictLoop's tick reliability depends on it.
+def test_submission_propagates_per_action_errors(monkeypatch: Any) -> None:
+    # The backtest action submitter does NOT swallow per-action errors.
+    # A failure in `send_command` must surface to `PredictLoop._tick`'s
+    # own logging/abort path — silently dropping ENTER/SELL actions
+    # would hide bugs and produce a misleading trade summary. The
+    # fail-loud contract matches the CLAUDE.md law 4 stance: no silent
+    # handlers in the action-submit path.
     class _RaisingOutbound(_OutboundStub):
         def send_command(self, cmd: Any) -> str:
             raise RuntimeError('injected')
@@ -109,8 +113,8 @@ def test_submission_swallows_per_action_errors(monkeypatch: Any) -> None:
         nexus_config=_nexus_config(), state=_instance_state(),
         praxis_outbound=outbound,  # type: ignore[arg-type]
     )
-    submit([_enter_action(), _enter_action()], 'long_on_signal')
-    # Neither action landed (both raised in send), but submit did not itself raise.
+    with pytest.raises(RuntimeError, match='injected'):
+        submit([_enter_action(), _enter_action()], 'long_on_signal')
     assert len(outbound.commands) == 0
 
 
