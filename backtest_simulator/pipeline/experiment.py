@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
+from typing import cast
 
 import polars as pl
 from limen import Sensor, Trainer, UniversalExperimentLoop
@@ -92,9 +93,11 @@ class ExperimentPipeline:
                     f'dict[str, list[object]], got {type(result).__name__}'
                 )
                 raise TypeError(msg)
-            # `result.items()` returns Unknown pairs after narrowing;
-            # widen to a typed mapping so .items() yields object pairs.
-            typed_result: Mapping[object, object] = result
+            # Pyright narrows `dict` to `dict[Unknown, Unknown]` after
+            # the isinstance check; the Mapping annotation alone won't
+            # propagate type parameters. Use cast() (banned only when
+            # the target type is Any; Mapping[object, object] is fine).
+            typed_result = cast('Mapping[object, object]', result)
             typed: dict[str, list[object]] = {}
             for raw_key, raw_value in typed_result.items():
                 if not isinstance(raw_key, str):
@@ -109,7 +112,10 @@ class ExperimentPipeline:
                         f'must be a list, got {type(raw_value).__name__}'
                     )
                     raise TypeError(msg)
-                value_list: list[object] = list(raw_value)
+                # Same widening for the inner list.
+                value_list: list[object] = list(
+                    cast('list[object]', raw_value),
+                )
                 typed[raw_key] = value_list
             return typed
 
@@ -172,7 +178,7 @@ class ExperimentPipeline:
             if isinstance(s, str):
                 obj: object = json.loads(s)
                 if isinstance(obj, dict):
-                    typed_obj: Mapping[object, object] = obj
+                    typed_obj = cast('Mapping[object, object]', obj)
                     parsed.append({str(k): v for k, v in typed_obj.items()})
                 else:
                     parsed.append({})

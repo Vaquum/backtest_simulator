@@ -59,7 +59,7 @@ def _install_nexus_enum_shim() -> None:
         raise TypeError(msg)
     # Post-shim this dict holds both Praxis and Nexus enum keys + values
     # as Enum synonyms, so `Enum` is the honest narrowest annotation.
-    allowed: dict[Enum, frozenset[Enum]] = raw_allowed
+    allowed = cast('dict[Enum, frozenset[Enum]]', raw_allowed)
     praxis_by_name = {em.name: em for em in _PraxisExecutionMode}
     order_name: dict[str, Enum] = {ot.name: ot for ot in _PraxisOrderType}
     nexus_order_name: dict[str, Enum] = {ot.name: ot for ot in _NexusOrderType}
@@ -183,8 +183,9 @@ def _extract_single_shot_price_fields(params: object) -> dict[str, Decimal | Non
     """Pull price/stop_price/stop_limit_price from a params object or dict."""
     raw: dict[str, object] = {'price': None, 'stop_price': None, 'stop_limit_price': None}
     if isinstance(params, Mapping):
+        typed_params = cast('Mapping[object, object]', params)
         for key in raw:
-            raw[key] = params.get(key)
+            raw[key] = typed_params.get(key)
     elif params is not None:
         # Nexus SingleShotParams or another params dataclass — copy
         # matching field values by name.

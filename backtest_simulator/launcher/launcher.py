@@ -36,7 +36,7 @@ from nexus.strategy.context import StrategyContext
 from nexus.strategy.predict_loop import PredictLoop
 from nexus.strategy.timer_loop import TimerLoop
 from praxis.core.domain.enums import OrderSide, OrderType
-from praxis.core.domain.trade_outcome import TradeOutcome
+from nexus.infrastructure.praxis_connector.trade_outcome import TradeOutcome
 from praxis.infrastructure.event_spine import EventSpine
 from praxis.infrastructure.venue_adapter import SubmitResult, VenueAdapter
 from praxis.launcher import InstanceConfig, Launcher
@@ -431,13 +431,16 @@ class BacktestLauncher(Launcher):
     same plumbing the backtest drives.
     """
 
-    # Parent `Launcher` declares `_poller: MarketDataPoller | None`; the
-    # backtest substitutes a duck-typed `BacktestMarketDataPoller` (same
-    # public surface — `start`/`stop`/`running`/`get_market_data`/
-    # `add_kline_size`/`remove_kline_size`). Re-annotating on the
-    # subclass tells pyright the narrower runtime type so that
-    # `self._poller.start()` does not trip reportOptionalMemberAccess.
-    _poller: BacktestMarketDataPoller | None
+    # `_poller` is inherited from praxis.Launcher with type
+    # `MarketDataPoller | None`. The backtest substitutes a duck-typed
+    # `BacktestMarketDataPoller` (same public surface — start/stop/
+    # running/get_market_data/add_kline_size/remove_kline_size). We
+    # don't re-annotate here: pyright's variance rules treat any
+    # subclass-side narrowing of a mutable class-level attribute as
+    # `reportIncompatibleVariableOverride`. Instead, every consumer
+    # site that calls `self._poller.start()` etc. is wrapped in an
+    # `assert self._poller is not None` so reportOptionalMemberAccess
+    # is satisfied without changing the parent's type.
 
     def __init__(
         self,
