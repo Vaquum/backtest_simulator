@@ -1,6 +1,7 @@
 """Backtest action-submit callback — bypass the full validator, land real TradeCommands."""
 from __future__ import annotations
 
+import importlib
 import logging
 import uuid
 from collections.abc import Callable
@@ -9,6 +10,8 @@ from decimal import Decimal
 from typing import cast
 
 from nexus.core.domain.enums import OrderSide
+from nexus.core.domain.order_types import ExecutionMode as _NexusExecutionMode
+from nexus.core.domain.order_types import OrderType as _NexusOrderType
 from nexus.core.validator.pipeline_models import (
     InstanceState,
     ValidationAction,
@@ -19,8 +22,59 @@ from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
 from nexus.infrastructure.praxis_connector.translate import translate_to_trade_command
 from nexus.instance_config import InstanceConfig as NexusInstanceConfig
 from nexus.strategy.action import Action, ActionType
+from praxis.core.domain.enums import ExecutionMode as _PraxisExecutionMode
+from praxis.core.domain.enums import OrderType as _PraxisOrderType
 
 _log = logging.getLogger(__name__)
+
+
+# --- Nexus/Praxis enum bridge -----------------------------------------------
+# Nexus and Praxis each define their own `ExecutionMode` / `OrderType`
+# enums. Same names + same values, different class objects. Praxis's
+# `validate_trade_command._ALLOWED_ORDER_TYPES` dict is keyed on Praxis
+# enums and returns None for a Nexus-enum TradeCommand; the validator
+# then raises "no allowed order types configured for mode SINGLE_SHOT".
+# Extend the dict with Nexus-keyed entries that accept both enum classes
+# as synonyms. Runs once at module import.
+def _install_nexus_enum_shim() -> None:
+    module = importlib.import_module('praxis.core.validate_trade_command')
+    allowed: dict = module._ALLOWED_ORDER_TYPES  # noqa: SLF001 - cross-package shim
+    praxis_by_name = {em.name: em for em in _PraxisExecutionMode}
+    order_name = {ot.name: ot for ot in _PraxisOrderType}
+    nexus_order_name = {ot.name: ot for ot in _NexusOrderType}
+    for nexus_em in _NexusExecutionMode:
+        praxis_em = praxis_by_name[nexus_em.name]
+        existing = allowed[praxis_em]
+        names = {ot.name for ot in existing}
+        synonym_set = frozenset(
+            {order_name[n] for n in names if n in order_name}
+            | {nexus_order_name[n] for n in names if n in nexus_order_name},
+        )
+        allowed[praxis_em] = synonym_set
+        allowed[nexus_em] = synonym_set
+
+
+_install_nexus_enum_shim()
+
+
+# --- FakeDatetime JSON-serializer shim --------------------------------------
+# Praxis's `event_spine` serializes via `orjson.dumps(default=_serialize_default)`.
+# orjson's native datetime handler rejects freezegun's `FakeDatetime`
+# subclass by type identity. Wrap the default handler to isoformat any
+# datetime before falling through to the original (which handles Decimal).
+def _install_fake_datetime_serializer_shim() -> None:
+    module = importlib.import_module('praxis.infrastructure.event_spine')
+    original = module._serialize_default  # noqa: SLF001 - cross-package shim
+
+    def _patched(obj: object) -> object:
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return original(obj)
+
+    module._serialize_default = _patched  # noqa: SLF001
+
+
+_install_fake_datetime_serializer_shim()
 
 
 _ACTION_TYPE_TO_VALIDATION_ACTION: dict[ActionType, ValidationAction] = {
@@ -59,20 +113,11 @@ def build_action_submitter(
     """
     def _submit(actions: list[Action], strategy_id: str) -> None:
         for action in actions:
-            try:
-                if action.action_type == ActionType.ABORT:
-                    _submit_abort(praxis_outbound, nexus_config, strategy_id, action)
-                else:
-                    _submit_translated(
-                        praxis_outbound, nexus_config, state, strategy_id, action,
-                    )
-            except Exception:  # noqa: BLE001 - per-action failure is local; don't abort the tick
-                _log.exception(
-                    'backtest action submission failed',
-                    extra={
-                        'strategy_id': strategy_id,
-                        'action_type': action.action_type.value,
-                    },
+            if action.action_type == ActionType.ABORT:
+                _submit_abort(praxis_outbound, nexus_config, strategy_id, action)
+            else:
+                _submit_translated(
+                    praxis_outbound, nexus_config, state, strategy_id, action,
                 )
 
     return _submit

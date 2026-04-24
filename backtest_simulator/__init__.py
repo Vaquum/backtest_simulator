@@ -1,6 +1,7 @@
 """backtest_simulator — honesty-gated backtester for unmodified Nexus strategies."""
 from __future__ import annotations
 
+from backtest_simulator import _limen_cache  # noqa: F401 - installs local-parquet cache on HistoricalData.get_spot_klines
 from backtest_simulator.exceptions import (
     ConservationViolation,
     DeterminismViolation,

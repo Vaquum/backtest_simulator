@@ -54,11 +54,15 @@ The gates check shape, scope, format, ratchets, and named test suites. They do n
 
 **No defensive fog.** Agents are primed to produce defensible-looking code: `try/except` that swallows everything, fallbacks for cases that don't happen, docstrings that restate the signature, comments that narrate the line, parameters that might be useful someday. None of it belongs here. The fail-loud gate (law 4) catches the AST-detectable forms mechanically; the rest is operator-caught at review.
 
+**No sitting in the dark.** Do not block callable outputs or script outputs in anyway to save context. Or do not hide sub-agent logs to save your context. Always stay fully aware of what the running thing is doing. 
+
 **Minimal scope.** Touch only the files the task demands. Drive-by cleanups go in a separate slice.
 
 **No synthetic data.** Ever. Inventing data is not a shortcut — it corrupts everything downstream. If the real data isn't there, stop and ask.
 
 **Validate against the stated expectation.** The question is never "did it run" — it's "did it return what the slice promised."
+
+**Deliver meaning not mechanics.** It's better to deliver the right meaning poorly, than deliver meaningless scaffolding and mechanics in an impressive way. 
 
 **The smallest possible honest way always.** Slice spec, code, communication, everything, let it be the smallest possible unit size that honestly delivers what is required.
 

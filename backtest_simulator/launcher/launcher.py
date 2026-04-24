@@ -39,37 +39,23 @@ from backtest_simulator.launcher.clock import accelerated_clock
 from backtest_simulator.launcher.poller import BacktestMarketDataPoller
 
 _log = logging.getLogger(__name__)
-# Used for the 'nexus instance running' / 'nexus instance stopped' lines
-# so `_NexusRunningHandler` (attached to `praxis.launcher`) catches them
-# from the override exactly as it would from upstream Launcher.
-_nexus_lifecycle_log = logging.getLogger('praxis.launcher')
 
 _BOOT_TIMEOUT_SECONDS = 60
 _NEXUS_RUN_TIMEOUT_SECONDS = 120
 _POLL_INTERVAL_SECONDS = 0.05
 _REAL_TIME_CAP_SECONDS = 600
 _SHUTDOWN_TIMEOUT_SECONDS = 30
-_NEXUS_RUNNING_MESSAGE = 'nexus instance running'
+# 60s frozen + 0.01s real per main tick. KNOWN TRADE-OFF: at 0.01s pause
+# the asyncio account_loop's `_QUEUE_POLL_INTERVAL` (0.1s) is starved —
+# commands are accepted by `submit_command` but never dispatched to the
+# adapter, leaving `orders=0` at the adapter. Bumping pause to 0.1s
+# closes the gap but makes the 8h-window run ~50s. The principled fix
+# (Issue #10 invariant #14) is a synchronous drain after every submit:
+# the Driver yields to asyncio in a tight poll on the outcome queue
+# until every submitted command_id has been observed, before advancing
+# the frozen clock. Pending that fix, choose tradeoff with this constant.
 _CLOCK_TICK_SECONDS = timedelta(seconds=60)
 _CLOCK_TICK_REAL_PAUSE_SECONDS = 0.01
-
-
-class _NexusRunningHandler(logging.Handler):
-    """Signal an event once every Nexus instance has logged 'nexus instance running'."""
-
-    def __init__(self, event: threading.Event, expected: int) -> None:
-        super().__init__()
-        self._event = event
-        self._expected = expected
-        self._seen = 0
-        self._lock = threading.Lock()
-
-    def emit(self, record: logging.LogRecord) -> None:
-        if _NEXUS_RUNNING_MESSAGE in record.getMessage():
-            with self._lock:
-                self._seen += 1
-                if self._seen >= self._expected:
-                    self._event.set()
 
 
 class BacktestLauncher(Launcher):
@@ -139,49 +125,28 @@ class BacktestLauncher(Launcher):
         # Trainer's data source stay aligned.
         intervals: dict[int, int] = {}
         for inst in self._instances:
-            try:
-                manifest = load_manifest(inst.manifest_path)
-            except Exception:  # noqa: BLE001 - per-instance failure is isolated
-                _log.exception(
-                    'failed to load manifest for kline extraction',
-                    extra={'account_id': inst.account_id},
-                )
-                continue
+            manifest = load_manifest(inst.manifest_path)
             for spec in manifest.strategies:
                 for sensor_spec in spec.sensors:
                     kline_size = self._kline_size_from_experiment_dir(
                         sensor_spec.experiment_dir,
                     )
-                    if kline_size is None:
-                        continue
                     current = intervals.get(kline_size)
                     if current is None or sensor_spec.interval_seconds < current:
                         intervals[kline_size] = sensor_spec.interval_seconds
         return intervals
 
     @staticmethod
-    def _kline_size_from_experiment_dir(experiment_dir: Path) -> int | None:
+    def _kline_size_from_experiment_dir(experiment_dir: Path) -> int:
         metadata_path = experiment_dir / 'metadata.json'
         if not metadata_path.is_file():
-            return None
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
-            sfd_module_name = metadata.get('sfd_module')
-            if not sfd_module_name:
-                return None
-            sfd = importlib.import_module(sfd_module_name)
-            limen_manifest = sfd.manifest()
-            config = getattr(limen_manifest, 'data_source_config', None)
-            if config is None:
-                return None
-            kline_size = config.params.get('kline_size')
-            return int(kline_size) if kline_size is not None else None
-        except Exception:  # noqa: BLE001 - missing experiment is non-fatal
-            _log.exception(
-                'failed to extract kline_size from experiment_dir',
-                extra={'experiment_dir': str(experiment_dir)},
-            )
-            return None
+            msg = f'metadata.json not found at {metadata_path}'
+            raise FileNotFoundError(msg)
+        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+        sfd_module_name = metadata['sfd_module']
+        sfd = importlib.import_module(sfd_module_name)
+        limen_manifest = sfd.manifest()
+        return int(limen_manifest.data_source_config.params['kline_size'])
 
     def _signal_handler(self, _signum: int, _frame: FrameType | None) -> None:
         # Backtests aren't daemons; termination is driven by the outer
@@ -208,79 +173,79 @@ class BacktestLauncher(Launcher):
         injected into both `PredictLoop` and `TimerLoop`.
         """
         if self._trading is None or self._loop is None:
-            return
-        try:
-            state_store = StateStore(inst.state_dir)
-            praxis_outbound = PraxisOutbound(
-                submit_fn=self._trading.submit_command,
-                loop=self._loop,
-                register_fn=self._trading.register_account,
-                unregister_fn=self._trading.unregister_account,
-                pull_positions_fn=self._trading.pull_positions,
-            )
-            sequencer = StartupSequencer(
-                state_store=state_store,
-                manifest_path=inst.manifest_path,
-                strategies_base_path=inst.strategies_base_path,
-                strategy_state_path=inst.strategy_state_path,
-                praxis_outbound=praxis_outbound,
-            )
-            runner = sequencer.start()
-            nexus_config = self._build_nexus_instance_config(inst)
-            state = InstanceState(capital=CapitalState(capital_pool=Decimal('1000000')))
-            action_submit = build_action_submitter(
-                nexus_config=nexus_config, state=state, praxis_outbound=praxis_outbound,
+            msg = 'BacktestLauncher._run_nexus_instance: trading/loop not initialised'
+            raise RuntimeError(msg)
+        state_store = StateStore(inst.state_dir)
+        praxis_outbound = PraxisOutbound(
+            submit_fn=self._trading.submit_command,
+            loop=self._loop,
+            register_fn=self._trading.register_account,
+            unregister_fn=self._trading.unregister_account,
+            pull_positions_fn=self._trading.pull_positions,
+        )
+        sequencer = StartupSequencer(
+            state_store=state_store,
+            manifest_path=inst.manifest_path,
+            strategies_base_path=inst.strategies_base_path,
+            strategy_state_path=inst.strategy_state_path,
+            praxis_outbound=praxis_outbound,
+        )
+        runner = sequencer.start()
+        nexus_config = self._build_nexus_instance_config(inst)
+        state = InstanceState(capital=CapitalState(capital_pool=Decimal('1000000')))
+        action_submit = build_action_submitter(
+            nexus_config=nexus_config, state=state, praxis_outbound=praxis_outbound,
+        )
+
+        def market_data_provider(kline_size: int) -> pl.DataFrame:
+            if self._poller is None:
+                msg = 'BacktestLauncher.market_data_provider: poller not initialised'
+                raise RuntimeError(msg)
+            return self._poller.get_market_data(kline_size)
+
+        def context_provider(_strategy_id: str) -> StrategyContext:
+            return StrategyContext(
+                positions=(),
+                capital_available=Decimal('0'),
+                operational_mode=OperationalMode.ACTIVE,
             )
 
-            def market_data_provider(kline_size: int) -> pl.DataFrame:
-                if self._poller is None:
-                    return pl.DataFrame()
-                return self._poller.get_market_data(kline_size)
+        predict_loop = PredictLoop(
+            runner=runner, wired_sensors=sequencer.wired_sensors,
+            market_data_provider=market_data_provider,
+            context_provider=context_provider,
+            action_submit=action_submit,
+        )
+        predict_loop.start()
 
-            def context_provider(_strategy_id: str) -> StrategyContext:
-                return StrategyContext(
-                    positions=(),
-                    capital_available=Decimal('0'),
-                    operational_mode=OperationalMode.ACTIVE,
-                )
-
-            predict_loop = PredictLoop(
-                runner=runner, wired_sensors=sequencer.wired_sensors,
-                market_data_provider=market_data_provider,
+        timer_loop: TimerLoop | None = None
+        if sequencer.timer_specs:
+            timer_loop = TimerLoop(
+                runner=runner, strategy_timers=sequencer.timer_specs,
                 context_provider=context_provider,
                 action_submit=action_submit,
             )
-            predict_loop.start()
+            timer_loop.start()
 
-            timer_loop: TimerLoop | None = None
-            if sequencer.timer_specs:
-                timer_loop = TimerLoop(
-                    runner=runner, strategy_timers=sequencer.timer_specs,
-                    context_provider=context_provider,
-                    action_submit=action_submit,
-                )
-                timer_loop.start()
+        praxis_inbound = PraxisInbound(outcome_queue=outcome_queue)
+        # Direct event signal — no log-message interception. The running
+        # event is initialised in `run_window` on `self._nexus_running`.
+        self._nexus_running.set()
+        self._stop_event.wait()
 
-            praxis_inbound = PraxisInbound(outcome_queue=outcome_queue)
-            _nexus_lifecycle_log.info('nexus instance running', extra={'account_id': inst.account_id})
-            self._stop_event.wait()
-
-            shutdown = ShutdownSequencer(
-                runner=runner,
-                manifest=sequencer._manifest,
-                state_store=state_store,
-                state=sequencer._state,
-                strategy_state_path=inst.strategy_state_path or inst.state_dir / 'strategy_state',
-                predict_loop=predict_loop,
-                timer_loop=timer_loop,
-                praxis_outbound=praxis_outbound,
-                praxis_inbound=praxis_inbound,
-                account_id=inst.account_id,
-            )
-            shutdown.shutdown()
-            _nexus_lifecycle_log.info('nexus instance stopped', extra={'account_id': inst.account_id})
-        except Exception:  # noqa: BLE001 - top-level catch for thread, must not propagate
-            _log.exception('nexus instance failed', extra={'account_id': inst.account_id})
+        shutdown = ShutdownSequencer(
+            runner=runner,
+            manifest=sequencer._manifest,
+            state_store=state_store,
+            state=sequencer._state,
+            strategy_state_path=inst.strategy_state_path or inst.state_dir / 'strategy_state',
+            predict_loop=predict_loop,
+            timer_loop=timer_loop,
+            praxis_outbound=praxis_outbound,
+            praxis_inbound=praxis_inbound,
+            account_id=inst.account_id,
+        )
+        shutdown.shutdown()
 
     @staticmethod
     def _build_nexus_instance_config(inst: InstanceConfig) -> NexusInstanceConfig:
@@ -322,29 +287,27 @@ class BacktestLauncher(Launcher):
             msg = f'run_window: end {end} must be after start {start}'
             raise ValueError(msg)
 
-        running_event = threading.Event()
-        handler = _NexusRunningHandler(
-            running_event, expected=max(len(self._instances), 1),
-        )
-        nexus_logger = logging.getLogger('praxis.launcher')
-        nexus_logger.addHandler(handler)
+        # Direct threading.Event — set by `_run_nexus_instance` when the
+        # Nexus instance thread is ready. No log-message interception.
+        self._nexus_running = threading.Event()
 
         launch_thread = threading.Thread(
             target=self.launch, daemon=True, name='backtest-launch',
         )
-        try:
-            launch_thread.start()
-            self._wait_until_trading_ready()
-            self._wait_until_all_nexus_running(running_event)
-        finally:
-            nexus_logger.removeHandler(handler)
+        launch_thread.start()
+        self._wait_until_trading_ready()
+        self._wait_until_all_nexus_running()
 
         with accelerated_clock(start) as freezer:
             self._advance_clock_until(end, freezer)
             self.request_stop()
         launch_thread.join(timeout=_SHUTDOWN_TIMEOUT_SECONDS)
         if launch_thread.is_alive():
-            _log.warning('backtest launch thread did not terminate within shutdown timeout')
+            msg = (
+                f'backtest launch thread did not terminate within '
+                f'{_SHUTDOWN_TIMEOUT_SECONDS}s of shutdown'
+            )
+            raise RuntimeError(msg)
 
     def _wait_until_trading_ready(self) -> None:
         # freezegun patches every public `time.*` clock (time.monotonic,
@@ -362,11 +325,10 @@ class BacktestLauncher(Launcher):
         msg = f'Trading did not start within {_BOOT_TIMEOUT_SECONDS}s of real wall time'
         raise RuntimeError(msg)
 
-    @staticmethod
-    def _wait_until_all_nexus_running(event: threading.Event) -> None:
-        if not event.wait(timeout=_NEXUS_RUN_TIMEOUT_SECONDS):
+    def _wait_until_all_nexus_running(self) -> None:
+        if not self._nexus_running.wait(timeout=_NEXUS_RUN_TIMEOUT_SECONDS):
             msg = (
-                f'Nexus instances did not all reach "running" within '
+                f'Nexus instance did not reach running within '
                 f'{_NEXUS_RUN_TIMEOUT_SECONDS}s of real wall time'
             )
             raise RuntimeError(msg)
