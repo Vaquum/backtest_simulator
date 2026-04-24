@@ -1,4 +1,4 @@
-"""FillModel — historical-trade matching with strict stop enforcement."""
+"""FillModel — strict-live-reality tape matching; fills at actual tape price, never at declared stop."""
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -9,6 +9,27 @@ import polars as pl
 from backtest_simulator.venue.filters import BinanceSpotFilters
 from backtest_simulator.venue.types import FillModelConfig, FillResult, PendingOrder
 
+# Governing principle (from PR #15 body): backtest ≡ paper ≡ live. One
+# methodology. When the three environments disagree, the one that matches
+# real market reality wins. Fills reflect actual tape execution, not
+# strategy intent — the declared stop is a *measurement unit* for the R
+# denominator, never a *promise* about where fills land.
+#
+# Concretely:
+#   - MARKET entry walks the tape. If the tape breaches the order's
+#     attached `stop_price` mid-walk, the walk HALTS. Residual qty is
+#     never booked at the declared stop (that would be a phantom fill
+#     at a price the tape did not offer). Partial fill is returned as-is.
+#   - STOP_LOSS / STOP_LOSS_LIMIT / TAKE_PROFIT orders fill at the FIRST
+#     tape tick at or past `stop_price` — at the tick's ACTUAL price,
+#     not at the declared stop. A gapping tape produces gap slippage
+#     (fill worse than stop), as it does in live trading.
+#
+# R denominator stays clean (|entry - declared_stop| * qty is definitional
+# and unaffected). R numerator reflects real market execution: a strategy's
+# R distribution is meaningful only if stopped trades are allowed to land
+# worse than -1R on gapping markets — which is the empirical truth.
+
 
 def walk_trades(
     order: PendingOrder,
@@ -16,16 +37,20 @@ def walk_trades(
     config: FillModelConfig,
     filters: BinanceSpotFilters,
 ) -> list[FillResult]:
-    """Match `order` against the historical `trades` stream. Stop enforcement is strict.
+    """Match `order` against the historical `trades` stream — strict-live-reality.
 
-    MARKET walks trades from `submit_time + submit_latency` until qty is filled.
-    LIMIT goes taker if crossed at submit, otherwise maker-queued; an incoming
-    trade later at or beyond the limit fills the maker leg.
-    STOP_LOSS / STOP_LOSS_LIMIT / TAKE_PROFIT: the trade stream triggers the
-    stop the FIRST time it crosses `stop_price`. The fill price is
-    `stop_price` rounded to tick_size; we DO NOT slide to wherever the bar
-    closed. R = |entry - stop| * qty is honest only if this function's output
-    never silently substitutes a different price.
+    MARKET walks trades from `submit_time + submit_latency` until qty is
+    filled OR the tape breaches the order's attached `stop_price`. On
+    breach the walk HALTS and only the pre-breach qty fills at its
+    actual tape prices; no residual is booked at the declared stop.
+
+    LIMIT goes taker if crossed at submit, otherwise maker-queued; an
+    incoming trade later at or beyond the limit fills the maker leg.
+
+    STOP_LOSS / STOP_LOSS_LIMIT / TAKE_PROFIT: the tape triggers the
+    stop on the FIRST tick at or past `stop_price`. The fill lands at
+    that tick's actual price, which may be at stop or worse (gap
+    slippage) — matching live execution.
     """
     submit_ts = order.submit_time + timedelta(milliseconds=config.submit_latency_ms)
     window = trades.filter(pl.col('time') >= submit_ts).sort('time')
@@ -41,49 +66,40 @@ def walk_trades(
 
 
 def _walk_market(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFilters) -> list[FillResult]:
-    # Aggregate the tape walk into ONE VWAP fill rather than emitting
-    # one FillResult per consumed tape tick. Two reasons:
-    #   1. Real venues return a handful of fills for a typical MARKET
-    #      order (one per price level hit on the book), not hundreds;
-    #      emitting one per tape tick overstates fill granularity.
-    #   2. Each FillResult generates a `FillReceived` event_spine append
-    #      in Praxis — 283 appends per order blows past any reasonable
-    #      drain budget. Aggregating keeps the backtest honest on total
-    #      cost/qty (VWAP preserves both) while staying realistic on
-    #      fill-event shape.
+    # The tape walk aggregates into ONE VWAP fill rather than emitting
+    # one FillResult per consumed tape tick. Real venues return a
+    # handful of fills for a typical MARKET order (one per price level
+    # hit on the book), not hundreds; emitting one per tape tick
+    # overstates fill granularity AND every FillResult generates a
+    # `FillReceived` event_spine append in Praxis (283 appends per
+    # order blows past any reasonable drain budget). Aggregating keeps
+    # the backtest honest on total cost/qty (VWAP preserves both)
+    # while staying realistic on fill-event shape.
     #
-    # Declared-stop enforcement (Part 2): if the order carries a
-    # `stop_price`, the walk monitors each tape tick for a stop
-    # breach. A BUY stop is below the entry and protects a long —
-    # a tick AT or BELOW stop_price means the protective stop
-    # triggered before the walk could fill the target qty. The fill
-    # is closed AT `stop_price` (rounded to tick_size) with the
-    # remaining qty, reason=`market_stopped`.
+    # Declared-stop safety (live-reality semantics): if the order
+    # carries a `stop_price`, the walk monitors each tape tick for a
+    # breach. A breach means the market has already moved past the
+    # strategy's declared stop during the entry window. The walk
+    # HALTS on breach — we return only the pre-breach partial fill at
+    # its actual tape prices. NO residual is booked at the declared
+    # stop; that would be a phantom fill at a price the tape did not
+    # offer, which live execution cannot reproduce. The strategy is
+    # expected to observe the partial fill and emit its own close
+    # action (or the attached protective-stop layer will fire a
+    # separate STOP_LOSS SELL at the next tick past stop_price).
     #
-    # HONESTY NOTE: this is a "declared-R cap" model — realised
-    # risk per trade equals the strategy's declared stop, capped.
-    # It is OPTIMISTIC versus real market-gap execution where a
-    # stop triggered on a gapping tape fills at the next available
-    # price (possibly much worse than stop_price). Production-
-    # grade fill modelling would use the NEXT tick after the breach
-    # as the fill price, not the stop itself. Part 2 accepts the
-    # declared-R cap because:
-    #   1. Honesty for `r_per_trade` requires a deterministic
-    #      denominator tied to the DECLARED stop, not to realised
-    #      gap-slippage (which is a separate HonestyStatus axis).
-    #   2. The VWAP-aggregated walk already filled everything before
-    #      the breach at real tape prices — only the residual
-    #      post-breach qty is capped at stop. In a liquid BTCUSDT
-    #      window the residual is usually tiny.
-    # A future honesty gate may replace this with gap-aware fills
-    # plus a `gap_slippage_bps` column; the declared-R cap stays
-    # as the honest `r_per_trade` reference regardless.
+    # Effect on R: the R denominator (|entry - declared_stop| * qty)
+    # is definitional and unchanged. The R numerator reflects the
+    # actual market move, which means a gapping-through-stop trade
+    # CAN produce R worse than -1 — and that is correct. The
+    # previous "residual at stop" model forced R to exactly -1 on
+    # every stopped trade, hiding gap risk from the R distribution.
     stop_price = order.stop_price
     remaining = order.qty
     consumed_qty = Decimal('0')
     consumed_notional = Decimal('0')
     last_time: datetime | None = None
-    stop_triggered = False
+    stop_halted = False
     for row in window.iter_rows(named=True):
         if remaining <= 0:
             break
@@ -94,16 +110,11 @@ def _walk_market(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpot
                 or (order.side == 'SELL' and px >= stop_price)
             )
             if breaches:
-                # Close at the declared stop — honest R. The
-                # remaining qty is filled at `stop_price`, not at
-                # `px` (which is already past it). This keeps
-                # `|entry - stop| * qty` accurate as the realised
-                # risk regardless of where the tape crossed.
-                consumed_qty += remaining
-                consumed_notional += remaining * stop_price
-                last_time = _ts(row['time'])
-                remaining = Decimal('0')
-                stop_triggered = True
+                # Stop breached mid-walk. Halt — return only what was
+                # filled at pre-breach tape prices. The unfilled
+                # residual is released (the caller / capital lifecycle
+                # must handle release-on-partial-fill).
+                stop_halted = True
                 break
         take = min(remaining, Decimal(str(row['qty'])))
         consumed_qty += take
@@ -113,7 +124,7 @@ def _walk_market(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpot
     if consumed_qty == 0 or last_time is None:
         return []
     vwap = consumed_notional / consumed_qty
-    reason = 'market_stopped' if stop_triggered else 'market_vwap'
+    reason = 'market_stop_halted' if stop_halted else 'market_vwap'
     return [FillResult(
         fill_time=last_time,
         fill_price=filters.round_price(vwap),
@@ -146,6 +157,20 @@ def _walk_limit(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotF
 
 
 def _walk_stop(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFilters) -> list[FillResult]:
+    # STOP_LOSS / STOP_LOSS_LIMIT / TAKE_PROFIT: the tape triggers the
+    # stop on the first tick at or past `stop_price`. The fill lands
+    # at THAT TICK'S ACTUAL PRICE — not at `stop_price` — because
+    # that is what live execution does. If the tape gapped through
+    # stop (sudden large move), the tick price is materially worse
+    # than stop and the strategy realises gap slippage. Modelling the
+    # fill at stop price would silently hide that realised slippage
+    # from the R distribution.
+    #
+    # STOP_LOSS_LIMIT semantic: after trigger, the order converts to
+    # a LIMIT at `limit_price`. The current implementation treats it
+    # the same as STOP_LOSS (fill at first-tick price) — strict LIMIT
+    # semantics after trigger are a follow-up refinement. Conservative
+    # choice: same fill path, same realism.
     if order.stop_price is None:
         return []
     stop = order.stop_price
@@ -155,7 +180,7 @@ def _walk_stop(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFi
         if triggered:
             return [FillResult(
                 fill_time=_ts(row['time']),
-                fill_price=filters.round_price(stop),
+                fill_price=filters.round_price(px),
                 fill_qty=filters.round_qty(order.qty), is_maker=False, reason='stop_trigger',
             )]
     return []
