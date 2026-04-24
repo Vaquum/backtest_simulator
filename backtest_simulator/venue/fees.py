@@ -17,8 +17,12 @@ class FeeSchedule:
     maker: Decimal = _DEFAULT_MAKER
     taker: Decimal = _DEFAULT_TAKER
     bnb_discount: bool = False
-    per_symbol_maker: dict[str, Decimal] = field(default_factory=dict)
-    per_symbol_taker: dict[str, Decimal] = field(default_factory=dict)
+    per_symbol_maker: dict[str, Decimal] = field(
+        default_factory=lambda: dict[str, Decimal](),
+    )
+    per_symbol_taker: dict[str, Decimal] = field(
+        default_factory=lambda: dict[str, Decimal](),
+    )
 
     def rate(self, symbol: str, *, is_maker: bool) -> Decimal:
         """Effective fee rate for this symbol + liquidity role."""

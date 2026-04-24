@@ -37,10 +37,18 @@ class Account:
     account_id: str
     api_key: str
     api_secret: str
-    balances: dict[str, Decimal] = field(default_factory=dict)
-    locked: dict[str, Decimal] = field(default_factory=dict)
-    trades: list[VenueTrade] = field(default_factory=list)
-    orders: dict[str, VenueOrder] = field(default_factory=dict)
+    balances: dict[str, Decimal] = field(
+        default_factory=lambda: dict[str, Decimal](),
+    )
+    locked: dict[str, Decimal] = field(
+        default_factory=lambda: dict[str, Decimal](),
+    )
+    trades: list[VenueTrade] = field(
+        default_factory=lambda: list[VenueTrade](),
+    )
+    orders: dict[str, VenueOrder] = field(
+        default_factory=lambda: dict[str, VenueOrder](),
+    )
 
 
 def quote_asset(symbol: str) -> str:

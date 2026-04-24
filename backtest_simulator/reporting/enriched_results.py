@@ -45,8 +45,16 @@ def build_enriched_table(
     """
     limen_results = _read_limen_results(experiment_dir)
     bt = pl.read_parquet(backtest_results_parquet) if backtest_results_parquet.is_file() else pl.DataFrame()
-    limen_ids = set(limen_results['round_id'].to_list()) if not limen_results.is_empty() else set()
-    bt_ids = set(bt['round_id'].to_list()) if 'round_id' in bt.columns else set()
+    limen_ids: set[object] = (
+        set(limen_results['round_id'].to_list())
+        if not limen_results.is_empty()
+        else set[object]()
+    )
+    bt_ids: set[object] = (
+        set(bt['round_id'].to_list())
+        if 'round_id' in bt.columns
+        else set[object]()
+    )
     _assert_bijection(limen_ids, bt_ids)
     joined = limen_results.join(bt, on='round_id', how='left') if not bt.is_empty() else limen_results
     if out_csv is not None:
@@ -75,7 +83,7 @@ def _read_limen_results(experiment_dir: Path) -> pl.DataFrame:
     return pl.DataFrame(schema={'round_id': pl.Int64, 'round_params': pl.Utf8})
 
 
-def _assert_bijection(limen_ids: set[int], backtest_ids: set[int]) -> None:
+def _assert_bijection(limen_ids: set[object], backtest_ids: set[object]) -> None:
     missing = limen_ids - backtest_ids
     extra = backtest_ids - limen_ids
     problems: list[str] = []

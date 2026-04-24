@@ -74,7 +74,9 @@ class BuiltManifest:
     manifest_path: Path
     strategies_base_path: Path
     manifest: Manifest
-    strategy_params: dict[str, object] = field(default_factory=dict)
+    strategy_params: dict[str, object] = field(
+        default_factory=lambda: dict[str, object](),
+    )
 
 
 class ManifestBuilder:
@@ -108,7 +110,7 @@ class ManifestBuilder:
         """
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
-        raw_params = {
+        raw_params: dict[str, object] = {
             'symbol': strategy_params.symbol,
             'capital': str(strategy_params.capital),
             'kelly_pct': str(strategy_params.kelly_pct),

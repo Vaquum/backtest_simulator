@@ -46,4 +46,4 @@ class FillModelConfig:
     cancel_latency_ms: int = 30
     fill_notification_latency_ms: int = 20
     fee_role_by_submit_latency: bool = True
-    extras: dict[str, str] = field(default_factory=dict)
+    extras: dict[str, str] = field(default_factory=lambda: dict[str, str]())
