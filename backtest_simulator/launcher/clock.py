@@ -48,30 +48,42 @@ _TIMER_POLL_INTERVAL_SECONDS: float = 0.005
 
 
 def _frozen_aware_timer_run(self: threading.Timer) -> None:
-    # Accumulate elapsed time from `datetime.now(UTC)` deltas rather
-    # than comparing against a fixed target timestamp. That matters for
-    # Timers scheduled BEFORE `accelerated_clock` engages: a target
-    # computed under real time (e.g. 2026-04-24 + 1h) would be
-    # unreachable once the frozen clock takes over (jumps to 2026-04-07).
-    # Delta-accumulation is robust to the forward-jump and resets
-    # cleanly on any clock discontinuity.
+    # Fire at the NEXT epoch-aligned interval boundary rather than
+    # accumulating wait-loop deltas or setting a target from the
+    # moment the Timer starts. Per-fire target drifts because each
+    # Timer's target = start_now + interval, and `start_now` itself has
+    # absorbed drift from the previous tick's processing time. The
+    # chain of Timers then walks forward by `interval + drift` per step
+    # instead of exactly `interval`, and flaky preds land on different
+    # feature windows across runs.
     #
-    # Outside `accelerated_clock`, `datetime.now(UTC)` is real, so
-    # elapsed tracks real wall time with ~5ms polling overhead.
-    interval = timedelta(seconds=self.interval)
-    elapsed = timedelta(0)
-    last = datetime.now(UTC)
-    while elapsed < interval:
+    # Epoch alignment: `target = ceil(now_sec / interval) * interval`.
+    # At frozen 14:23:15 with interval=3600s, target is 15:00:00. At
+    # frozen 15:00:00.5 the next target is 16:00:00. Every Timer fire
+    # lands exactly on a frozen interval boundary regardless of real
+    # wall-time jitter, so the chain `0, 1, 2, …` of ticks produces
+    # byte-identical features across runs and the decoder's preds
+    # transitions are deterministic.
+    #
+    # `freeze_time` can jump `datetime.now(UTC)` dramatically forward or
+    # backward when it engages/releases mid-Timer. The reset path rebinds
+    # the target when `now` appears to be `> interval * 2` earlier than
+    # the current target — that's the fingerprint of a freeze transition,
+    # not a clock step that ever happens mid-backtest.
+    interval_seconds = int(self.interval)
+    interval = timedelta(seconds=interval_seconds)
+    target: datetime | None = None
+    while True:
         if self.finished.wait(_TIMER_POLL_INTERVAL_SECONDS):
             return
         now = datetime.now(UTC)
-        if now < last:
-            # Clock jumped backwards (freeze_time transition); reset
-            # baseline and keep accumulating from there.
-            last = now
-        else:
-            elapsed += now - last
-            last = now
+        if target is None or now < target - interval * 2:
+            epoch = datetime(1970, 1, 1, tzinfo=UTC)
+            elapsed_whole = int((now - epoch).total_seconds())
+            next_boundary = (elapsed_whole // interval_seconds + 1) * interval_seconds
+            target = epoch + timedelta(seconds=next_boundary)
+        if now >= target:
+            break
     if not self.finished.is_set():
         self.function(*self.args, **self.kwargs)  # type: ignore[attr-defined]
     self.finished.set()
