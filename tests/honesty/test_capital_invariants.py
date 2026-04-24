@@ -24,7 +24,7 @@ def _fresh_state(pool: Decimal = Decimal('100000')) -> CapitalState:
     state = CapitalState(capital_pool=pool)
     # Reset per-state prev-snapshot so INV-1b starts from a known
     # baseline rather than seeing leftover state from another test.
-    _PrevPoolTracker._prev.pop(id(state), None)  # noqa: SLF001 - test-only reset
+    _PrevPoolTracker._prev.pop(id(state), None)
     return state
 
 

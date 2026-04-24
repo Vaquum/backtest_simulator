@@ -1,24 +1,22 @@
-"""Real-CAPITAL ValidationPipeline + 4-step CapitalController lifecycle driver.
-
-Part 2 invariant: every ENTER/EXIT action that reaches the venue
-adapter must have first cleared the real Nexus CAPITAL validator AND
-must pass through `check_and_reserve → send_order → order_ack →
-order_fill` on a shared `CapitalController`. The other five validator
-stages (INTAKE / RISK / PRICE / HEALTH / PLATFORM_LIMITS) are wired to
-an `_allow` stub because Part 2 scope is "CAPITAL real, others _allow"
-per `TODO.md`; they will land as real checks in a follow-up slice.
-
-`build_validation_pipeline` returns the configured
-`nexus.core.validator.ValidationPipeline` plus its `CapitalController`.
-The controller is the SHARED instance the action-submitter and the
-venue-fill bridge both drive — the pipeline's CAPITAL stage calls
-`check_and_reserve` during validation, and the `CapitalLifecycleTracker`
-feeds `send_order`, `order_ack`, and `order_fill` back in as Praxis's
-event spine produces `CommandAccepted`, `OrderSubmitted`, and
-`FillReceived` events.
-"""
+"""Real-CAPITAL ValidationPipeline + 4-step CapitalController lifecycle driver."""
 from __future__ import annotations
 
+# Part 2 invariant: every ENTER/EXIT action that reaches the venue
+# adapter must have first cleared the real Nexus CAPITAL validator AND
+# must pass through `check_and_reserve → send_order → order_ack →
+# order_fill` on a shared `CapitalController`. The other five validator
+# stages (INTAKE / RISK / PRICE / HEALTH / PLATFORM_LIMITS) are wired to
+# an `_allow` stub because Part 2 scope is "CAPITAL real, others _allow"
+# per `TODO.md`; they will land as real checks in a follow-up slice.
+#
+# `build_validation_pipeline` returns the configured
+# `nexus.core.validator.ValidationPipeline` plus its `CapitalController`.
+# The controller is the SHARED instance the action-submitter and the
+# venue-fill bridge both drive — the pipeline's CAPITAL stage calls
+# `check_and_reserve` during validation, and the `CapitalLifecycleTracker`
+# feeds `send_order`, `order_ack`, and `order_fill` back in as Praxis's
+# event spine produces `CommandAccepted`, `OrderSubmitted`, and
+# `FillReceived` events.
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -32,7 +30,6 @@ from nexus.core.validator.capital_stage import (
     validate_capital_stage,
 )
 from nexus.core.validator.pipeline_models import (
-    ValidationAction,
     ValidationDecision,
     ValidationRequestContext,
     ValidationStage,
@@ -42,11 +39,13 @@ _log = logging.getLogger(__name__)
 
 
 def _allow_stage(_ctx: ValidationRequestContext) -> ValidationDecision:
-    """`_allow` stub: unconditionally pass. Used for the Part 2 stages
-    we deliberately leave open (INTAKE, RISK, PRICE, HEALTH,
-    PLATFORM_LIMITS). The backtest is not a production intake; all of
-    those checks are gate-only-at-live concerns (order_rate, book
-    staleness, etc.) that would reject honest historical hypotheses.
+    """`_allow` stub: unconditionally pass.
+
+    Used for the Part 2 stages we deliberately leave open (INTAKE,
+    RISK, PRICE, HEALTH, PLATFORM_LIMITS). The backtest is not a
+    production intake; all of those checks are gate-only-at-live
+    concerns (order_rate, book staleness, etc.) that would reject
+    honest historical hypotheses.
     """
     return ValidationDecision(allowed=True)
 
@@ -104,8 +103,9 @@ class _PendingLifecycle:
 
 
 class CapitalLifecycleTracker:
-    """Feeds the `CapitalController` the 4-step lifecycle events that
-    Part 2 requires.
+    """Feed the `CapitalController` the 4-step lifecycle events.
+
+    Part 2 requires the four-step reservation → sent → ack → fill flow.
 
     The backtest's action-submitter logs the reservation at
     `check_and_reserve` time (stored under `command_id`); the launcher's
@@ -160,8 +160,10 @@ class CapitalLifecycleTracker:
             return entry.notional if entry is not None else None
 
     def match_pending_by_prefix(self, prefix: str) -> str | None:
-        """Return the pending command_id whose dash-stripped form
-        starts with `prefix`, or None.
+        """Return the pending command_id matching the given prefix.
+
+        The dash-stripped form of the command_id must start with
+        `prefix`, else None.
 
         The launcher's adapter wrapper uses this to match Praxis's
         `SS-<command-prefix>-<seq>` client_order_id back to a full

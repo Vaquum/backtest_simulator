@@ -49,7 +49,7 @@ _log = logging.getLogger(__name__)
 # as synonyms. Runs once at module import.
 def _install_nexus_enum_shim() -> None:
     module = importlib.import_module('praxis.core.validate_trade_command')
-    allowed: dict = module._ALLOWED_ORDER_TYPES  # noqa: SLF001 - cross-package shim
+    allowed: dict = module._ALLOWED_ORDER_TYPES
     praxis_by_name = {em.name: em for em in _PraxisExecutionMode}
     order_name = {ot.name: ot for ot in _PraxisOrderType}
     nexus_order_name = {ot.name: ot for ot in _NexusOrderType}
@@ -75,14 +75,14 @@ _install_nexus_enum_shim()
 # datetime before falling through to the original (which handles Decimal).
 def _install_fake_datetime_serializer_shim() -> None:
     module = importlib.import_module('praxis.infrastructure.event_spine')
-    original = module._serialize_default  # noqa: SLF001 - cross-package shim
+    original = module._serialize_default
 
     def _patched(obj: object) -> object:
         if isinstance(obj, datetime):
             return obj.isoformat()
         return original(obj)
 
-    module._serialize_default = _patched  # noqa: SLF001
+    module._serialize_default = _patched
 
 
 _install_fake_datetime_serializer_shim()
@@ -119,121 +119,139 @@ _PRAXIS_ENUM_BY_FIELD: dict[str, type[Enum]] = {
 }
 
 
+def _convert_enum_field(field_name: str, value: object) -> object:
+    """Swap a single Nexus enum value for its Praxis counterpart.
+
+    Best-effort: if the field's Praxis enum lacks a member with this
+    name (e.g. Nexus `STPMode.CANCEL_TAKER` vs Praxis `EXPIRE_TAKER`),
+    the original value is returned unchanged.
+    """
+    praxis_enum = _PRAXIS_ENUM_BY_FIELD.get(field_name)
+    if praxis_enum is None or value is None or isinstance(value, praxis_enum):
+        return value
+    name = getattr(value, 'name', None)
+    if name is None:
+        return value
+    try:
+        return praxis_enum[name]
+    except KeyError:
+        _log.debug(
+            'enum convert skipped: %s=%r has no counterpart in %s',
+            field_name, value, praxis_enum.__name__,
+        )
+        return value
+
+
+def _extract_single_shot_price_fields(params: object) -> dict[str, object | None]:
+    """Pull price/stop_price/stop_limit_price from a params object or dict."""
+    extracted: dict[str, object | None] = {
+        'price': None, 'stop_price': None, 'stop_limit_price': None,
+    }
+    if isinstance(params, Mapping):
+        for key in extracted:
+            extracted[key] = params.get(key)
+    elif params is not None:
+        # Nexus SingleShotParams or another params dataclass — copy
+        # matching field values by name.
+        for key in extracted:
+            if hasattr(params, key):
+                extracted[key] = getattr(params, key)
+    # Praxis's SingleShotParams expects `Decimal` values. The strategy
+    # template stores them as strings on `execution_params` (YAML
+    # roundtrip), so coerce non-None scalars to Decimal. `None` passes
+    # through as "no limit / no stop".
+    for key in extracted:
+        value = extracted[key]
+        if value is not None and not isinstance(value, Decimal):
+            extracted[key] = Decimal(str(value))
+    return extracted
+
+
+def _wrap_single_shot_params(attrs: dict[str, object]) -> None:
+    """Mutate `attrs` in place: wrap execution_params as Praxis SingleShotParams.
+
+    Praxis's `TradeCommand.__post_init__` requires `execution_params`
+    be a `praxis.core.domain.single_shot_params.SingleShotParams` when
+    mode is SINGLE_SHOT. Nexus passes through the action's raw dict,
+    so we wrap it here.
+
+    Praxis's `validate_trade_command` rejects `stop_price` on MARKET
+    orders. Our backtest's MARKET ENTER still carries a DECLARED
+    protective stop for `FillModel.apply_stop`, so we strip it from
+    the Praxis params but preserve it on the returned namespace as
+    `declared_stop_price` for the lifecycle tracker.
+    """
+    if attrs.get('execution_mode') is not _PraxisExecutionMode.SINGLE_SHOT:
+        return
+    if isinstance(attrs.get('execution_params'), _PraxisSingleShotParams):
+        return
+    extracted = _extract_single_shot_price_fields(attrs.get('execution_params'))
+    declared_stop_price = extracted['stop_price']
+    from praxis.core.domain.enums import OrderType as _PraxisOT  # local import
+    is_market = attrs.get('order_type') is _PraxisOT.MARKET
+    stop_price_for_praxis = None if is_market else extracted['stop_price']
+    attrs['execution_params'] = _PraxisSingleShotParams(
+        price=extracted['price'],
+        stop_price=stop_price_for_praxis,
+        stop_limit_price=extracted['stop_limit_price'],
+    )
+    attrs['declared_stop_price'] = declared_stop_price
+
+
 def _to_praxis_enums(cmd: object) -> object:
-    """Return a `SimpleNamespace` mirroring `cmd`'s fields with Nexus Enum
-    values swapped for Praxis Enums, and `execution_params` wrapped in a
-    Praxis `SingleShotParams` when the mode is SINGLE_SHOT.
+    """Return a `SimpleNamespace` mirroring `cmd`'s fields with Praxis Enums.
+
+    Nexus Enum values are swapped for Praxis Enums, and `execution_params`
+    is wrapped in a Praxis `SingleShotParams` when the mode is SINGLE_SHOT.
 
     Using `dataclasses.replace` would re-run the Nexus `TradeCommand.
     __post_init__` validator which insists on Nexus enums — the exact
     opposite of what we want. `SimpleNamespace` gives Praxis's
     `praxis_outbound.send_command` attribute-access parity with the
-    original dataclass and skips Nexus's own validation layer, so
-    Praxis's internal `TradeCommand` (constructed inside
-    `execution_manager.submit_command` from our kwargs) gets Praxis
-    enums and identity comparisons like
-    `cmd.execution_mode != ExecutionMode.SINGLE_SHOT` pass.
-
-    Best-effort on enum mapping: if a field's name is not present in
-    the corresponding Praxis Enum (e.g. Nexus `STPMode.CANCEL_TAKER`
-    vs Praxis `STPMode.EXPIRE_TAKER`), the Nexus value is left in
-    place rather than raising. If a downstream Praxis check rejects
-    it, the rejection surfaces as a clear error on the next run.
+    original dataclass and skips Nexus's own validation layer.
     """
-    attrs: dict[str, object] = {}
-    for field in dataclasses.fields(cmd):
-        value = getattr(cmd, field.name)
-        praxis_enum = _PRAXIS_ENUM_BY_FIELD.get(field.name)
-        if (
-            praxis_enum is not None
-            and value is not None
-            and not isinstance(value, praxis_enum)
-        ):
-            name = getattr(value, 'name', None)
-            if name is not None:
-                try:
-                    value = praxis_enum[name]
-                except KeyError:
-                    _log.debug(
-                        'enum convert skipped: %s=%r has no counterpart in %s',
-                        field.name, value, praxis_enum.__name__,
-                    )
-        attrs[field.name] = value
-    # Praxis's `TradeCommand.__post_init__` requires `execution_params`
-    # be a `praxis.core.domain.single_shot_params.SingleShotParams` when
-    # mode is SINGLE_SHOT. Nexus `translate_to_trade_command` just
-    # passes `action.execution_params` through unchanged — in our
-    # strategy template that's a dict (`{'symbol': ..., 'stop_bps': ...}`)
-    # meant for validator context, not a params object. Wrap it into a
-    # Praxis `SingleShotParams`; MARKET orders have no price/stop fields
-    # so the default-empty instance is correct.
-    mode = attrs.get('execution_mode')
-    if mode is _PraxisExecutionMode.SINGLE_SHOT and not isinstance(
-        attrs.get('execution_params'), _PraxisSingleShotParams,
-    ):
-        params = attrs.get('execution_params')
-        extracted: dict[str, object | None] = {
-            'price': None, 'stop_price': None, 'stop_limit_price': None,
-        }
-        if isinstance(params, Mapping):
-            for key in extracted:
-                extracted[key] = params.get(key)
-        elif params is not None:
-            # Nexus SingleShotParams or another params dataclass — copy
-            # matching field values by name.
-            for key in extracted:
-                if hasattr(params, key):
-                    extracted[key] = getattr(params, key)
-        # Praxis's SingleShotParams expects `Decimal` values for price
-        # fields. The strategy template stores them as strings on the
-        # `execution_params` dict (so the YAML-serialisable params
-        # roundtrip cleanly), so coerce non-None scalars to Decimal
-        # here. `None` passes through as "no limit / no stop".
-        for key in extracted:
-            value = extracted[key]
-            if value is not None and not isinstance(value, Decimal):
-                extracted[key] = Decimal(str(value))
-        # Praxis's `validate_trade_command` rejects `stop_price` on
-        # MARKET orders ("MARKET does not use execution_params.stop_price")
-        # because Praxis-native MARKET orders have no stop concept. In
-        # our backtest, however, a MARKET ENTER carries a DECLARED
-        # protective stop for `FillModel.apply_stop` to enforce during
-        # the tape walk. To satisfy both: strip `stop_price` from the
-        # Praxis SingleShotParams for MARKET orders, but preserve it
-        # on the returned namespace as `declared_stop_price` so the
-        # launcher's capital-lifecycle tracker can carry it through to
-        # the adapter wrapper, which injects it back into the
-        # adapter's `submit_order` call.
-        declared_stop_price = extracted['stop_price']
-        mode = attrs.get('execution_mode')
-        order_type = attrs.get('order_type')
-        from praxis.core.domain.enums import OrderType as _PraxisOT  # local import
-        is_market = order_type is _PraxisOT.MARKET
-        stop_price_for_praxis = None if is_market else extracted['stop_price']
-        attrs['execution_params'] = _PraxisSingleShotParams(
-            price=extracted['price'],
-            stop_price=stop_price_for_praxis,
-            stop_limit_price=extracted['stop_limit_price'],
-        )
-        attrs['declared_stop_price'] = declared_stop_price
-        del mode
+    attrs: dict[str, object] = {
+        field.name: _convert_enum_field(field.name, getattr(cmd, field.name))
+        for field in dataclasses.fields(cmd)
+    }
+    _wrap_single_shot_params(attrs)
     return SimpleNamespace(**attrs)
 
 
+@dataclasses.dataclass(frozen=True)
+class SubmitterBindings:
+    """Long-lived wiring a `build_action_submitter` caller provides once.
+
+    Bundles the per-instance dependencies (Nexus config, pipeline, Praxis
+    outbound, strategy budget) so the builder and the per-action helper
+    each take a single argument for them instead of five.
+    """
+
+    nexus_config: NexusInstanceConfig
+    state: InstanceState
+    praxis_outbound: PraxisOutbound
+    validation_pipeline: ValidationPipeline
+    strategy_budget: Decimal
+
+
+ReservationHook = Callable[[str, ValidationDecision, ValidationRequestContext, Action], None]
+SubmitHook = Callable[[str], None]
+
+
 def build_action_submitter(
-    *, nexus_config: NexusInstanceConfig,
-    state: InstanceState,
-    praxis_outbound: PraxisOutbound,
-    validation_pipeline: ValidationPipeline,
-    strategy_budget: Decimal,
-    on_reservation: Callable[[str, ValidationDecision, ValidationRequestContext, Action], None] | None = None,
-    on_submit: Callable[[str], None] | None = None,
+    bindings: SubmitterBindings,
+    *,
+    on_reservation: ReservationHook | None = None,
+    on_submit: SubmitHook | None = None,
 ) -> Callable[[list[Action], str], None]:
-    """Return a callback for `PredictLoop(action_submit=...)` that drives real
-    ValidationPipeline and sends the resulting `TradeCommand`.
+    """Return a callback for `PredictLoop(action_submit=...)`.
+
+    The callback drives the real ValidationPipeline and sends the
+    resulting `TradeCommand`.
 
     Contract:
-      - Every non-ABORT action is evaluated against `validation_pipeline`.
+      - Every non-ABORT action is evaluated against
+        `bindings.validation_pipeline`.
         A denied decision is logged with the failing stage + reason and
         the action is dropped without reaching Praxis; upstream Nexus
         behaviour is the same (`submit_actions` honors the decision).
@@ -259,13 +277,12 @@ def build_action_submitter(
                 action.size,
             )
             if action.action_type == ActionType.ABORT:
-                _submit_abort(praxis_outbound, nexus_config, strategy_id, action)
+                _submit_abort(
+                    bindings.praxis_outbound, bindings.nexus_config,
+                    strategy_id, action,
+                )
                 continue
-            result = _submit_translated(
-                praxis_outbound, nexus_config, state, strategy_id, action,
-                validation_pipeline=validation_pipeline,
-                strategy_budget=strategy_budget,
-            )
+            result = _submit_translated(bindings, strategy_id, action)
             if result is None:
                 continue
             command_id, decision, context = result
@@ -278,18 +295,14 @@ def build_action_submitter(
 
 
 def _submit_translated(
-    praxis_outbound: PraxisOutbound,
-    config: NexusInstanceConfig,
-    state: InstanceState,
+    bindings: SubmitterBindings,
     strategy_id: str,
     action: Action,
-    *,
-    validation_pipeline: ValidationPipeline,
-    strategy_budget: Decimal,
 ) -> tuple[str, ValidationDecision, ValidationRequestContext] | None:
     context = _build_context(
-        config=config, state=state, strategy_id=strategy_id,
-        action=action, strategy_budget=strategy_budget,
+        config=bindings.nexus_config, state=bindings.state,
+        strategy_id=strategy_id, action=action,
+        strategy_budget=bindings.strategy_budget,
     )
     # Part 2 INTAKE hook: declared-stop enforcement. Long-only strategy
     # convention — BUY opens a long (requires protective stop), SELL
@@ -322,10 +335,10 @@ def _submit_translated(
     if action.direction == OrderSide.SELL:
         decision = ValidationDecision(allowed=True)
         cmd = translate_to_trade_command(
-            action, context, decision, config, datetime.now(UTC),
+            action, context, decision, bindings.nexus_config, datetime.now(UTC),
         )
         cmd = _to_praxis_enums(cmd)
-        command_id = praxis_outbound.send_command(cmd)
+        command_id = bindings.praxis_outbound.send_command(cmd)
         _log.info(
             'backtest action submitted (SELL close — CAPITAL skipped)',
             extra={
@@ -335,7 +348,7 @@ def _submit_translated(
             },
         )
         return command_id, decision, context
-    decision = validation_pipeline.validate(context)
+    decision = bindings.validation_pipeline.validate(context)
     if not decision.allowed:
         _log.warning(
             'validation denied: stage=%s reason_code=%s message=%s command_id=%s',
@@ -345,9 +358,11 @@ def _submit_translated(
             context.command_id,
         )
         return None
-    cmd = translate_to_trade_command(action, context, decision, config, datetime.now(UTC))
+    cmd = translate_to_trade_command(
+        action, context, decision, bindings.nexus_config, datetime.now(UTC),
+    )
     cmd = _to_praxis_enums(cmd)
-    command_id = praxis_outbound.send_command(cmd)
+    command_id = bindings.praxis_outbound.send_command(cmd)
     _log.info(
         'backtest action submitted',
         extra={

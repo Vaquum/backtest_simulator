@@ -1,35 +1,34 @@
-"""Conservation laws for Nexus's CapitalController ledger model.
-
-Nexus's `CapitalState.capital_pool` is a STATIC BUDGET, not a balance
-that gets debited and credited by each transition. The other components
-(`reservation_notional`, `in_flight_order_notional`,
-`working_order_notional`, `position_notional`) represent DEPLOYED
-claims against that budget; the CapitalController's `check_and_reserve`
-simply increments `reservation_notional`, leaving `capital_pool`
-untouched. Fees paid at fill time decrement `fee_reserve` (and may
-draw from `capital_pool` depending on adapter accounting).
-
-The Part 2 honesty invariants this module enforces after every
-CapitalController transition:
-
-  INV-1  capital_pool is monotonically non-increasing event-to-event
-         (no free capital appearing anywhere on the timeline — the
-         launcher tracks the PREVIOUS snapshot per account and this
-         function compares new_pool to prev_pool, not only to
-         initial_pool).
-  INV-2  every component is non-negative (no negative balances).
-  INV-3  total_deployed = position + working + in_flight + reservation
-         never exceeds capital_pool (no overcommitment).
-
-A violation raises `ConservationViolation` so the backtest aborts at
-the first offending event boundary with enough context for the
-operator to find the bug.
-"""
+"""Conservation laws for Nexus's CapitalController ledger model."""
 from __future__ import annotations
 
+# Nexus's `CapitalState.capital_pool` is a STATIC BUDGET, not a balance
+# that gets debited and credited by each transition. The other components
+# (`reservation_notional`, `in_flight_order_notional`,
+# `working_order_notional`, `position_notional`) represent DEPLOYED
+# claims against that budget; the CapitalController's `check_and_reserve`
+# simply increments `reservation_notional`, leaving `capital_pool`
+# untouched. Fees paid at fill time decrement `fee_reserve` (and may
+# draw from `capital_pool` depending on adapter accounting).
+#
+# The Part 2 honesty invariants this module enforces after every
+# CapitalController transition:
+#
+#   INV-1  capital_pool is monotonically non-increasing event-to-event
+#          (no free capital appearing anywhere on the timeline — the
+#          launcher tracks the PREVIOUS snapshot per account and this
+#          function compares new_pool to prev_pool, not only to
+#          initial_pool).
+#   INV-2  every component is non-negative (no negative balances).
+#   INV-3  total_deployed = position + working + in_flight + reservation
+#          never exceeds capital_pool (no overcommitment).
+#
+# A violation raises `ConservationViolation` so the backtest aborts at
+# the first offending event boundary with enough context for the
+# operator to find the bug.
 from dataclasses import dataclass
 from decimal import Decimal
 from threading import Lock
+from typing import ClassVar
 
 from nexus.core.domain.capital_state import CapitalState
 
@@ -82,8 +81,9 @@ def capital_totals(state: CapitalState) -> CapitalTotals:
 
 
 class _PrevPoolTracker:
-    """Per-process record of the most recent `capital_pool` snapshot,
-    keyed by the `id()` of the CapitalState object.
+    """Per-process record of the most recent `capital_pool` snapshot.
+
+    Keyed by the `id()` of the CapitalState object.
 
     INV-1 ("capital_pool is monotonically non-increasing") requires
     comparing new pool to PREVIOUS pool, not only to initial pool.
@@ -94,8 +94,8 @@ class _PrevPoolTracker:
     catches that.
     """
 
-    _lock = Lock()
-    _prev: dict[int, Decimal] = {}
+    _lock: ClassVar[Lock] = Lock()
+    _prev: ClassVar[dict[int, Decimal]] = {}
 
     @classmethod
     def snapshot_and_record(cls, state: CapitalState) -> Decimal:

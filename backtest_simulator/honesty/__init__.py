@@ -1,17 +1,15 @@
-"""Honesty gates — the mechanical invariants of Part 2.
-
-`capital` owns the real-CAPITAL ValidationPipeline and a backtest-
-driven CapitalController whose 4-step lifecycle
-(`check_and_reserve → send_order → order_ack → order_fill`) is called
-by the `BacktestLauncher` as orders flow through Praxis and return
-as fills. `conservation` owns the per-event invariant checks; any
-drift between `capital_pool`, `position_notional`, `working_order_notional`,
-`in_flight_order_notional`, and `reservation_notional` raises
-`ConservationViolation` so the backtest aborts the instant the
-capital books stop balancing.
-"""
+"""Honesty gates — the mechanical invariants of Part 2."""
 from __future__ import annotations
 
+# `capital` owns the real-CAPITAL ValidationPipeline and a backtest-
+# driven CapitalController whose 4-step lifecycle
+# (`check_and_reserve → send_order → order_ack → order_fill`) is called
+# by the `BacktestLauncher` as orders flow through Praxis and return
+# as fills. `conservation` owns the per-event invariant checks; any
+# drift between `capital_pool`, `position_notional`, `working_order_notional`,
+# `in_flight_order_notional`, and `reservation_notional` raises
+# `ConservationViolation` so the backtest aborts the instant the
+# capital books stop balancing.
 from backtest_simulator.honesty.capital import (
     CapitalLifecycleTracker,
     build_validation_pipeline,

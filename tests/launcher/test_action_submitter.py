@@ -1,39 +1,44 @@
-"""ActionSubmitter contract — Part 2: the submitter runs the real
-ValidationPipeline, carries the declared stop on the side, and
-propagates fail-loud on per-action errors.
+"""ActionSubmitter contract — Part 2.
+
+The submitter runs the real ValidationPipeline, carries the declared
+stop on the side, and propagates fail-loud on per-action errors.
 """
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Any
+from typing import cast
 
 import pytest
-from nexus.core.domain.capital_state import CapitalState
 from nexus.core.domain.enums import OrderSide
 from nexus.core.domain.order_types import ExecutionMode, OrderType
+from nexus.core.validator import ValidationPipeline
 from nexus.core.validator.pipeline_models import InstanceState
+from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
 from nexus.instance_config import InstanceConfig as NexusInstanceConfig
 from nexus.strategy.action import Action, ActionType
 
 from backtest_simulator.honesty import build_validation_pipeline
-from backtest_simulator.launcher.action_submitter import build_action_submitter
+from backtest_simulator.launcher.action_submitter import (
+    SubmitterBindings,
+    build_action_submitter,
+)
 
 
 class _OutboundStub:
     """Minimal stand-in for PraxisOutbound that records send_command calls."""
 
     def __init__(self) -> None:
-        self.commands: list[Any] = []
-        self.aborts: list[dict[str, Any]] = []
+        self.commands: list[object] = []
+        self.aborts: list[dict[str, object]] = []
 
-    def send_command(self, cmd: Any) -> str:
+    def send_command(self, cmd: object) -> str:
         self.commands.append(cmd)
         # Generate a command_id — Praxis does this server-side but the
         # outbound stub needs to hand one back.
         import uuid
         return str(uuid.uuid4())
 
-    def send_abort(self, **kwargs: Any) -> None:
+    def send_abort(self, **kwargs: object) -> None:
         self.aborts.append(kwargs)
 
 
@@ -41,7 +46,20 @@ def _nexus_config() -> NexusInstanceConfig:
     return NexusInstanceConfig(account_id='bts-acct', venue='binance_spot_simulated')
 
 
-def _pipeline_and_state() -> tuple[Any, InstanceState]:
+def _make_bindings(
+    outbound: _OutboundStub,
+    pipeline: ValidationPipeline,
+    state: InstanceState,
+) -> SubmitterBindings:
+    return SubmitterBindings(
+        nexus_config=_nexus_config(), state=state,
+        praxis_outbound=cast(PraxisOutbound, outbound),
+        validation_pipeline=pipeline,
+        strategy_budget=Decimal('100000'),
+    )
+
+
+def _pipeline_and_state() -> tuple[ValidationPipeline, InstanceState]:
     # Build a Part 2-shaped pipeline that shares the same CapitalState
     # the InstanceState carries — that's the invariant the real
     # launcher enforces and what the CAPITAL validator reads from.
@@ -93,20 +111,14 @@ def _sell_action() -> Action:
 def test_builder_returns_callable() -> None:
     outbound = _OutboundStub()
     pipeline, state = _pipeline_and_state()
-    submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
-        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
-    )
+    submit = build_action_submitter(_make_bindings(outbound, pipeline, state))
     assert callable(submit)
 
 
 def test_enter_with_declared_stop_passes_validation_and_sends() -> None:
     outbound = _OutboundStub()
     pipeline, state = _pipeline_and_state()
-    submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
-        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
-    )
+    submit = build_action_submitter(_make_bindings(outbound, pipeline, state))
     submit([_enter_action()], 'long_on_signal')
     assert len(outbound.commands) == 1
     cmd = outbound.commands[0]
@@ -122,10 +134,7 @@ def test_buy_entry_without_declared_stop_is_rejected_by_intake() -> None:
     # Part 2 INTAKE gate — no stop, no entry.
     outbound = _OutboundStub()
     pipeline, state = _pipeline_and_state()
-    submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
-        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
-    )
+    submit = build_action_submitter(_make_bindings(outbound, pipeline, state))
     action_no_stop = Action(
         action_type=ActionType.ENTER,
         direction=OrderSide.BUY,
@@ -147,10 +156,7 @@ def test_sell_exit_without_stop_is_accepted() -> None:
     # the risk close, so no stop_price is required.
     outbound = _OutboundStub()
     pipeline, state = _pipeline_and_state()
-    submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
-        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
-    )
+    submit = build_action_submitter(_make_bindings(outbound, pipeline, state))
     submit([_sell_action()], 'long_on_signal')
     assert len(outbound.commands) == 1
     # `_to_praxis_enums` converts side to Praxis OrderSide; compare by name.
@@ -160,10 +166,7 @@ def test_sell_exit_without_stop_is_accepted() -> None:
 def test_abort_action_routed_to_send_abort() -> None:
     outbound = _OutboundStub()
     pipeline, state = _pipeline_and_state()
-    submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
-        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
-    )
+    submit = build_action_submitter(_make_bindings(outbound, pipeline, state))
     abort = Action(
         action_type=ActionType.ABORT,
         direction=None, size=None, execution_mode=None, order_type=None,
@@ -184,14 +187,11 @@ def test_submission_propagates_per_action_errors() -> None:
     # handler catches at a higher level; silencing here would hide
     # bugs.
     class _RaisingOutbound(_OutboundStub):
-        def send_command(self, cmd: Any) -> str:
+        def send_command(self, cmd: object) -> str:
             raise RuntimeError('injected')
     outbound = _RaisingOutbound()
     pipeline, state = _pipeline_and_state()
-    submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
-        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
-    )
+    submit = build_action_submitter(_make_bindings(outbound, pipeline, state))
     with pytest.raises(RuntimeError, match='injected'):
         submit([_enter_action()], 'long_on_signal')
     # No command got through; the capture happens inside the outbound
@@ -207,19 +207,20 @@ def test_on_reservation_hook_receives_decision_with_reservation() -> None:
     # calls can reference it.
     outbound = _OutboundStub()
     pipeline, state = _pipeline_and_state()
-    captured: list[Any] = []
+    captured: list[tuple[str, object, object, Action]] = []
 
-    def on_reservation(command_id: str, decision: Any, context: Any, action: Any) -> None:
+    def on_reservation(
+        command_id: str, decision: object, context: object, action: Action,
+    ) -> None:
         captured.append((command_id, decision, context, action))
 
     submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
-        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
+        _make_bindings(outbound, pipeline, state),
         on_reservation=on_reservation,
     )
     submit([_enter_action()], 'long_on_signal')
     assert len(captured) == 1
-    command_id, decision, context, action = captured[0]
+    _command_id, decision, context, action = captured[0]
     assert decision.allowed is True
     assert decision.reservation is not None
     assert decision.reservation.notional > 0
@@ -235,8 +236,7 @@ def test_on_submit_hook_fires_with_command_id() -> None:
     pipeline, state = _pipeline_and_state()
     submitted: list[str] = []
     submit = build_action_submitter(
-        nexus_config=_nexus_config(), state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
-        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
+        _make_bindings(outbound, pipeline, state),
         on_submit=submitted.append,
     )
     submit([_enter_action(), _sell_action()], 'long_on_signal')

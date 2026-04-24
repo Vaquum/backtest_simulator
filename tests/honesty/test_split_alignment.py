@@ -7,17 +7,19 @@ import numpy as np
 import pytest
 
 from backtest_simulator.exceptions import LookAheadViolation
-from backtest_simulator.sensors.precompute import SignalsTable
+from backtest_simulator.sensors.precompute import PredictionsInput, SignalsTable
 
 
 def _build(split: tuple[int, int, int]) -> SignalsTable:
     stamps = [datetime(2020, 4, 1, tzinfo=UTC) + timedelta(hours=i) for i in range(10)]
     return SignalsTable.from_predictions(
         decoder_id='d-0', split_config=split,
-        timestamps=stamps,
-        probs=np.full(10, 0.7),
-        preds=np.ones(10, dtype=int),
-        label_horizon_bars=3, bar_seconds=3600,
+        predictions=PredictionsInput(
+            timestamps=stamps,
+            probs=np.full(10, 0.7),
+            preds=np.ones(10, dtype=int),
+            label_horizon_bars=3, bar_seconds=3600,
+        ),
     )
 
 

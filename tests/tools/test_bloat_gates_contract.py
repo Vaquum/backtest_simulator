@@ -50,12 +50,28 @@ def test_module_budgets_covers_every_m1_path_from_issue_10() -> None:
     data = json.loads(BUDGET_JSON.read_text(encoding='utf-8'))
     bts_paths = {p for p in data if p.startswith('backtest_simulator/')}
     script_paths = {p for p in data if p.startswith('scripts/')}
-    # Lower bound relaxed after the fake-purge commit deleted driver.py,
-    # environment.py, and the runtime/* shim modules. Every remaining
-    # module must still have a budget entry; new modules added in future
-    # PRs bump this by their own count.
-    assert len(bts_paths) >= 22, f'expected >= 22 backtest_simulator paths, got {len(bts_paths)}'
+    # M1+M2 as shipped: the package spans 39 files. The original
+    # issue #10 plan assumed 30 (single launcher.py, single
+    # runtime/*), but the Part 1 honesty rework split `launcher`,
+    # `pipeline`, and `honesty` into sub-packages and deleted the
+    # runtime/ shim. Every .py under backtest_simulator/ is declared
+    # in module_budgets.json — no silent-escape module.
+    actual_paths = _actual_bts_paths()
+    assert bts_paths == actual_paths, (
+        f'module_budgets.json paths diverge from actual source tree: '
+        f'extra={sorted(bts_paths - actual_paths)}, '
+        f'missing={sorted(actual_paths - bts_paths)}'
+    )
     assert len(script_paths) == 7, f'expected 7 scripts paths, got {len(script_paths)}'
+
+
+def _actual_bts_paths() -> set[str]:
+    root = REPO_ROOT / 'backtest_simulator'
+    return {
+        str(p.relative_to(REPO_ROOT)).replace('\\', '/')
+        for p in root.rglob('*.py')
+        if '__pycache__' not in p.parts
+    }
 
 
 def test_all_gate_scripts_exist_and_are_executable() -> None:

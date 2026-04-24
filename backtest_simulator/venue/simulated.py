@@ -1,10 +1,9 @@
 """SimulatedVenueAdapter — real Praxis VenueAdapter Protocol against historical trades."""
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
 
 from praxis.core.domain.enums import OrderSide, OrderStatus, OrderType
 from praxis.core.domain.health_snapshot import HealthSnapshot
@@ -78,7 +77,7 @@ class SimulatedVenueAdapter:
         msg = f'account_id {account_id!r} never registered'
         raise KeyError(msg)
 
-    async def submit_order(  # noqa: PLR0913 - Protocol signature; every arg is Praxis-defined
+    async def submit_order(
         self,
         account_id: str,
         symbol: str,
@@ -113,8 +112,12 @@ class SimulatedVenueAdapter:
         )
         fills = walk_trades(order, trades, self._fill_config, self._filters)
         immediate = _I.record_fills(
-            account, self._fees, venue_order_id, coid,
-            symbol, side, fills, self._mint_trade_id,
+            account, self._fees,
+            _I.OrderIdentity(
+                venue_order_id=venue_order_id, client_order_id=coid,
+                symbol=symbol, side=side,
+            ),
+            fills, self._mint_trade_id,
         )
         filled_qty = sum((f.qty for f in immediate), Decimal('0'))
         status = (
@@ -229,7 +232,7 @@ class SimulatedVenueAdapter:
             if sym not in self._symbol_filters:
                 self._symbol_filters[sym] = BinanceSpotFilters.binance_spot(sym)
 
-    def parse_execution_report(self, data: dict[str, Any]) -> ExecutionReport:
+    def parse_execution_report(self, data: Mapping[str, object]) -> ExecutionReport:
         del data
         msg = (
             'SimulatedVenueAdapter.parse_execution_report: WebSocket path is '

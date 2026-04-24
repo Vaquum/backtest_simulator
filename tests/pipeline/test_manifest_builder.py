@@ -9,6 +9,7 @@ from nexus.infrastructure.manifest import load_manifest
 
 from backtest_simulator.pipeline import ManifestBuilder
 from backtest_simulator.pipeline.manifest_builder import (
+    AccountSpec,
     SensorBinding,
     StrategyParamsSpec,
 )
@@ -31,13 +32,19 @@ def _spec() -> StrategyParamsSpec:
     )
 
 
+def _account() -> AccountSpec:
+    return AccountSpec(
+        account_id='bts-acct-0',
+        allocated_capital=Decimal('100000'),
+        capital_pool=Decimal('10000'),
+    )
+
+
 def test_build_emits_valid_nexus_manifest(tmp_path: Path) -> None:
     exp = _make_experiment_dir(tmp_path)
     builder = ManifestBuilder(output_dir=tmp_path / 'out')
     built = builder.build(
-        account_id='bts-acct-0',
-        allocated_capital=Decimal('100000'),
-        capital_pool=Decimal('10000'),
+        account=_account(),
         strategy_id='long_on_signal_q35',
         sensor=SensorBinding(
             experiment_dir=exp, permutation_ids=(1, 5), interval_seconds=3600,
@@ -57,9 +64,7 @@ def test_manifest_round_trips_via_nexus_loader(tmp_path: Path) -> None:
     exp = _make_experiment_dir(tmp_path)
     builder = ManifestBuilder(output_dir=tmp_path / 'out')
     built = builder.build(
-        account_id='bts-acct-0',
-        allocated_capital=Decimal('100000'),
-        capital_pool=Decimal('10000'),
+        account=_account(),
         strategy_id='long_on_signal_q35',
         sensor=SensorBinding(
             experiment_dir=exp, permutation_ids=(1,), interval_seconds=3600,
@@ -79,9 +84,7 @@ def test_build_rejects_missing_experiment_dir(tmp_path: Path) -> None:
     builder = ManifestBuilder(output_dir=tmp_path / 'out')
     with pytest.raises(ValueError, match='experiment_dir not found'):
         builder.build(
-            account_id='bts-acct-0',
-            allocated_capital=Decimal('100000'),
-            capital_pool=Decimal('10000'),
+            account=_account(),
             strategy_id='s',
             sensor=SensorBinding(
                 experiment_dir=tmp_path / 'missing',
@@ -103,9 +106,7 @@ def test_strategy_file_has_baked_params_substituted(tmp_path: Path) -> None:
     exp = _make_experiment_dir(tmp_path)
     builder = ManifestBuilder(output_dir=tmp_path / 'out')
     built = builder.build(
-        account_id='bts-acct-0',
-        allocated_capital=Decimal('100000'),
-        capital_pool=Decimal('10000'),
+        account=_account(),
         strategy_id='s',
         sensor=SensorBinding(
             experiment_dir=exp, permutation_ids=(1,), interval_seconds=3600,
@@ -131,9 +132,7 @@ def test_strategy_file_is_syntactically_valid_python(tmp_path: Path) -> None:
     exp = _make_experiment_dir(tmp_path)
     builder = ManifestBuilder(output_dir=tmp_path / 'out')
     built = builder.build(
-        account_id='bts-acct-0',
-        allocated_capital=Decimal('100000'),
-        capital_pool=Decimal('10000'),
+        account=_account(),
         strategy_id='s',
         sensor=SensorBinding(
             experiment_dir=exp, permutation_ids=(1,), interval_seconds=3600,
@@ -152,9 +151,7 @@ def test_strategy_params_round_trip_to_yaml(tmp_path: Path) -> None:
     exp = _make_experiment_dir(tmp_path)
     builder = ManifestBuilder(output_dir=tmp_path / 'out')
     built = builder.build(
-        account_id='bts-acct-0',
-        allocated_capital=Decimal('100000'),
-        capital_pool=Decimal('10000'),
+        account=_account(),
         strategy_id='s1',
         sensor=SensorBinding(
             experiment_dir=exp, permutation_ids=(1,), interval_seconds=3600,

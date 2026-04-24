@@ -38,7 +38,7 @@ class _FakeAdapter:
     def __init__(self, result: SimpleNamespace) -> None:
         self._result = result
 
-    async def submit_order(self, *args, **kwargs):  # noqa: ANN001
+    async def submit_order(self, *args, **kwargs):
         return self._result
 
 
@@ -49,7 +49,7 @@ def _tracker_with_pending(
     notional: Decimal = Decimal('1000'),
 ) -> CapitalLifecycleTracker:
     # Build a real pipeline so the controller has a live reservation.
-    pipeline, controller, _state = build_validation_pipeline(
+    _pipeline, controller, _state = build_validation_pipeline(
         capital_pool=Decimal('100000'),
     )
     # Short-circuit: directly call check_and_reserve so we get a real
@@ -185,14 +185,14 @@ def test_record_rejection_raises_on_controller_failure() -> None:
     # returns success=False. The tracker MUST raise rather than
     # report "clean" while the controller still holds the capital.
     class _FailingController:
-        def order_reject(self, order_id: str):  # noqa: ANN201
+        def order_reject(self, order_id: str):
             return SimpleNamespace(
                 success=False,
                 reason='simulated_failure',
                 category=SimpleNamespace(name='INVARIANT_BREACH'),
             )
 
-        def release_reservation(self, reservation_id: str):  # noqa: ANN201
+        def release_reservation(self, reservation_id: str):
             return SimpleNamespace(success=True)
 
     tracker = CapitalLifecycleTracker(_FailingController())
@@ -203,6 +203,6 @@ def test_record_rejection_raises_on_controller_failure() -> None:
     )
     # Mark as sent so record_rejection calls order_reject (not
     # release_reservation).
-    tracker._pending['cmd-fail'].sent = True  # noqa: SLF001 - test-only setup
+    tracker._pending['cmd-fail'].sent = True
     with pytest.raises(RuntimeError, match='order_reject failed'):
         tracker.record_rejection('cmd-fail', 'VENUE-1')

@@ -155,6 +155,10 @@ max-branches = 12
 max-statements = 50
 
 [tool.ruff.lint.per-file-ignores]
+# SimulatedVenueAdapter.submit_order must byte-match the Praxis
+# VenueAdapter Protocol signature (10 args). A helper-extraction
+# refactor would break the runtime_checkable isinstance() check.
+"backtest_simulator/venue/simulated.py" = ["PLR0913"]
 "tests/**/*.py" = [
   "S101", "ANN", "BLE001",
   "PLR0912", "PLR0913", "PLR0915",

@@ -8,7 +8,6 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any
 
 import polars as pl
 from limen import Sensor, Trainer, UniversalExperimentLoop
@@ -18,18 +17,27 @@ from limen.sfd import logreg_binary
 
 _log = logging.getLogger(__name__)
 
-FilterValue = float | int | str | bool | tuple[float, float] | set[Any] | frozenset[Any]
+FilterValue = (
+    float | int | str | bool
+    | tuple[float, float]
+    | set[object] | frozenset[object]
+)
 FilterCriteria = dict[str, FilterValue]
 
 
 @dataclass(frozen=True)
 class ExperimentFile:
-    """Loaded user experiment file with `params()` and `manifest()` callables."""
+    """Loaded user experiment file with `params()` and `manifest()` callables.
+
+    `params()` returns the grid dict passed to `ParamDomain`.
+    `manifest()` returns the experiment manifest Limen consumes; its exact
+    shape belongs to Limen, so we carry it as `object` and hand it through.
+    """
 
     source_path: Path
     module: ModuleType
-    params: Callable[[], dict[str, Any]]
-    manifest: Callable[[], Any]
+    params: Callable[[], dict[str, object]]
+    manifest: Callable[[], object]
 
 
 class ExperimentPipeline:
@@ -37,8 +45,9 @@ class ExperimentPipeline:
 
     def __init__(self, experiment_dir: Path, sfd: object = logreg_binary) -> None:
         # `sfd` is Limen's plug-in strategy-family-descriptor — a module or
-        # instance exposing the required hooks. Limen itself types it `Any`;
-        # `object` is the honest narrowest Python type for a duck-typed arg.
+        # instance exposing the required hooks. Limen itself leaves it
+        # untyped; `object` is the honest narrowest Python type for a
+        # duck-typed arg.
         self._experiment_dir = Path(experiment_dir).resolve()
         self._sfd = sfd
 
@@ -49,7 +58,7 @@ class ExperimentPipeline:
         The file must define two module-level callables (module functions OR
         class instances whose methods match):
 
-          def params() -> dict[str, list[Any]]
+          def params() -> dict[str, list[object]]
           def manifest() -> limen.experiment.Manifest
         """
         source_path = Path(path).resolve()

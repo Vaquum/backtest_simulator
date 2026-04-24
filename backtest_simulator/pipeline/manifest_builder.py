@@ -46,6 +46,19 @@ class StrategyParamsSpec:
 
 
 @dataclass(frozen=True)
+class AccountSpec:
+    """Account + capital sizing for the generated manifest.
+
+    Bundles the three account/capital fields so `ManifestBuilder.build`
+    takes one argument for them instead of three.
+    """
+
+    account_id: str
+    allocated_capital: Decimal
+    capital_pool: Decimal
+
+
+@dataclass(frozen=True)
 class SensorBinding:
     """Wire one Limen experiment_dir + permutation_ids to one strategy."""
 
@@ -77,12 +90,10 @@ class ManifestBuilder:
             raise FileNotFoundError(msg)
         self._template_path = template
 
-    def build(  # noqa: PLR0913 - manifest fields are all required for validation
+    def build(
         self,
         *,
-        account_id: str,
-        allocated_capital: Decimal,
-        capital_pool: Decimal,
+        account: AccountSpec,
         strategy_id: str,
         sensor: SensorBinding,
         strategy_params: StrategyParamsSpec,
@@ -118,8 +129,7 @@ class ManifestBuilder:
         )
 
         manifest = _assemble_manifest(
-            account_id=account_id, allocated_capital=allocated_capital,
-            capital_pool=capital_pool, strategy_id=strategy_id,
+            account=account, strategy_id=strategy_id,
             sensor=sensor, capital_pct=capital_pct,
             strategy_file=strategy_file.name,
         )
@@ -143,11 +153,9 @@ class ManifestBuilder:
         )
 
 
-def _assemble_manifest(  # noqa: PLR0913 - manifest-schema arg count
+def _assemble_manifest(
     *,
-    account_id: str,
-    allocated_capital: Decimal,
-    capital_pool: Decimal,
+    account: AccountSpec,
     strategy_id: str,
     sensor: SensorBinding,
     capital_pct: Decimal,
@@ -168,9 +176,9 @@ def _assemble_manifest(  # noqa: PLR0913 - manifest-schema arg count
         timers=timers,
     )
     return Manifest(
-        account_id=account_id,
-        allocated_capital=allocated_capital,
-        capital_pool=capital_pool,
+        account_id=account.account_id,
+        allocated_capital=account.allocated_capital,
+        capital_pool=account.capital_pool,
         strategies=(strategy,),
     )
 

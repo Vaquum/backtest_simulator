@@ -1,20 +1,18 @@
-"""Accelerated-clock context manager — freezegun + threading.Timer frozen-aware wait.
-
-Design: the main thread in `BacktestLauncher._advance_clock_until` is the
-SINGLE authoritative driver of frozen time. Everyone else (asyncio
-coroutines, PredictLoop Timers) reads frozen time via `datetime.now(UTC)`
-but never ticks it themselves. `asyncio.sleep` is left alone; the event
-loop's scheduler uses `loop.time = real_monotonic` (rebound in
-`BacktestLauncher._install_real_loop_time`) so its callback firings
-happen in real time regardless of freezegun's `time.monotonic` patch.
-Only `threading.Timer.run` is patched, because its default
-`threading.Event.wait(timeout)` is a blocking real-time wait that would
-otherwise make a `kline_size=3600` Timer take 3600 real seconds; the
-replacement polls `datetime.now(UTC)` (frozen) and fires when enough
-frozen time has elapsed, yielding control to the main driver in between.
-"""
+"""Accelerated-clock context manager — freezegun + threading.Timer frozen-aware wait."""
 from __future__ import annotations
 
+# Design: the main thread in `BacktestLauncher._advance_clock_until` is the
+# SINGLE authoritative driver of frozen time. Everyone else (asyncio
+# coroutines, PredictLoop Timers) reads frozen time via `datetime.now(UTC)`
+# but never ticks it themselves. `asyncio.sleep` is left alone; the event
+# loop's scheduler uses `loop.time = real_monotonic` (rebound in
+# `BacktestLauncher._install_real_loop_time`) so its callback firings
+# happen in real time regardless of freezegun's `time.monotonic` patch.
+# Only `threading.Timer.run` is patched, because its default
+# `threading.Event.wait(timeout)` is a blocking real-time wait that would
+# otherwise make a `kline_size=3600` Timer take 3600 real seconds; the
+# replacement polls `datetime.now(UTC)` (frozen) and fires when enough
+# frozen time has elapsed, yielding control to the main driver in between.
 import logging
 import threading
 import time
@@ -98,11 +96,14 @@ def _frozen_aware_timer_run(self: threading.Timer) -> None:
         if now >= target:
             break
     if not self.finished.is_set():
-        self.function(*self.args, **self.kwargs)  # type: ignore[attr-defined]
+        fn = getattr(self, 'function')
+        fn_args = getattr(self, 'args')
+        fn_kwargs = getattr(self, 'kwargs')
+        fn(*fn_args, **fn_kwargs)
     self.finished.set()
 
 
-threading.Timer.run = _frozen_aware_timer_run  # type: ignore[method-assign]
+setattr(threading.Timer, 'run', _frozen_aware_timer_run)
 
 
 @contextmanager

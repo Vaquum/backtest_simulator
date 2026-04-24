@@ -5,7 +5,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import Decimal
-from typing import Any
 
 from praxis.core.domain.enums import OrderSide, OrderStatus, OrderType
 from praxis.infrastructure.venue_adapter import (
@@ -17,7 +16,7 @@ from praxis.infrastructure.venue_adapter import (
 
 from backtest_simulator.venue.fees import FeeSchedule
 from backtest_simulator.venue.filters import BinanceSpotFilters
-from backtest_simulator.venue.types import PendingOrder
+from backtest_simulator.venue.types import FillResult, PendingOrder
 
 TYPE_MAP: dict[OrderType, str] = {
     OrderType.MARKET: 'MARKET',
@@ -91,11 +90,26 @@ def record_rejection(
     )
 
 
-def record_fills(  # noqa: PLR0913 - recorder; every arg carries schema meaning
-    account: Account, fees: FeeSchedule, venue_order_id: str, client_order_id: str,
-    symbol: str, side: OrderSide, fills: list[Any], next_trade_id_fn: Callable[[], str],
+@dataclass(frozen=True)
+class OrderIdentity:
+    """Identifying fields a recorded fill ties to.
+
+    Bundles the four per-order identifier/side fields so `record_fills`
+    takes one argument for them instead of four.
+    """
+
+    venue_order_id: str
+    client_order_id: str
+    symbol: str
+    side: OrderSide
+
+
+def record_fills(
+    account: Account, fees: FeeSchedule, identity: OrderIdentity,
+    fills: list[FillResult], next_trade_id_fn: Callable[[], str],
 ) -> tuple[ImmediateFill, ...]:
     recorded: list[ImmediateFill] = []
+    symbol = identity.symbol
     for fill in fills:
         fee = fees.fee(symbol, fill.fill_price * fill.fill_qty, is_maker=fill.is_maker)
         trade_id = next_trade_id_fn()
@@ -104,8 +118,9 @@ def record_fills(  # noqa: PLR0913 - recorder; every arg carries schema meaning
             fee=fee, fee_asset=quote_asset(symbol), is_maker=fill.is_maker,
         ))
         account.trades.append(VenueTrade(
-            venue_trade_id=trade_id, venue_order_id=venue_order_id,
-            client_order_id=client_order_id, symbol=symbol, side=side,
+            venue_trade_id=trade_id, venue_order_id=identity.venue_order_id,
+            client_order_id=identity.client_order_id,
+            symbol=symbol, side=identity.side,
             qty=fill.fill_qty, price=fill.fill_price,
             fee=fee, fee_asset=quote_asset(symbol),
             is_maker=fill.is_maker, timestamp=fill.fill_time,

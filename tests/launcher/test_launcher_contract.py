@@ -39,15 +39,14 @@ def test_poller_get_market_data_returns_empty_for_unknown_size() -> None:
     assert result.is_empty()
 
 
-def test_kline_size_from_experiment_dir_returns_none_for_missing() -> None:
-    # The kline-size resolver walks metadata.json -> sfd_module ->
-    # manifest() -> data_source_config. Each step can legitimately fail
-    # (missing file, missing key, unimportable module); the resolver
-    # returns None in every case rather than raising, letting the
-    # launcher continue with an empty kline set for that sensor.
-    from pathlib import Path
-    result = BacktestLauncher._kline_size_from_experiment_dir(Path('/tmp/no-such-dir-XYZ'))
-    assert result is None
+def test_kline_size_from_experiment_dir_raises_on_missing() -> None:
+    # No silent fallbacks. If the experiment directory lacks
+    # metadata.json, the resolver raises FileNotFoundError rather
+    # than returning None — a missing file means the launcher was
+    # invoked against an empty/half-written experiment, and the
+    # strategy MUST NOT boot under that condition.
+    with pytest.raises(FileNotFoundError, match=r'metadata\.json'):
+        BacktestLauncher._kline_size_from_experiment_dir(Path('/tmp/no-such-dir-XYZ'))
 
 
 def test_kline_size_from_experiment_dir_parses_real_metadata(tmp_path: Path) -> None:
@@ -64,35 +63,11 @@ def test_kline_size_from_experiment_dir_parses_real_metadata(tmp_path: Path) -> 
     assert result == 3600, f'expected 3600 from logreg_binary manifest, got {result}'
 
 
-def test_nexus_running_handler_releases_event_on_expected_count() -> None:
-    import logging
-    import threading
-
-    from backtest_simulator.launcher.launcher import _NexusRunningHandler
-    event = threading.Event()
-    handler = _NexusRunningHandler(event, expected=2)
-    for _ in range(2):
-        rec = logging.LogRecord(
-            name='praxis.launcher', level=logging.INFO, pathname='', lineno=0,
-            msg='nexus instance running', args=(), exc_info=None,
-        )
-        handler.emit(rec)
-    assert event.is_set()
-
-
-def test_nexus_running_handler_ignores_unrelated_logs() -> None:
-    import logging
-    import threading
-
-    from backtest_simulator.launcher.launcher import _NexusRunningHandler
-    event = threading.Event()
-    handler = _NexusRunningHandler(event, expected=1)
-    rec = logging.LogRecord(
-        name='praxis.launcher', level=logging.INFO, pathname='', lineno=0,
-        msg='trading started', args=(), exc_info=None,
-    )
-    handler.emit(rec)
-    assert not event.is_set()
+# Part 1 rework: `_NexusRunningHandler` (a log-record listener that
+# released a threading.Event on N 'nexus instance running' messages)
+# was removed when the launcher switched to driving `_instance_running`
+# directly from the post-register callback. No log-parsing handler
+# exists anymore, so the two handler tests that lived here are gone.
 
 
 def test_instance_config_construction_is_stable() -> None:

@@ -9,6 +9,7 @@ import os
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -18,7 +19,11 @@ import polars as pl
 from limen import HistoricalData
 from nexus.core.domain.capital_state import CapitalState
 from nexus.core.domain.enums import OperationalMode
-from nexus.core.validator.pipeline_models import InstanceState
+from nexus.core.validator.pipeline_models import (
+    InstanceState,
+    ValidationDecision,
+    ValidationRequestContext,
+)
 from nexus.infrastructure.manifest import load_manifest
 from nexus.infrastructure.praxis_connector.praxis_inbound import PraxisInbound
 from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
@@ -27,6 +32,7 @@ from nexus.infrastructure.state_store import StateStore
 from nexus.instance_config import InstanceConfig as NexusInstanceConfig
 from nexus.startup.sequencer import StartupSequencer
 from nexus.startup.shutdown_sequencer import ShutdownSequencer
+from nexus.strategy.action import Action
 from nexus.strategy.context import StrategyContext
 from nexus.strategy.predict_loop import PredictLoop
 from nexus.strategy.timer_loop import TimerLoop
@@ -41,7 +47,10 @@ from backtest_simulator.honesty import (
     build_validation_pipeline,
     capital_totals,
 )
-from backtest_simulator.launcher.action_submitter import build_action_submitter
+from backtest_simulator.launcher.action_submitter import (
+    SubmitterBindings,
+    build_action_submitter,
+)
 from backtest_simulator.launcher.clock import accelerated_clock
 from backtest_simulator.launcher.poller import BacktestMarketDataPoller
 
@@ -67,7 +76,7 @@ _REAL_MONOTONIC = time.monotonic
 # yield so the asyncio account_loop + Timer threads get CPU between
 # ticks. Strategy sklearn inference (~50ms real) keeps main ticking
 # during that window; the tinier the pause, the bigger the frozen-time
-# drift per strategy tick (drift ≈ sklearn_time × tick_seconds / pause).
+# drift per strategy tick (drift ~= sklearn_time x tick_seconds / pause).
 # With 120s ticks at 0.01s pause, drift is ~600s = 10 min per tick —
 # small enough that PredictLoop Timer firings still land at the intended
 # frozen schedule, and the decoder's proven `preds 0→1→0→1` transition
@@ -124,9 +133,11 @@ class CapitalPartialFillError(RuntimeError):
     """
 
 
-def _extract_declared_stop_price(action: 'Action') -> Decimal | None:
-    """Pull `declared_stop_price` from the Nexus Action's
-    `execution_params` dict. Returns None when absent or blank.
+def _extract_declared_stop_price(action: Action) -> Decimal | None:
+    """Pull `declared_stop_price` from the Nexus Action.
+
+    Reads `action.execution_params['stop_price']` and returns None
+    when absent or blank.
 
     The strategy template writes `execution_params['stop_price']` as a
     string for YAML roundtrip; this function coerces to Decimal.
@@ -143,10 +154,142 @@ def _extract_declared_stop_price(action: 'Action') -> Decimal | None:
     return Decimal(str(raw))
 
 
+@dataclass(frozen=True)
+class _LifecycleContext:
+    """Bundled state the adapter-wrapper helpers share.
+
+    Used instead of passing `tracker`, `capital_state`, `initial_pool`
+    as three separate positional args on every helper call.
+    """
+
+    tracker: CapitalLifecycleTracker
+    capital_state: CapitalState
+    initial_pool: Decimal
+
+
+def _check_tracker_match_required(
+    pre_match_command_id: str | None,
+    side_arg: object,
+    client_order_id: object,
+) -> None:
+    """Raise when a BUY submit has no tracker match.
+
+    Part 2 SELL-as-close convention: the action_submitter skips
+    CAPITAL reservation for SELL actions (they are exits, not new
+    reservations). Those show up here with side=SELL and no tracker
+    entry — that's expected, not an error.
+    """
+    if pre_match_command_id is not None:
+        return
+    side_name = getattr(side_arg, 'name', str(side_arg))
+    if side_name != 'BUY':
+        return
+    msg = (
+        f'capital lifecycle: BUY submit for '
+        f'client_order_id={client_order_id!r} has no matching '
+        f'reservation in tracker. Part 2 honesty requires '
+        f'every BUY to clear the CAPITAL stage BEFORE dispatch; '
+        f'missing match means the action-submitter skipped the '
+        f'reservation OR the client_order_id format has changed.'
+    )
+    raise RuntimeError(msg)
+
+
+def _maybe_inject_declared_stop(
+    pre_match_command_id: str | None,
+    client_order_id: object,
+    kwargs: dict[str, object],
+    tracker: CapitalLifecycleTracker,
+    declared_stops: dict[str, Decimal],
+) -> dict[str, object]:
+    """Inject declared_stop_price into kwargs when present on the tracker.
+
+    Praxis's `validate_trade_command` strips stop_price from MARKET
+    orders before the command reaches here. We look up the command
+    via its client_order_id and inject the honest declared stop so
+    FillModel.apply_stop can enforce it during the trade walk.
+    """
+    if pre_match_command_id is None or kwargs.get('stop_price') is not None:
+        return kwargs
+    declared_stop = tracker.declared_stop_for_command(pre_match_command_id)
+    if declared_stop is None:
+        return kwargs
+    new_kwargs = dict(kwargs)
+    new_kwargs['stop_price'] = declared_stop
+    if isinstance(client_order_id, str):
+        declared_stops[client_order_id] = declared_stop
+    return new_kwargs
+
+
+def _sum_fill_totals(result: object) -> tuple[Decimal, Decimal]:
+    """Sum the result's immediate_fills into (notional, fees)."""
+    fill_notional = Decimal('0')
+    fill_fees = Decimal('0')
+    for fill in getattr(result, 'immediate_fills', ()):
+        fill_notional += Decimal(str(fill.qty)) * Decimal(str(fill.price))
+        fill_fees += Decimal(str(fill.fee))
+    return fill_notional, fill_fees
+
+
+def _finalize_successful_fill(
+    ctx: _LifecycleContext,
+    command_id: str,
+    result: object,
+    venue_order_id: str,
+    status_name: str,
+) -> None:
+    """Fire record_sent + record_ack_and_fill with conservation checks.
+
+    Fails loud on capital overshoot or PARTIALLY_FILLED status — Part 2
+    honesty requires terminal FILLED/REJECTED only, and reservation
+    buffering must absorb any real slippage without silent capping.
+    """
+    ctx.tracker.record_sent(command_id, venue_order_id)
+    assert_conservation(
+        ctx.capital_state, ctx.initial_pool,
+        context=f'send_order command_id={command_id}',
+    )
+    fill_notional, fill_fees = _sum_fill_totals(result)
+    reservation_notional = ctx.tracker.declared_reservation_for_command(command_id)
+    if reservation_notional is not None and fill_notional > reservation_notional:
+        slippage = fill_notional - reservation_notional
+        msg = (
+            f'capital overshoot: fill_notional={fill_notional} exceeds '
+            f'reserved={reservation_notional} for command_id={command_id} '
+            f'by {slippage}. Raise `_NOTIONAL_RESERVATION_BUFFER` in '
+            f'backtest_simulator.launcher.action_submitter to absorb this '
+            f'slippage honestly; silently capping here would bypass '
+            f'CAPITAL gating.'
+        )
+        raise CapitalOvershootError(msg)
+    if status_name == 'PARTIALLY_FILLED':
+        msg = (
+            f'PARTIALLY_FILLED command_id={command_id} venue_order_id='
+            f'{venue_order_id}: Part 2 lifecycle expects terminal '
+            f'FILLED or REJECTED. Partial residual working-notional '
+            f'would not be drained and the capital ledger would '
+            f'under-count. Investigate why the MARKET walk did not '
+            f'fully fill the order.'
+        )
+        raise CapitalPartialFillError(msg)
+    ctx.tracker.record_ack_and_fill(
+        command_id, venue_order_id, fill_notional, fill_fees,
+    )
+    assert_conservation(
+        ctx.capital_state, ctx.initial_pool,
+        context=f'order_fill command_id={command_id}',
+    )
+    _log.info(
+        'capital lifecycle: command_id=%s reserve->send->ack->fill '
+        'venue_order_id=%s fill_notional=%s fees=%s',
+        command_id, venue_order_id, fill_notional, fill_fees,
+    )
+
+
 def _install_capital_adapter_wrapper(
-    adapter: 'VenueAdapter',
-    tracker: 'CapitalLifecycleTracker',
-    capital_state: 'CapitalState',
+    adapter: VenueAdapter,
+    tracker: CapitalLifecycleTracker,
+    capital_state: CapitalState,
     initial_pool: Decimal,
     declared_stops: dict[str, Decimal],
 ) -> None:
@@ -167,40 +310,18 @@ def _install_capital_adapter_wrapper(
     each transition so any drift fails loud at the offending boundary.
     """
     original_submit = adapter.submit_order
+    ctx = _LifecycleContext(
+        tracker=tracker, capital_state=capital_state, initial_pool=initial_pool,
+    )
 
     async def wrapped_submit(*args: object, **kwargs: object) -> object:
-        # Inject the declared_stop_price we stashed on the tracker at
-        # reservation time. Praxis's `validate_trade_command` strips
-        # stop_price from MARKET orders before the command reaches
-        # here, so the `stop_price` kwarg is always None on a MARKET
-        # command. We look up the command via its client_order_id and
-        # inject the honest declared stop so FillModel.apply_stop
-        # can enforce it during the trade walk.
         client_order_id = kwargs.get('client_order_id')
-        # Part 2 SELL-as-close convention: the action_submitter skips
-        # CAPITAL reservation for SELL actions (they are exits, not new
-        # reservations). Those show up here with side=SELL and no
-        # tracker entry — that's expected, not an error.
         side_arg = args[2] if len(args) > 2 else kwargs.get('side')
-        side_name = getattr(side_arg, 'name', str(side_arg))
         pre_match_command_id = _match_command_id(tracker, client_order_id)
-        if pre_match_command_id is None and side_name == 'BUY':
-            msg = (
-                f'capital lifecycle: BUY submit for '
-                f'client_order_id={client_order_id!r} has no matching '
-                f'reservation in tracker. Part 2 honesty requires '
-                f'every BUY to clear the CAPITAL stage BEFORE dispatch; '
-                f'missing match means the action-submitter skipped the '
-                f'reservation OR the client_order_id format has changed.'
-            )
-            raise RuntimeError(msg)
-        if pre_match_command_id is not None and kwargs.get('stop_price') is None:
-            declared_stop = tracker.declared_stop_for_command(pre_match_command_id)
-            if declared_stop is not None:
-                kwargs = dict(kwargs)  # shallow copy
-                kwargs['stop_price'] = declared_stop
-                if isinstance(client_order_id, str):
-                    declared_stops[client_order_id] = declared_stop
+        _check_tracker_match_required(pre_match_command_id, side_arg, client_order_id)
+        kwargs = _maybe_inject_declared_stop(
+            pre_match_command_id, client_order_id, kwargs, tracker, declared_stops,
+        )
         # If the original adapter raises mid-submit we MUST release
         # the capital reservation — otherwise the reservation stays
         # locked forever and the lifecycle tracker never pops it,
@@ -215,10 +336,6 @@ def _install_capital_adapter_wrapper(
                     context=f'adapter_raised command_id={pre_match_command_id}',
                 )
             raise
-        # The Nexus command_id is embedded in the client_order_id as
-        # the `SS-<command_id-prefix>-<sequence>` format Nexus generates
-        # in `generate_client_order_id`. The prefix is the leading 16
-        # hex chars of the command_id stripped of dashes.
         command_id = _match_command_id(tracker, client_order_id)
         if command_id is None:
             _log.info(
@@ -242,74 +359,18 @@ def _install_capital_adapter_wrapper(
                 command_id,
             )
             return result
-        tracker.record_sent(command_id, venue_order_id)
-        assert_conservation(
-            capital_state, initial_pool,
-            context=f'send_order command_id={command_id}',
-        )
-        fill_notional = Decimal('0')
-        fill_fees = Decimal('0')
-        for fill in getattr(result, 'immediate_fills', ()):
-            fill_notional += Decimal(str(fill.qty)) * Decimal(str(fill.price))
-            fill_fees += Decimal(str(fill.fee))
-        # Fail loud on capital overshoot. The action-submitter
-        # reserves `reference_price * size * (1 + buffer)` at
-        # validation time; actual fills that exceed that buffered
-        # amount mean a real slippage blow-up the strategy didn't
-        # budget for. Honesty demands we surface it rather than
-        # silently capping the ledger fill — bumping the buffer in
-        # action_submitter is the right response, not hiding.
-        reservation_notional = tracker.declared_reservation_for_command(
-            command_id,
-        )
-        if reservation_notional is not None and fill_notional > reservation_notional:
-            slippage = fill_notional - reservation_notional
-            msg = (
-                f'capital overshoot: fill_notional={fill_notional} exceeds '
-                f'reserved={reservation_notional} for command_id={command_id} '
-                f'by {slippage}. Raise `_NOTIONAL_RESERVATION_BUFFER` in '
-                f'backtest_simulator.launcher.action_submitter to absorb this '
-                f'slippage honestly; silently capping here would bypass '
-                f'CAPITAL gating.'
-            )
-            raise CapitalOvershootError(msg)
-        # Status gate: Part 2 honesty requires terminal states after
-        # each submit. REJECTED already handled above. PARTIALLY_FILLED
-        # would leave residual working-notional after we pop the
-        # lifecycle, hiding the fact that the remainder never
-        # completed. The VWAP aggregator in `FillModel._walk_market`
-        # produces a single fill for the whole qty or `REJECTED` via
-        # filter rules, so PARTIALLY_FILLED shouldn't reach us — but
-        # we assert it explicitly to catch any future path that does.
-        if status_name == 'PARTIALLY_FILLED':
-            msg = (
-                f'PARTIALLY_FILLED command_id={command_id} venue_order_id='
-                f'{venue_order_id}: Part 2 lifecycle expects terminal '
-                f'FILLED or REJECTED. Partial residual working-notional '
-                f'would not be drained and the capital ledger would '
-                f'under-count. Investigate why the MARKET walk did not '
-                f'fully fill the order.'
-            )
-            raise CapitalPartialFillError(msg)
-        tracker.record_ack_and_fill(
-            command_id, venue_order_id, fill_notional, fill_fees,
-        )
-        assert_conservation(
-            capital_state, initial_pool,
-            context=f'order_fill command_id={command_id}',
-        )
-        _log.info(
-            'capital lifecycle: command_id=%s reserve→send→ack→fill '
-            'venue_order_id=%s fill_notional=%s fees=%s',
-            command_id, venue_order_id, fill_notional, fill_fees,
+        _finalize_successful_fill(
+            ctx, command_id, result, venue_order_id, status_name,
         )
         return result
 
-    adapter.submit_order = wrapped_submit  # type: ignore[method-assign]
+    setattr(adapter, 'submit_order', wrapped_submit)
 
 
-def _match_command_id(tracker: 'CapitalLifecycleTracker', client_order_id: object) -> str | None:
-    """Map Nexus's `SS-<command_prefix>-<seq>` client_order_id back to
+def _match_command_id(tracker: CapitalLifecycleTracker, client_order_id: object) -> str | None:
+    """Map Nexus's client_order_id back to the tracker's command_id.
+
+    The Nexus form is `SS-<command_prefix>-<seq>`; we map it back to
     the full `command_id` the tracker recorded.
 
     Nexus's `generate_client_order_id` takes the original `command_id`
@@ -523,9 +584,12 @@ class BacktestLauncher(Launcher):
             declared_stops=self._declared_stops,
         )
         action_submit = build_action_submitter(
-            nexus_config=nexus_config, state=state, praxis_outbound=praxis_outbound,
-            validation_pipeline=pipeline,
-            strategy_budget=allocated_capital,
+            SubmitterBindings(
+                nexus_config=nexus_config, state=state,
+                praxis_outbound=praxis_outbound,
+                validation_pipeline=pipeline,
+                strategy_budget=allocated_capital,
+            ),
             on_reservation=self._record_reservation,
             on_submit=self._record_submitted_command,
         )
@@ -683,7 +747,7 @@ class BacktestLauncher(Launcher):
                 'call only after _wait_until_trading_ready'
             )
             raise RuntimeError(msg)
-        self._loop.time = _REAL_MONOTONIC  # type: ignore[method-assign]
+        setattr(self._loop, 'time', _REAL_MONOTONIC)
 
     def _wait_until_trading_ready(self) -> None:
         # freezegun patches every public `time.*` clock (time.monotonic,
@@ -721,9 +785,9 @@ class BacktestLauncher(Launcher):
     def _record_reservation(
         self,
         command_id: str,
-        decision: 'ValidationDecision',
-        context: 'ValidationRequestContext',
-        action: 'Action',
+        decision: ValidationDecision,
+        context: ValidationRequestContext,
+        action: Action,
     ) -> None:
         # Called by action_submitter's `on_reservation` hook after a
         # successful CAPITAL validation. Feeds the
@@ -899,7 +963,8 @@ class BacktestLauncher(Launcher):
                     _REAL_TIME_CAP_SECONDS, end, datetime.now(UTC),
                 )
                 return
-            freezer.tick(_CLOCK_TICK_SECONDS)  # type: ignore[attr-defined]
+            tick_fn = getattr(freezer, 'tick')
+            tick_fn(_CLOCK_TICK_SECONDS)
             time.sleep(_CLOCK_TICK_REAL_PAUSE_SECONDS)
             self._drain_pending_submits()
         # Grace drain: frozen time drifts because multiple threads

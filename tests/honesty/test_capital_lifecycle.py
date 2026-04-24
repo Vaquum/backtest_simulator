@@ -38,9 +38,9 @@ def _ctx(
 ) -> ValidationRequestContext:
     # Mirror `_build_context` shape with just the fields the CAPITAL
     # stage reads; other fields are filled with safe sentinels.
+    from nexus.core.domain.capital_state import CapitalState
     from nexus.core.domain.enums import OrderSide
     from nexus.core.validator.pipeline_models import InstanceState
-    from nexus.core.domain.capital_state import CapitalState
     from nexus.instance_config import InstanceConfig as NexusInstanceConfig
     return ValidationRequestContext(
         strategy_id=strategy_id,
@@ -122,7 +122,7 @@ def test_pipeline_denies_per_trade_limit_breach() -> None:
     assert decision.failed_stage == ValidationStage.CAPITAL
 
 
-def _instance_state_sharing(capital_state):  # noqa: ANN001 - internal helper
+def _instance_state_sharing(capital_state):
     from nexus.core.validator.pipeline_models import InstanceState
     return InstanceState(capital=capital_state)
 
@@ -162,7 +162,7 @@ def test_lifecycle_happy_path() -> None:
 
 
 def test_lifecycle_fail_loud_on_skip_reservation() -> None:
-    pipeline, controller, _state = build_validation_pipeline(
+    _pipeline, controller, _state = build_validation_pipeline(
         capital_pool=Decimal('100000'),
     )
     tracker = CapitalLifecycleTracker(controller)
@@ -224,7 +224,7 @@ def test_record_rejection_releases_reservation() -> None:
     )
     tracker = CapitalLifecycleTracker(controller)
     # Reserve via pipeline so the controller has the reservation.
-    pipeline, _, _ = build_validation_pipeline(capital_pool=Decimal('100000'))
+    _pipeline, _, _ = build_validation_pipeline(capital_pool=Decimal('100000'))
     # Use the same controller for the tracker's pipeline.
     # (build_validation_pipeline creates a fresh controller each call.)
     ctx = _ctx()

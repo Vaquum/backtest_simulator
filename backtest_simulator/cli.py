@@ -1,19 +1,17 @@
-"""bts CLI — sweep + analyze subcommands.
-
-`bts sweep` is the Part 2 entry point that produces
-`<experiment_dir>/results_with_backtest.csv` enriched with backtest
-columns. It reads the Limen UEL `results.csv` (and optionally an
-already-produced `backtest_results.parquet`) and joins them into a
-single enriched CSV. If no backtest parquet exists yet, the output
-carries the Limen columns plus NaN placeholders for the backtest
-columns — an operator-visible HONEST null rather than a silently
-missing file.
-
-`bts analyze` is the same operation retained under its historical
-name, so existing automation that calls `bts analyze` keeps working.
-"""
+"""bts CLI — sweep + analyze subcommands."""
 from __future__ import annotations
 
+# `bts sweep` is the Part 2 entry point that produces
+# `<experiment_dir>/results_with_backtest.csv` enriched with backtest
+# columns. It reads the Limen UEL `results.csv` (and optionally an
+# already-produced `backtest_results.parquet`) and joins them into a
+# single enriched CSV. If no backtest parquet exists yet, the output
+# carries the Limen columns plus NaN placeholders for the backtest
+# columns — an operator-visible HONEST null rather than a silently
+# missing file.
+#
+# `bts analyze` is the same operation retained under its historical
+# name, so existing automation that calls `bts analyze` keeps working.
 import argparse
 import sys
 from pathlib import Path
@@ -51,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
 def _cmd_sweep(args: argparse.Namespace) -> int:
     exp_dir = Path(args.experiment).resolve()
     if not exp_dir.is_dir():
-        print(f'bts sweep: experiment dir not found: {exp_dir}', file=sys.stderr)
+        sys.stderr.write(f'bts sweep: experiment dir not found: {exp_dir}\n')
         return 2
     backtest_parquet = (
         Path(args.backtest_parquet).resolve() if args.backtest_parquet is not None
@@ -62,7 +60,7 @@ def _cmd_sweep(args: argparse.Namespace) -> int:
         else exp_dir / 'results_with_backtest.csv'
     )
     build_enriched_table(exp_dir, backtest_parquet, out_csv=out_csv)
-    print(f'bts sweep: wrote {out_csv}')
+    sys.stdout.write(f'bts sweep: wrote {out_csv}\n')
     return 0
 
 

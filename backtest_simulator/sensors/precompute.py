@@ -5,7 +5,6 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import polars as pl
@@ -22,6 +21,21 @@ class SignalRow:
     pred: int
     label_t0: datetime
     label_t1: datetime
+
+
+@dataclass(frozen=True)
+class PredictionsInput:
+    """Per-decoder inputs for building a SignalsTable.
+
+    Bundles the five prediction/label fields so the builder takes one
+    argument for them instead of five.
+    """
+
+    timestamps: list[datetime]
+    probs: np.ndarray
+    preds: np.ndarray
+    label_horizon_bars: int
+    bar_seconds: int
 
 
 @dataclass
@@ -41,23 +55,24 @@ class SignalsTable:
     frame: pl.DataFrame  # columns: timestamp, prob, pred, label_t0, label_t1
 
     @classmethod
-    def from_predictions(  # noqa: PLR0913 - constructs the signals frame from distinct per-decoder inputs
+    def from_predictions(
         cls,
         *,
         decoder_id: str,
         split_config: tuple[int, int, int],
-        timestamps: list[datetime],
-        probs: np.ndarray,
-        preds: np.ndarray,
-        label_horizon_bars: int,
-        bar_seconds: int,
+        predictions: PredictionsInput,
     ) -> SignalsTable:
         from datetime import timedelta
-        rows = []
-        for i, ts in enumerate(timestamps):
+        rows: list[tuple[datetime, float, int, datetime, datetime]] = []
+        for i, ts in enumerate(predictions.timestamps):
             label_t0 = ts
-            label_t1 = ts + timedelta(seconds=bar_seconds * label_horizon_bars)
-            rows.append((ts, float(probs[i]), int(preds[i]), label_t0, label_t1))
+            label_t1 = ts + timedelta(
+                seconds=predictions.bar_seconds * predictions.label_horizon_bars,
+            )
+            rows.append((
+                ts, float(predictions.probs[i]), int(predictions.preds[i]),
+                label_t0, label_t1,
+            ))
         utc = pl.Datetime(time_zone='UTC')
         frame = pl.DataFrame(
             rows,
@@ -101,11 +116,21 @@ class SignalsTable:
     @classmethod
     def load(cls, directory: Path, decoder_id: str) -> SignalsTable:
         metadata_path = directory / f'{decoder_id}.meta.json'
-        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+        metadata: dict[str, object] = json.loads(metadata_path.read_text(encoding='utf-8'))
         frame = pl.read_parquet(directory / f'{decoder_id}.parquet')
-        split_config_raw: Any = metadata['split_config']
+        split_config_raw = metadata['split_config']
+        if not isinstance(split_config_raw, list) or len(split_config_raw) != 3:
+            msg = (
+                f'SignalsTable.load: expected 3-element list for split_config '
+                f'in {metadata_path}, got {split_config_raw!r}'
+            )
+            raise ValueError(msg)
         return cls(
             decoder_id=decoder_id,
-            split_config=(int(split_config_raw[0]), int(split_config_raw[1]), int(split_config_raw[2])),
+            split_config=(
+                int(split_config_raw[0]),
+                int(split_config_raw[1]),
+                int(split_config_raw[2]),
+            ),
             frame=frame,
         )

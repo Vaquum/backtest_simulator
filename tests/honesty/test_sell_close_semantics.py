@@ -15,29 +15,32 @@ the action_submitter. The test here pins the agreed Part 2 behavior.
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Any
+from typing import cast
 
-from nexus.core.domain.capital_state import CapitalState
 from nexus.core.domain.enums import OrderSide
 from nexus.core.domain.order_types import ExecutionMode, OrderType
 from nexus.core.validator.pipeline_models import InstanceState
+from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
 from nexus.instance_config import InstanceConfig as NexusInstanceConfig
 from nexus.strategy.action import Action, ActionType
 
 from backtest_simulator.honesty import build_validation_pipeline
-from backtest_simulator.launcher.action_submitter import build_action_submitter
+from backtest_simulator.launcher.action_submitter import (
+    SubmitterBindings,
+    build_action_submitter,
+)
 
 
 class _OutboundStub:
     def __init__(self) -> None:
-        self.commands: list[Any] = []
+        self.commands: list[object] = []
 
-    def send_command(self, cmd: Any) -> str:
+    def send_command(self, cmd: object) -> str:
         self.commands.append(cmd)
         import uuid
         return str(uuid.uuid4())
 
-    def send_abort(self, **kwargs: Any) -> None:
+    def send_abort(self, **kwargs: object) -> None:
         pass
 
 
@@ -64,15 +67,24 @@ def test_sell_close_does_not_reserve_capital() -> None:
         capital_pool=Decimal('100000'),
     )
     state = InstanceState(capital=capital_state)
-    reservations_captured: list[Any] = []
+    reservations_captured: list[tuple[str, object, Action]] = []
 
-    def on_reservation(command_id: str, decision: Any, context: Any, action: Any) -> None:
+    def on_reservation(
+        command_id: str, decision: object, context: object, action: Action,
+    ) -> None:
+        del context
         reservations_captured.append((command_id, decision, action))
 
     submit = build_action_submitter(
-        nexus_config=NexusInstanceConfig(account_id='bts', venue='binance_spot_simulated'),
-        state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
-        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
+        SubmitterBindings(
+            nexus_config=NexusInstanceConfig(
+                account_id='bts', venue='binance_spot_simulated',
+            ),
+            state=state,
+            praxis_outbound=cast(PraxisOutbound, outbound),
+            validation_pipeline=pipeline,
+            strategy_budget=Decimal('100000'),
+        ),
         on_reservation=on_reservation,
     )
     submit([_sell_close_action()], 'long_on_signal')
@@ -100,9 +112,15 @@ def test_sell_close_still_fires_on_submit() -> None:
     state = InstanceState(capital=capital_state)
     submitted: list[str] = []
     submit = build_action_submitter(
-        nexus_config=NexusInstanceConfig(account_id='bts', venue='binance_spot_simulated'),
-        state=state, praxis_outbound=outbound,  # type: ignore[arg-type]
-        validation_pipeline=pipeline, strategy_budget=Decimal('100000'),
+        SubmitterBindings(
+            nexus_config=NexusInstanceConfig(
+                account_id='bts', venue='binance_spot_simulated',
+            ),
+            state=state,
+            praxis_outbound=cast(PraxisOutbound, outbound),
+            validation_pipeline=pipeline,
+            strategy_budget=Decimal('100000'),
+        ),
         on_submit=submitted.append,
     )
     submit([_sell_close_action()], 'long_on_signal')
