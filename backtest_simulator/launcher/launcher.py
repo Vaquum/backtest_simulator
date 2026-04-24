@@ -19,15 +19,14 @@ import polars as pl
 from limen import HistoricalData
 from nexus.core.domain.capital_state import CapitalState
 from nexus.core.domain.enums import OperationalMode
+from nexus.core.domain.instance_state import InstanceState
 from nexus.core.validator.pipeline_models import (
-    InstanceState,
     ValidationDecision,
     ValidationRequestContext,
 )
 from nexus.infrastructure.manifest import load_manifest
 from nexus.infrastructure.praxis_connector.praxis_inbound import PraxisInbound
 from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
-from nexus.infrastructure.praxis_connector.trade_outcome import TradeOutcome
 from nexus.infrastructure.state_store import StateStore
 from nexus.instance_config import InstanceConfig as NexusInstanceConfig
 from nexus.startup.sequencer import StartupSequencer
@@ -36,8 +35,10 @@ from nexus.strategy.action import Action
 from nexus.strategy.context import StrategyContext
 from nexus.strategy.predict_loop import PredictLoop
 from nexus.strategy.timer_loop import TimerLoop
+from praxis.core.domain.enums import OrderSide, OrderType
+from praxis.core.domain.trade_outcome import TradeOutcome
 from praxis.infrastructure.event_spine import EventSpine
-from praxis.infrastructure.venue_adapter import VenueAdapter
+from praxis.infrastructure.venue_adapter import SubmitResult, VenueAdapter
 from praxis.launcher import InstanceConfig, Launcher
 from praxis.trading_config import TradingConfig
 
@@ -169,8 +170,8 @@ class _LifecycleContext:
 
 def _check_tracker_match_required(
     pre_match_command_id: str | None,
-    side_arg: object,
-    client_order_id: object,
+    side: OrderSide,
+    client_order_id: str | None,
 ) -> None:
     """Raise when a BUY submit has no tracker match.
 
@@ -181,8 +182,7 @@ def _check_tracker_match_required(
     """
     if pre_match_command_id is not None:
         return
-    side_name = getattr(side_arg, 'name', str(side_arg))
-    if side_name != 'BUY':
+    if side.name != 'BUY':
         return
     msg = (
         f'capital lifecycle: BUY submit for '
@@ -197,35 +197,33 @@ def _check_tracker_match_required(
 
 def _maybe_inject_declared_stop(
     pre_match_command_id: str | None,
-    client_order_id: object,
-    kwargs: dict[str, object],
+    client_order_id: str | None,
+    stop_price: Decimal | None,
     tracker: CapitalLifecycleTracker,
     declared_stops: dict[str, Decimal],
-) -> dict[str, object]:
-    """Inject declared_stop_price into kwargs when present on the tracker.
+) -> Decimal | None:
+    """Return the stop_price to forward to `submit_order`.
 
     Praxis's `validate_trade_command` strips stop_price from MARKET
     orders before the command reaches here. We look up the command
     via its client_order_id and inject the honest declared stop so
     FillModel.apply_stop can enforce it during the trade walk.
     """
-    if pre_match_command_id is None or kwargs.get('stop_price') is not None:
-        return kwargs
+    if pre_match_command_id is None or stop_price is not None:
+        return stop_price
     declared_stop = tracker.declared_stop_for_command(pre_match_command_id)
     if declared_stop is None:
-        return kwargs
-    new_kwargs = dict(kwargs)
-    new_kwargs['stop_price'] = declared_stop
-    if isinstance(client_order_id, str):
+        return stop_price
+    if client_order_id is not None:
         declared_stops[client_order_id] = declared_stop
-    return new_kwargs
+    return declared_stop
 
 
-def _sum_fill_totals(result: object) -> tuple[Decimal, Decimal]:
+def _sum_fill_totals(result: SubmitResult) -> tuple[Decimal, Decimal]:
     """Sum the result's immediate_fills into (notional, fees)."""
     fill_notional = Decimal('0')
     fill_fees = Decimal('0')
-    for fill in getattr(result, 'immediate_fills', ()):
+    for fill in result.immediate_fills:
         fill_notional += Decimal(str(fill.qty)) * Decimal(str(fill.price))
         fill_fees += Decimal(str(fill.fee))
     return fill_notional, fill_fees
@@ -234,7 +232,7 @@ def _sum_fill_totals(result: object) -> tuple[Decimal, Decimal]:
 def _finalize_successful_fill(
     ctx: _LifecycleContext,
     command_id: str,
-    result: object,
+    result: SubmitResult,
     venue_order_id: str,
     status_name: str,
 ) -> None:
@@ -314,20 +312,33 @@ def _install_capital_adapter_wrapper(
         tracker=tracker, capital_state=capital_state, initial_pool=initial_pool,
     )
 
-    async def wrapped_submit(*args: object, **kwargs: object) -> object:
-        client_order_id = kwargs.get('client_order_id')
-        side_arg = args[2] if len(args) > 2 else kwargs.get('side')
+    async def wrapped_submit(
+        account_id: str, symbol: str, side: OrderSide, order_type: OrderType,
+        qty: Decimal, *,
+        price: Decimal | None = None,
+        stop_price: Decimal | None = None,
+        stop_limit_price: Decimal | None = None,
+        client_order_id: str | None = None,
+        time_in_force: str | None = None,
+    ) -> SubmitResult:
         pre_match_command_id = _match_command_id(tracker, client_order_id)
-        _check_tracker_match_required(pre_match_command_id, side_arg, client_order_id)
-        kwargs = _maybe_inject_declared_stop(
-            pre_match_command_id, client_order_id, kwargs, tracker, declared_stops,
+        _check_tracker_match_required(pre_match_command_id, side, client_order_id)
+        stop_price = _maybe_inject_declared_stop(
+            pre_match_command_id, client_order_id, stop_price,
+            tracker, declared_stops,
         )
         # If the original adapter raises mid-submit we MUST release
         # the capital reservation — otherwise the reservation stays
         # locked forever and the lifecycle tracker never pops it,
         # failing the `pending_count == 0` terminal check.
         try:
-            result = await original_submit(*args, **kwargs)
+            result = await original_submit(
+                account_id, symbol, side, order_type, qty,
+                price=price, stop_price=stop_price,
+                stop_limit_price=stop_limit_price,
+                client_order_id=client_order_id,
+                time_in_force=time_in_force,
+            )
         except Exception:
             if pre_match_command_id is not None:
                 tracker.record_rejection(pre_match_command_id, '')
@@ -345,9 +356,8 @@ def _install_capital_adapter_wrapper(
                 client_order_id, tracker.pending_count,
             )
             return result
-        status = getattr(result, 'status', None)
-        venue_order_id = getattr(result, 'venue_order_id', '')
-        status_name = getattr(status, 'name', '') if status is not None else ''
+        venue_order_id = result.venue_order_id
+        status_name = result.status.name
         if status_name == 'REJECTED':
             tracker.record_rejection(command_id, venue_order_id)
             assert_conservation(
@@ -367,7 +377,9 @@ def _install_capital_adapter_wrapper(
     setattr(adapter, 'submit_order', wrapped_submit)
 
 
-def _match_command_id(tracker: CapitalLifecycleTracker, client_order_id: object) -> str | None:
+def _match_command_id(
+    tracker: CapitalLifecycleTracker, client_order_id: str | None,
+) -> str | None:
     """Map Nexus's client_order_id back to the tracker's command_id.
 
     The Nexus form is `SS-<command_prefix>-<seq>`; we map it back to
@@ -378,7 +390,7 @@ def _match_command_id(tracker: CapitalLifecycleTracker, client_order_id: object)
     We match via the tracker's public `match_pending_by_prefix`
     accessor instead of reaching into `_pending`.
     """
-    if not isinstance(client_order_id, str):
+    if client_order_id is None:
         return None
     parts = client_order_id.split('-')
     if len(parts) < 3:
@@ -418,6 +430,14 @@ class BacktestLauncher(Launcher):
     apples-to-apples guarantee requires that production plumbing is the
     same plumbing the backtest drives.
     """
+
+    # Parent `Launcher` declares `_poller: MarketDataPoller | None`; the
+    # backtest substitutes a duck-typed `BacktestMarketDataPoller` (same
+    # public surface — `start`/`stop`/`running`/`get_market_data`/
+    # `add_kline_size`/`remove_kline_size`). Re-annotating on the
+    # subclass tells pyright the narrower runtime type so that
+    # `self._poller.start()` does not trip reportOptionalMemberAccess.
+    _poller: BacktestMarketDataPoller | None
 
     def __init__(
         self,
@@ -630,11 +650,26 @@ class BacktestLauncher(Launcher):
         self._nexus_running.set()
         self._stop_event.wait()
 
+        # `sequencer.start()` has returned, so `manifest` and
+        # `instance_state` are both populated — but the public
+        # properties are typed `| None` for the pre-start window. The
+        # None-guard is a runtime assertion that the invariant still
+        # holds; if it ever fails the shutdown path gets a concrete
+        # error instead of a downstream NoneType crash.
+        sequencer_manifest = sequencer.manifest
+        sequencer_state = sequencer.instance_state
+        if sequencer_manifest is None or sequencer_state is None:
+            msg = (
+                f'StartupSequencer did not populate manifest/state after '
+                f'start(): manifest={sequencer_manifest!r} '
+                f'state={sequencer_state!r}'
+            )
+            raise RuntimeError(msg)
         shutdown = ShutdownSequencer(
             runner=runner,
-            manifest=sequencer._manifest,
+            manifest=sequencer_manifest,
             state_store=state_store,
-            state=sequencer._state,
+            state=sequencer_state,
             strategy_state_path=inst.strategy_state_path or inst.state_dir / 'strategy_state',
             predict_loop=predict_loop,
             timer_loop=timer_loop,

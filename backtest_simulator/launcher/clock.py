@@ -21,11 +21,22 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 from freezegun import freeze_time
-from freezegun.api import FrozenDateTimeFactory
+from freezegun.api import (
+    FrozenDateTimeFactory,
+    StepTickTimeFactory,
+    TickingDateTimeFactory,
+)
 
 _log = logging.getLogger(__name__)
 
-_active_freezer: FrozenDateTimeFactory | None = None
+# freeze_time() yields a Union of three factory classes depending on
+# tick/auto_tick_seconds. We construct it with defaults (tick=False,
+# auto_tick_seconds=0) so the runtime value is always
+# FrozenDateTimeFactory — but pyright reads the declared Union from the
+# library signature, so the variable type must accept all three.
+_FreezerFactory = FrozenDateTimeFactory | StepTickTimeFactory | TickingDateTimeFactory
+
+_active_freezer: _FreezerFactory | None = None
 
 # ---- threading.Timer patch -------------------------------------------------
 #
@@ -107,7 +118,7 @@ setattr(threading.Timer, 'run', _frozen_aware_timer_run)
 
 
 @contextmanager
-def accelerated_clock(start: datetime) -> Iterator[FrozenDateTimeFactory]:
+def accelerated_clock(start: datetime) -> Iterator[_FreezerFactory]:
     """Freeze `datetime.now(UTC)` at `start`; engage the Timer-frozen wait.
 
     `real_asyncio=True` keeps asyncio's own sleep machinery using real

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
 import clickhouse_connect
 import polars as pl
+import pyarrow as pa
 from clickhouse_connect.driver.client import Client
 
 from backtest_simulator.feed.lookahead import (
@@ -96,7 +98,7 @@ class ClickHouseFeed:
         # Lazy connect so construction doesn't require the DB to be reachable.
         if self._client is not None:
             return self._client
-        self._client = clickhouse_connect.get_client(
+        self._client = _make_client(
             host=self._config.host,
             port=self._config.port,
             username=self._config.user,
@@ -141,7 +143,7 @@ class ClickHouseFeed:
         )
         start_str = _format_datetime64(start)
         end_str = _format_datetime64(end)
-        arrow = client.query_arrow(query, parameters={'start': start_str, 'end': end_str})
+        arrow = _query_arrow(client, query, parameters={'start': start_str, 'end': end_str})
         frame = pl.from_arrow(arrow)
         if not isinstance(frame, pl.DataFrame):
             msg = f'expected DataFrame from Arrow conversion, got {type(frame).__name__}'
@@ -182,3 +184,30 @@ def _format_datetime64(value: datetime) -> str:
         from datetime import UTC
         value = value.astimezone(UTC).replace(tzinfo=None)
     return value.strftime(_TRADES_DATETIME_FORMAT)
+
+
+# clickhouse_connect exposes `get_client` and `Client.query_arrow` via
+# `**kwargs`/un-annotated returns. Pyright marks any direct call site
+# as "partially unknown". These thin wrappers fix the function
+# signature at the boundary: we pass through only the named args we
+# actually use, so the call site itself is fully typed.
+def _make_client(
+    *, host: str, port: int, username: str, password: str, database: str,
+) -> Client:
+    return clickhouse_connect.get_client(
+        host=host, port=port, username=username,
+        password=password, database=database,
+    )
+
+
+def _query_arrow(
+    client: Client, query: str, *, parameters: Mapping[str, str],
+) -> pa.Table:
+    result = client.query_arrow(query, parameters=dict(parameters))
+    if not isinstance(result, pa.Table):
+        msg = (
+            f'ClickHouseFeed._query_arrow: expected pyarrow.Table '
+            f'from query_arrow, got {type(result).__name__}'
+        )
+        raise TypeError(msg)
+    return result

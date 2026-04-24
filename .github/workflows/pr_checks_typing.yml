@@ -93,22 +93,22 @@ jobs:
 
       - name: Plant py.typed markers in sibling libraries
         run: |
-          # Nexus / Praxis / Limen ship without py.typed, so pyright's
-          # reportMissingTypeStubs flags every import. They DO have
-          # type annotations in source (used internally), so once we
-          # mark them as typed pyright reads the source directly via
-          # useLibraryCodeForTypes (default true). This drops ~65
-          # reportMissingTypeStubs errors and a long tail of cascading
-          # reportUnknown* errors that flow from the unresolved
-          # member types.
+          # Nexus / Praxis / Limen / clickhouse_connect ship without
+          # py.typed, so pyright's reportMissingTypeStubs flags every
+          # import. They DO have type annotations in source (used
+          # internally), so once we mark them as typed pyright reads
+          # the source directly via useLibraryCodeForTypes (default
+          # true). This drops ~65 reportMissingTypeStubs errors and a
+          # long tail of cascading reportUnknown* errors that flow
+          # from the unresolved member types.
           #
           # The marker is a single empty `py.typed` file at the
           # package root; PEP 561 spec.
           set -euo pipefail
           python -c "
           import os, sys
-          import nexus, praxis, limen
-          for pkg in (nexus, praxis, limen):
+          import nexus, praxis, limen, clickhouse_connect
+          for pkg in (nexus, praxis, limen, clickhouse_connect):
               root = os.path.dirname(pkg.__file__)
               marker = os.path.join(root, 'py.typed')
               if not os.path.exists(marker):

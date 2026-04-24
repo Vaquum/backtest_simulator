@@ -13,17 +13,18 @@ from types import SimpleNamespace
 from typing import cast
 
 from nexus.core.domain.enums import OrderSide
+from nexus.core.domain.instance_state import InstanceState
 from nexus.core.domain.order_types import ExecutionMode as _NexusExecutionMode
 from nexus.core.domain.order_types import OrderType as _NexusOrderType
 from nexus.core.validator import ValidationPipeline
 from nexus.core.validator.pipeline_models import (
-    InstanceState,
     ValidationAction,
     ValidationDecision,
     ValidationRequestContext,
     ValidationStage,
 )
 from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
+from nexus.infrastructure.praxis_connector.trade_command import TradeCommand
 from nexus.infrastructure.praxis_connector.translate import translate_to_trade_command
 from nexus.instance_config import InstanceConfig as NexusInstanceConfig
 from nexus.strategy.action import Action, ActionType
@@ -49,15 +50,24 @@ _log = logging.getLogger(__name__)
 # as synonyms. Runs once at module import.
 def _install_nexus_enum_shim() -> None:
     module = importlib.import_module('praxis.core.validate_trade_command')
-    allowed: dict = module._ALLOWED_ORDER_TYPES
+    raw_allowed = getattr(module, '_ALLOWED_ORDER_TYPES')
+    if not isinstance(raw_allowed, dict):
+        msg = (
+            f'praxis.core.validate_trade_command._ALLOWED_ORDER_TYPES must '
+            f'be a dict, got {type(raw_allowed).__name__}'
+        )
+        raise TypeError(msg)
+    # Post-shim this dict holds both Praxis and Nexus enum keys + values
+    # as Enum synonyms, so `Enum` is the honest narrowest annotation.
+    allowed: dict[Enum, frozenset[Enum]] = raw_allowed
     praxis_by_name = {em.name: em for em in _PraxisExecutionMode}
-    order_name = {ot.name: ot for ot in _PraxisOrderType}
-    nexus_order_name = {ot.name: ot for ot in _NexusOrderType}
+    order_name: dict[str, Enum] = {ot.name: ot for ot in _PraxisOrderType}
+    nexus_order_name: dict[str, Enum] = {ot.name: ot for ot in _NexusOrderType}
     for nexus_em in _NexusExecutionMode:
         praxis_em = praxis_by_name[nexus_em.name]
         existing = allowed[praxis_em]
         names = {ot.name for ot in existing}
-        synonym_set = frozenset(
+        synonym_set: frozenset[Enum] = frozenset(
             {order_name[n] for n in names if n in order_name}
             | {nexus_order_name[n] for n in names if n in nexus_order_name},
         )
@@ -75,14 +85,20 @@ _install_nexus_enum_shim()
 # datetime before falling through to the original (which handles Decimal).
 def _install_fake_datetime_serializer_shim() -> None:
     module = importlib.import_module('praxis.infrastructure.event_spine')
-    original = module._serialize_default
+    original = getattr(module, '_serialize_default')
+    if not callable(original):
+        msg = (
+            f'praxis.infrastructure.event_spine._serialize_default must '
+            f'be callable, got {type(original).__name__}'
+        )
+        raise TypeError(msg)
 
     def _patched(obj: object) -> object:
         if isinstance(obj, datetime):
             return obj.isoformat()
         return original(obj)
 
-    module._serialize_default = _patched
+    setattr(module, '_serialize_default', _patched)
 
 
 _install_fake_datetime_serializer_shim()
@@ -142,29 +158,40 @@ def _convert_enum_field(field_name: str, value: object) -> object:
         return value
 
 
-def _extract_single_shot_price_fields(params: object) -> dict[str, object | None]:
+def _coerce_optional_decimal(value: object) -> Decimal | None:
+    """Coerce a params-field scalar to Decimal | None.
+
+    Praxis's SingleShotParams expects Decimal values. The strategy
+    template stores them as strings on `execution_params` (YAML
+    roundtrip), so we accept str/int/float/Decimal and return None
+    for None.
+    """
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (str, int, float)):
+        return Decimal(str(value))
+    msg = (
+        f'single-shot price field: expected Decimal|str|int|float|None, '
+        f'got {type(value).__name__}'
+    )
+    raise TypeError(msg)
+
+
+def _extract_single_shot_price_fields(params: object) -> dict[str, Decimal | None]:
     """Pull price/stop_price/stop_limit_price from a params object or dict."""
-    extracted: dict[str, object | None] = {
-        'price': None, 'stop_price': None, 'stop_limit_price': None,
-    }
+    raw: dict[str, object] = {'price': None, 'stop_price': None, 'stop_limit_price': None}
     if isinstance(params, Mapping):
-        for key in extracted:
-            extracted[key] = params.get(key)
+        for key in raw:
+            raw[key] = params.get(key)
     elif params is not None:
         # Nexus SingleShotParams or another params dataclass — copy
         # matching field values by name.
-        for key in extracted:
+        for key in raw:
             if hasattr(params, key):
-                extracted[key] = getattr(params, key)
-    # Praxis's SingleShotParams expects `Decimal` values. The strategy
-    # template stores them as strings on `execution_params` (YAML
-    # roundtrip), so coerce non-None scalars to Decimal. `None` passes
-    # through as "no limit / no stop".
-    for key in extracted:
-        value = extracted[key]
-        if value is not None and not isinstance(value, Decimal):
-            extracted[key] = Decimal(str(value))
-    return extracted
+                raw[key] = getattr(params, key)
+    return {key: _coerce_optional_decimal(value) for key, value in raw.items()}
 
 
 def _wrap_single_shot_params(attrs: dict[str, object]) -> None:
@@ -198,7 +225,7 @@ def _wrap_single_shot_params(attrs: dict[str, object]) -> None:
     attrs['declared_stop_price'] = declared_stop_price
 
 
-def _to_praxis_enums(cmd: object) -> object:
+def _to_praxis_enums(cmd: TradeCommand) -> TradeCommand:
     """Return a `SimpleNamespace` mirroring `cmd`'s fields with Praxis Enums.
 
     Nexus Enum values are swapped for Praxis Enums, and `execution_params`
@@ -208,14 +235,17 @@ def _to_praxis_enums(cmd: object) -> object:
     __post_init__` validator which insists on Nexus enums — the exact
     opposite of what we want. `SimpleNamespace` gives Praxis's
     `praxis_outbound.send_command` attribute-access parity with the
-    original dataclass and skips Nexus's own validation layer.
+    original dataclass and skips Nexus's own validation layer. The
+    SimpleNamespace carries the same public field surface as TradeCommand;
+    pyright sees the declared return type, Praxis sees duck-typed
+    attributes, runtime gets the relaxed dataclass.
     """
     attrs: dict[str, object] = {
         field.name: _convert_enum_field(field.name, getattr(cmd, field.name))
         for field in dataclasses.fields(cmd)
     }
     _wrap_single_shot_params(attrs)
-    return SimpleNamespace(**attrs)
+    return cast('TradeCommand', SimpleNamespace(**attrs))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -503,7 +533,7 @@ def _check_declared_stop(
 def _extract_symbol(action: Action) -> str:
     params = action.execution_params or {}
     raw = params.get('symbol')
-    return cast('str', raw) if isinstance(raw, str) else 'BTCUSDT'
+    return raw if isinstance(raw, str) else 'BTCUSDT'
 
 
 def _resolve_side(action: Action) -> OrderSide | None:

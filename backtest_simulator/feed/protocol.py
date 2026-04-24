@@ -19,6 +19,7 @@ class HistoricalFeed(Protocol):
         # Protocol stub — implementations supply the body. `del` keeps
         # vulture from flagging these Protocol-required parameters as unused.
         del symbol, kline_size, n_rows
+        raise NotImplementedError
 
     def get_trades(
         self, symbol: str, start: datetime, end: datetime,
@@ -33,3 +34,4 @@ class HistoricalFeed(Protocol):
         adapter's declared `trade_window_seconds`.
         """
         del symbol, start, end, venue_lookahead_seconds
+        raise NotImplementedError

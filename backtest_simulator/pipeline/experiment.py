@@ -29,14 +29,16 @@ FilterCriteria = dict[str, FilterValue]
 class ExperimentFile:
     """Loaded user experiment file with `params()` and `manifest()` callables.
 
-    `params()` returns the grid dict passed to `ParamDomain`.
+    `params()` returns the grid dict passed to `ParamDomain` — Limen
+    requires `dict[str, list[object]]` (value-lists over which the
+    search strategy grids).
     `manifest()` returns the experiment manifest Limen consumes; its exact
     shape belongs to Limen, so we carry it as `object` and hand it through.
     """
 
     source_path: Path
     module: ModuleType
-    params: Callable[[], dict[str, object]]
+    params: Callable[[], dict[str, list[object]]]
     manifest: Callable[[], object]
 
 
@@ -73,14 +75,42 @@ class ExperimentPipeline:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        params_fn = getattr(module, 'params', None)
-        manifest_fn = getattr(module, 'manifest', None)
-        if not callable(params_fn) or not callable(manifest_fn):
+        params_fn_raw = getattr(module, 'params', None)
+        manifest_fn_raw = getattr(module, 'manifest', None)
+        if not callable(params_fn_raw) or not callable(manifest_fn_raw):
             msg = (
                 f'experiment file {source_path} must define callable '
                 '`params` and `manifest` at module level'
             )
             raise ValueError(msg)
+
+        def params_fn() -> dict[str, list[object]]:
+            result = params_fn_raw()
+            if not isinstance(result, dict):
+                msg = (
+                    f'experiment file {source_path}: params() must return '
+                    f'dict[str, list[object]], got {type(result).__name__}'
+                )
+                raise TypeError(msg)
+            typed: dict[str, list[object]] = {}
+            for key, value in result.items():
+                if not isinstance(key, str):
+                    msg = (
+                        f'experiment file {source_path}: params() keys must '
+                        f'be str, got {type(key).__name__}={key!r}'
+                    )
+                    raise TypeError(msg)
+                if not isinstance(value, list):
+                    msg = (
+                        f'experiment file {source_path}: params()[{key!r}] '
+                        f'must be a list, got {type(value).__name__}'
+                    )
+                    raise TypeError(msg)
+                typed[key] = list(value)
+            return typed
+
+        def manifest_fn() -> object:
+            return manifest_fn_raw()
 
         return ExperimentFile(
             source_path=source_path, module=module,
@@ -115,11 +145,7 @@ class ExperimentPipeline:
             sfd=self._sfd, search_strategy=strategy,
             experiment_dir=self._experiment_dir,
         )
-        uel.run(
-            experiment_name=experiment_name,
-            n_permutations=n_permutations,
-            resume=resume,
-        )
+        _run_uel(uel, experiment_name, n_permutations, resume=resume)
         _log.info(
             'experiment finished',
             extra={'dir': str(self._experiment_dir), 'n_permutations': n_permutations},
@@ -184,3 +210,25 @@ def _column_predicate(column: str, spec: FilterValue) -> pl.Expr:
     if isinstance(spec, (set, frozenset)):
         return col.is_in(list(spec))
     return col == spec
+
+
+def _run_uel(
+    uel: UniversalExperimentLoop,
+    experiment_name: str,
+    n_permutations: int,
+    *,
+    resume: bool,
+) -> None:
+    """Call `uel.run(...)` with the MSQ triplet we exercise.
+
+    Limen's `UEL.run` signature uses bare `Callable | None` / `dict | None`
+    parameters; referring to it directly at the call site flags as
+    "type of 'run' is partially unknown". Wrapping the call here pins
+    the signature shape we actually use — positional-kwargs only, no
+    dict/Callable hooks — so the usage site is fully typed.
+    """
+    uel.run(
+        experiment_name=experiment_name,
+        n_permutations=n_permutations,
+        resume=resume,
+    )

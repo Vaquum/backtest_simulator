@@ -159,6 +159,10 @@ max-statements = 50
 # VenueAdapter Protocol signature (10 args). A helper-extraction
 # refactor would break the runtime_checkable isinstance() check.
 "backtest_simulator/venue/simulated.py" = ["PLR0913"]
+# launcher.py's `wrapped_submit` mirrors the 9-param Praxis Protocol
+# signature (it wraps SimulatedVenueAdapter.submit_order without
+# changing arity).
+"backtest_simulator/launcher/launcher.py" = ["PLR0913"]
 "tests/**/*.py" = [
   "S101", "ANN", "BLE001",
   "PLR0912", "PLR0913", "PLR0915",

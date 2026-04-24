@@ -73,6 +73,11 @@ EXPECTED_RUFF_POLICY: Final[dict[str, object]] = {
         # pattern would break the isinstance() check. Exempt this
         # single file from PLR0913 (max-args=6).
         'backtest_simulator/venue/simulated.py': ['PLR0913'],
+        # Same Protocol-conformance reason for launcher.py's
+        # `wrapped_submit` — it mirrors the 9-param submit_order
+        # signature exactly so it can replace the adapter's method
+        # via setattr without breaking the Protocol.
+        'backtest_simulator/launcher/launcher.py': ['PLR0913'],
     },
 }
 

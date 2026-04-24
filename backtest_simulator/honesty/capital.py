@@ -23,12 +23,10 @@ from dataclasses import dataclass
 from decimal import Decimal
 from threading import Lock
 
+from nexus.core.capital_controller.capital_controller import CapitalController
 from nexus.core.domain.capital_state import CapitalState
 from nexus.core.validator import ValidationPipeline
-from nexus.core.validator.capital_stage import (
-    CapitalController,
-    validate_capital_stage,
-)
+from nexus.core.validator.capital_stage import validate_capital_stage
 from nexus.core.validator.pipeline_models import (
     ValidationDecision,
     ValidationRequestContext,

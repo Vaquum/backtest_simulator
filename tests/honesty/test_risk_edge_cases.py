@@ -136,3 +136,38 @@ def test_compute_r_short_style_stop_above_entry() -> None:
     )
     assert r_long == r_short
     assert r_long == Decimal('10')
+
+
+def test_compute_r_idempotent_repeated_calls() -> None:
+    # Calling compute_r repeatedly with the same inputs returns
+    # bit-exact equal Decimals every time. Decimal arithmetic IS
+    # deterministic; this test pins that no module-level state
+    # accidentally drifts the result.
+    entry = Decimal('70123.45')
+    stop = Decimal('69876.55')
+    qty = Decimal('0.123')
+    r1 = compute_r(entry_price=entry, declared_stop_price=stop, qty=qty)
+    r2 = compute_r(entry_price=entry, declared_stop_price=stop, qty=qty)
+    r3 = compute_r(entry_price=entry, declared_stop_price=stop, qty=qty)
+    assert r1 == r2 == r3
+    assert r1 is not None
+
+
+def test_rpertrade_distinct_orders_are_independent() -> None:
+    # Two RPerTrade instances with different client_order_ids must
+    # not share state. Frozen dataclasses already enforce immutability,
+    # but this test pins that the .r property is computed from each
+    # instance's own fields, not from a class-level cache.
+    a = RPerTrade(
+        client_order_id='SS-a-001', side='BUY',
+        entry_price=Decimal('100'), declared_stop_price=Decimal('90'),
+        qty=Decimal('1'),
+    )
+    b = RPerTrade(
+        client_order_id='SS-b-001', side='BUY',
+        entry_price=Decimal('200'), declared_stop_price=Decimal('195'),
+        qty=Decimal('2'),
+    )
+    assert a.r == Decimal('10')
+    assert b.r == Decimal('10')
+    assert a.client_order_id != b.client_order_id
