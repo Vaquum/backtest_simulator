@@ -27,6 +27,40 @@ The plan: drive the existing pipeline (UEL → ManifestBuilder → BacktestLaunc
 - [x] `r_per_trade` from declared stop (no virtual `stop_bps` denominator). *(`backtest_simulator/honesty/risk.py::compute_r`; surfaced per-trade in profile output.)*
 - [x] `is_maker` reflects real fill type, not hardcoded `False`. *(MARKET orders are always taker → `False` is correct; documented in `_walk_market` aggregation path. Follow-up for LIMIT maker orders lives with broader LIMIT support.)*
 - [ ] `SignalsTable` precompute layer + per-decoder split-alignment. *(Deferred — precompute module exists at `backtest_simulator/sensors/precompute.py`, split-alignment tests are already passing; full wiring into the live predict path defers to a follow-up slice with its own e2e budget review.)*
-- [x] 18 honesty gate tests + 5 mutation tests (per Issue #10 *Tests* table). *(52 tests pass in `tests/honesty/`: pre-existing conservation / determinism / lookahead / split-alignment / stop-enforcement + new capital-invariants + capital-lifecycle + risk, with 5 mutation tests.)*
+- [x] 75 honesty tests across 12 files in `tests/honesty/`. *(capital_invariants, capital_lifecycle, conservation, determinism, lookahead, risk, risk_edge_cases, split_alignment, stop_enforcement, sell_close_semantics, adapter_wrapper_paths. Mutations are inline, not separate files.)*
 - [x] `pr_checks_honesty` workflow added; live ruleset includes it as a required check. *(`.github/workflows/pr_checks_honesty.yml`, ruleset snapshot `.github/rulesets/main.json` updated.)*
-- [x] `bts sweep` CLI produces `<experiment_dir>/results_with_backtest.csv` with the full enriched column set. *(`backtest_simulator/cli.py::_cmd_sweep` → `build_enriched_table`; tested by producing the CSV against the profile's UEL output.)*
+- [x] `bts enrich` CLI joins `results.csv` with optional `backtest_results.parquet` into `results_with_backtest.csv`. *(`backtest_simulator/cli.py::_cmd_enrich` → `build_enriched_table`. `bts sweep` and `bts analyze` retained as aliases. Does NOT run a backtest sweep — only enriches existing results.)*
+
+## Not delivered — #10 MVC assertions still open
+
+These items from #10's MVC / Tests table are NOT shipped in this PR. Each requires its own follow-up slice:
+
+- [ ] `test_perf_gate_logreg_binary` — 1-year hourly replay < 10s wall time.
+- [ ] `test_prescient_strategy` — prescient strategy raises `LookAheadViolation`.
+- [ ] `test_inverse_prescient` — sign-flipped prescient posts catastrophic loss.
+- [ ] `test_shuffle_bars` — permuted-bar-order profit collapses to ≈0 after fees.
+- [ ] `test_on_save_purity` — `save → load → save` produces identical bytes.
+- [ ] `test_sanity_buy_hold` — return within ±5 bps of `(close−open)/open − fees`.
+- [ ] `test_sanity_random` — 1000 random seeds mean return 95% CI brackets 0.
+- [ ] `test_sanity_zero_trade` — zero-trading strategy emits no fills, no fees.
+- [ ] `test_sanity_maker_no_fill` — far-away maker orders never fill.
+- [ ] `test_sanity_over_trading` — over-trading models have mean R/trade < 0, PF < 1.
+- [ ] 5 separate `_mutation.py` files (perf, conservation, split-alignment, on-save, determinism).
+- [ ] `NexusRuntime` module (replaced by `launcher/` package — architectural deviation from #10).
+- [ ] `SimulationDriver` module (replaced by `BacktestLauncher` — architectural deviation from #10).
+- [ ] 3 integration test files (`test_end_to_end`, `test_cli_end_to_end`, `test_notebook_execution`).
+- [ ] 1 notebook (`sweep_and_analyze.ipynb`).
+
+## Not delivered — capability gaps acknowledged
+
+These were flagged by the operator as "must not defer" but remain unimplemented. Each requires dedicated design work beyond documentation fixes:
+
+- [ ] **Market impact model.** No own-order book impact; historical tape walked as-is. No gate on order-size vs concurrent trade volume.
+- [ ] **Passive maker-fill realism.** Limit orders get full qty at limit price on first cross. No queue position, no partial fills, no aggressor-size bound.
+- [ ] **Gap-risk on stops.** Fills at declared stop price on crossing, not `min(stop, first_crossing_trade_price)`. Optimistic for adverse gap scenarios.
+- [ ] **Statistical honesty (CPCV / DSR / PBO / SPA).** Zero code. `SignalsTable.lookup()` takes only `t: datetime` — no path_id, no purge, no embargo.
+- [ ] **R denominator gameability gate.** No ATR-based sanity check on stop distance. `stop = entry × 0.9999` is accepted.
+- [ ] **Parametric thresholds.** All test calibrations are hardcoded constants. No `pytest.param` / env-var override / paired calibration-proof tests.
+- [ ] **Book-gap instrumentation.** Maximum stop-cross-to-trade gap not reported per-run.
+- [ ] **Ledger parity vs Praxis.** No parity test asserting byte-identical event-spine output between backtest and paper-Praxis replay.
+- [ ] **Slippage model.** No slippage model calibrated on trade-stream price-move distribution.
