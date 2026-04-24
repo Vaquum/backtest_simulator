@@ -87,9 +87,18 @@ def _assert_bijection(limen_ids: set[object], backtest_ids: set[object]) -> None
     missing = limen_ids - backtest_ids
     extra = backtest_ids - limen_ids
     problems: list[str] = []
+    # `set[object]` is not directly sort()-comparable; sort by repr so
+    # the diagnostic order is stable regardless of the underlying cell
+    # type (polars values can be int, str, or extension types).
     if missing and backtest_ids:
-        problems.append(f'decoder(s) present in Limen results.csv but missing from backtest parquet: {sorted(missing)}')
+        problems.append(
+            f'decoder(s) present in Limen results.csv but missing from backtest parquet: '
+            f'{sorted(missing, key=repr)}',
+        )
     if extra:
-        problems.append(f'decoder(s) present in backtest parquet but not declared in Limen results.csv: {sorted(extra)}')
+        problems.append(
+            f'decoder(s) present in backtest parquet but not declared in Limen results.csv: '
+            f'{sorted(extra, key=repr)}',
+        )
     if problems:
         raise ValueError('; '.join(problems))

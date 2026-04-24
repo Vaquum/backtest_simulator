@@ -194,20 +194,27 @@ def _format_datetime64(value: datetime) -> str:
 def _make_client(
     *, host: str, port: int, username: str, password: str, database: str,
 ) -> Client:
-    return clickhouse_connect.get_client(
+    raw_client: object = clickhouse_connect.get_client(
         host=host, port=port, username=username,
         password=password, database=database,
     )
+    if not isinstance(raw_client, Client):
+        msg = (
+            f'ClickHouseFeed._make_client: expected Client instance, '
+            f'got {type(raw_client).__name__}'
+        )
+        raise TypeError(msg)
+    return raw_client
 
 
 def _query_arrow(
     client: Client, query: str, *, parameters: Mapping[str, str],
 ) -> pa.Table:
-    result = client.query_arrow(query, parameters=dict(parameters))
-    if not isinstance(result, pa.Table):
+    raw_result: object = client.query_arrow(query, parameters=dict(parameters))
+    if not isinstance(raw_result, pa.Table):
         msg = (
             f'ClickHouseFeed._query_arrow: expected pyarrow.Table '
-            f'from query_arrow, got {type(result).__name__}'
+            f'from query_arrow, got {type(raw_result).__name__}'
         )
         raise TypeError(msg)
-    return result
+    return raw_result

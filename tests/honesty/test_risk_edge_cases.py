@@ -212,3 +212,52 @@ def test_compute_r_extreme_small_qty_decimal_safe() -> None:
     assert r is not None
     assert r == Decimal('1000') * qty
     assert r > 0
+
+
+def test_compute_r_decimal_quantize_compatibility() -> None:
+    # The strategy quantizes qty to 5 decimal places (BTC step size).
+    # Pin that compute_r preserves the resulting Decimal precision
+    # without performing any internal rounding.
+    entry = Decimal('70123.456789')
+    stop = Decimal('69876.543211')
+    qty = Decimal('0.20424')
+    r = compute_r(entry_price=entry, declared_stop_price=stop, qty=qty)
+    assert r is not None
+    expected = (entry - stop) * qty
+    assert r == expected
+    # Prove no quantization happened internally — the result should
+    # carry the full Decimal precision, not be rounded to qty's
+    # decimal places.
+    assert r.as_tuple().exponent < 0  # has fractional component
+
+
+def test_compute_r_with_high_precision_btc_distance() -> None:
+    # BTC at 100k USD with a 0.01% stop distance = $10. At 0.5 BTC
+    # qty, R = $5. The Decimal arithmetic must produce exactly 5.0,
+    # not 4.999999... from float roundoff. Pin this against any
+    # future helper rewrite that accidentally bridges through float.
+    entry = Decimal('100000')
+    stop = Decimal('99990')
+    qty = Decimal('0.5')
+    r = compute_r(entry_price=entry, declared_stop_price=stop, qty=qty)
+    assert r == Decimal('5')
+
+
+def test_compute_r_distance_dominates_qty_signal() -> None:
+    # Two trades with identical stop distance but different qty
+    # produce R values in proportion to qty. Pin the linear scaling
+    # so a future rewrite can't accidentally apply a non-linear
+    # transform on qty.
+    distance = Decimal('100')
+    a = compute_r(
+        entry_price=Decimal('1000'),
+        declared_stop_price=Decimal('900'),
+        qty=Decimal('1'),
+    )
+    b = compute_r(
+        entry_price=Decimal('1000'),
+        declared_stop_price=Decimal('900'),
+        qty=Decimal('5'),
+    )
+    assert a == distance
+    assert b == distance * Decimal('5')

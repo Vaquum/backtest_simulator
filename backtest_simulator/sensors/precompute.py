@@ -12,6 +12,21 @@ import polars as pl
 from backtest_simulator.exceptions import LookAheadViolation
 
 
+def _to_int(value: object) -> int:
+    """Narrow `object` to `int` with a clear error on type mismatch."""
+    if isinstance(value, bool):
+        # bool is a subclass of int but split_config values are
+        # genuine ints, not flags.
+        msg = f'_to_int: expected int, got bool {value!r}'
+        raise TypeError(msg)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str | float):
+        return int(value)
+    msg = f'_to_int: cannot narrow {type(value).__name__} to int'
+    raise TypeError(msg)
+
+
 @dataclass(frozen=True)
 class SignalRow:
     """One signal value at a timestamp, carrying the decoder's label span."""
@@ -118,19 +133,28 @@ class SignalsTable:
         metadata_path = directory / f'{decoder_id}.meta.json'
         metadata: dict[str, object] = json.loads(metadata_path.read_text(encoding='utf-8'))
         frame = pl.read_parquet(directory / f'{decoder_id}.parquet')
-        split_config_raw = metadata['split_config']
-        if not isinstance(split_config_raw, list) or len(split_config_raw) != 3:
+        split_config_raw: object = metadata['split_config']
+        if not isinstance(split_config_raw, list):
+            msg = (
+                f'SignalsTable.load: expected list for split_config '
+                f'in {metadata_path}, got {type(split_config_raw).__name__}'
+            )
+            raise ValueError(msg)
+        # `list` after isinstance is `list[Unknown]`; widen each cell
+        # via _to_int() which validates and narrows from object → int.
+        split_config_typed: list[object] = list(split_config_raw)
+        if len(split_config_typed) != 3:
             msg = (
                 f'SignalsTable.load: expected 3-element list for split_config '
-                f'in {metadata_path}, got {split_config_raw!r}'
+                f'in {metadata_path}, got {len(split_config_typed)} elements'
             )
             raise ValueError(msg)
         return cls(
             decoder_id=decoder_id,
             split_config=(
-                int(split_config_raw[0]),
-                int(split_config_raw[1]),
-                int(split_config_raw[2]),
+                _to_int(split_config_typed[0]),
+                _to_int(split_config_typed[1]),
+                _to_int(split_config_typed[2]),
             ),
             frame=frame,
         )

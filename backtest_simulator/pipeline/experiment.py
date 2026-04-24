@@ -4,7 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -92,26 +92,25 @@ class ExperimentPipeline:
                     f'dict[str, list[object]], got {type(result).__name__}'
                 )
                 raise TypeError(msg)
+            # `result.items()` returns Unknown pairs after narrowing;
+            # widen to a typed mapping so .items() yields object pairs.
+            typed_result: Mapping[object, object] = result
             typed: dict[str, list[object]] = {}
-            # `result` is dict[Unknown, Unknown] from pyright's view;
-            # cast each key/value at the boundary so the typed map
-            # below reads as dict[str, list[object]] without `Any`.
-            for raw_key, raw_value in result.items():
-                key: object = raw_key
-                value: object = raw_value
-                if not isinstance(key, str):
+            for raw_key, raw_value in typed_result.items():
+                if not isinstance(raw_key, str):
                     msg = (
                         f'experiment file {source_path}: params() keys must '
-                        f'be str, got {type(key).__name__}={key!r}'
+                        f'be str, got {type(raw_key).__name__}={raw_key!r}'
                     )
                     raise TypeError(msg)
-                if not isinstance(value, list):
+                if not isinstance(raw_value, list):
                     msg = (
-                        f'experiment file {source_path}: params()[{key!r}] '
-                        f'must be a list, got {type(value).__name__}'
+                        f'experiment file {source_path}: params()[{raw_key!r}] '
+                        f'must be a list, got {type(raw_value).__name__}'
                     )
                     raise TypeError(msg)
-                typed[key] = list(value)
+                value_list: list[object] = list(raw_value)
+                typed[raw_key] = value_list
             return typed
 
         def manifest_fn() -> object:
@@ -171,9 +170,10 @@ class ExperimentPipeline:
         parsed: list[dict[str, object]] = []
         for s in df['round_params']:
             if isinstance(s, str):
-                obj = json.loads(s)
+                obj: object = json.loads(s)
                 if isinstance(obj, dict):
-                    parsed.append({str(k): v for k, v in obj.items()})
+                    typed_obj: Mapping[object, object] = obj
+                    parsed.append({str(k): v for k, v in typed_obj.items()})
                 else:
                     parsed.append({})
             else:
