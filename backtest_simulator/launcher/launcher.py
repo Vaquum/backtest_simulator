@@ -1,6 +1,7 @@
 """BacktestLauncher — real praxis.launcher.Launcher subclass, historical seams."""
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import logging
@@ -45,17 +46,68 @@ _NEXUS_RUN_TIMEOUT_SECONDS = 120
 _POLL_INTERVAL_SECONDS = 0.05
 _REAL_TIME_CAP_SECONDS = 600
 _SHUTDOWN_TIMEOUT_SECONDS = 30
-# 60s frozen + 0.01s real per main tick. KNOWN TRADE-OFF: at 0.01s pause
-# the asyncio account_loop's `_QUEUE_POLL_INTERVAL` (0.1s) is starved —
-# commands are accepted by `submit_command` but never dispatched to the
-# adapter, leaving `orders=0` at the adapter. Bumping pause to 0.1s
-# closes the gap but makes the 8h-window run ~50s. The principled fix
-# (Issue #10 invariant #14) is a synchronous drain after every submit:
-# the Driver yields to asyncio in a tight poll on the outcome queue
-# until every submitted command_id has been observed, before advancing
-# the frozen clock. Pending that fix, choose tradeoff with this constant.
-_CLOCK_TICK_SECONDS = timedelta(seconds=60)
+
+# Capture `time.monotonic` at module load — BEFORE any `freeze_time`
+# block could patch it — so the real monotonic reference survives the
+# freeze. `asyncio.BaseEventLoop.time` defaults to `time.monotonic`,
+# which under freezegun returns frozen monotonic; that makes every
+# `asyncio.sleep(delay)` callback scheduled for `frozen_now + delay`
+# wait against a loop.time that stays at `frozen_now` forever — the
+# deadline never passes, the sleep never fires. Rebinding `loop.time`
+# to this captured real clock keeps the asyncio scheduler on real
+# wall time, regardless of what freezegun has patched globally.
+_REAL_MONOTONIC = time.monotonic
+# Main clock tick: 120 frozen seconds per iteration with a real-time
+# yield so the asyncio account_loop + Timer threads get CPU between
+# ticks. Strategy sklearn inference (~50ms real) keeps main ticking
+# during that window; the tinier the pause, the bigger the frozen-time
+# drift per strategy tick (drift ≈ sklearn_time × tick_seconds / pause).
+# With 120s ticks at 0.01s pause, drift is ~600s = 10 min per tick —
+# small enough that PredictLoop Timer firings still land at the intended
+# frozen schedule, and the decoder's proven `preds 0→1→0→1` transition
+# cluster on the 14:00-04:00 window fires cleanly. 120s also halves the
+# main iteration count vs 60s ticks, cutting clock-advance real time
+# from ~8.4s to ~4.2s on a 14h window — the biggest single lever to
+# keep the e2e profile inside the 10s budget.
+_CLOCK_TICK_SECONDS = timedelta(seconds=120)
 _CLOCK_TICK_REAL_PAUSE_SECONDS = 0.01
+# Drain settings: Praxis's account_loop polls its queue every 0.1s. The
+# drain wakes up at 0.02s granularity to catch fresh dispatches with
+# minimal delay after they complete; it bounds total drain real time so
+# a stuck command can't run the 10s budget into the ground.
+_DRAIN_POLL_INTERVAL_SECONDS = 0.02
+# Drain must stay well inside the 10s total e2e budget. 1.5s is enough
+# for `_process_command` to complete its ClickHouse round-trip
+# (`query_order_book` for slippage + `submit_order` walking the trade
+# window) even on a slow network. Anything longer is a real bug — the
+# whole run aborts so the operator sees the failure on the next line,
+# instead of letting frozen-minute ticks each spend seconds on drain
+# and silently blow the budget into the minutes.
+_DRAIN_TIMEOUT_SECONDS = 1.5
+
+
+class DrainTimeoutError(RuntimeError):
+    """Raised when a submitted command doesn't dispatch to the venue.
+
+    Carries the per-account diagnostic so the e2e log surfaces the exact
+    state (command queue size, async task's current await, etc.) at the
+    moment of failure. The backtest then unwinds cleanly instead of
+    spinning on repeat-warnings for the rest of the frozen window.
+    """
+
+
+def _wipe_event_spine_artifacts(db_path: Path) -> None:
+    """Remove the sqlite db + WAL/SHM siblings if they exist.
+
+    Left-over WAL/SHM from a previously hard-killed process can hold a
+    lock that blocks new writes ("database is locked"). A backtest is
+    meant to produce an event trail for THIS run only, so we wipe the
+    slate deterministically. `missing_ok=True` on `unlink` keeps this
+    idempotent across first-run and re-run.
+    """
+    for suffix in ('', '-wal', '-shm'):
+        target = db_path if suffix == '' else db_path.with_name(db_path.name + suffix)
+        target.unlink(missing_ok=True)
 
 
 class BacktestLauncher(Launcher):
@@ -86,6 +138,17 @@ class BacktestLauncher(Launcher):
         db_path: Path | None = None,
         historical_data: HistoricalData | None = None,
     ) -> None:
+        # A backtest run is one window, one set of events — not a live
+        # service that needs durable state across processes. Starting
+        # from a fresh EventSpine sqlite prevents `sqlite3.OperationalError:
+        # database is locked` when a prior run left the WAL/SHM sidecars
+        # in a half-open state (e.g. after a hard kill). The `db_path`
+        # parent directory is preserved; only the db file + `-wal`/`-shm`
+        # siblings are removed. A pre-built `event_spine` takes precedence
+        # over `db_path`, so callers that truly want persistence can hand
+        # one in and opt out of the wipe.
+        if event_spine is None and db_path is not None:
+            _wipe_event_spine_artifacts(db_path)
         super().__init__(
             trading_config=trading_config,
             instances=instances,
@@ -95,6 +158,15 @@ class BacktestLauncher(Launcher):
             healthz_port=None,
         )
         self._historical_data = historical_data or HistoricalData()
+        # Synchronous-drain counters. `_submitted_commands` is bumped by
+        # the action_submitter's `on_submit` callback after every
+        # successful `praxis_outbound.send_command`; the main clock loop
+        # then blocks until the venue adapter has delivered an equal
+        # number of orders (filled, partial, or rejected) before
+        # advancing the next frozen tick.
+        self._submitted_commands = 0
+        self._submit_lock = threading.Lock()
+        self._venue_adapter = venue_adapter
 
     def _start_poller(self) -> None:
         kline_intervals = self._resolve_kline_intervals_from_manifests()
@@ -195,6 +267,7 @@ class BacktestLauncher(Launcher):
         state = InstanceState(capital=CapitalState(capital_pool=Decimal('1000000')))
         action_submit = build_action_submitter(
             nexus_config=nexus_config, state=state, praxis_outbound=praxis_outbound,
+            on_submit=self._record_submitted_command,
         )
 
         def market_data_provider(kline_size: int) -> pl.DataFrame:
@@ -298,16 +371,56 @@ class BacktestLauncher(Launcher):
         self._wait_until_trading_ready()
         self._wait_until_all_nexus_running()
 
-        with accelerated_clock(start) as freezer:
-            self._advance_clock_until(end, freezer)
-            self.request_stop()
-        launch_thread.join(timeout=_SHUTDOWN_TIMEOUT_SECONDS)
-        if launch_thread.is_alive():
+        # Under `freeze_time`, `time.monotonic` is patched to return the
+        # frozen monotonic clock. asyncio's event loop schedules callbacks
+        # via `loop.call_at(self.time() + delay, ...)`; when `loop.time`
+        # delegates to the patched monotonic, every sleep's deadline
+        # (`frozen_now + delay`) is compared against a loop time that
+        # stays at `frozen_now` forever — the deadline never passes, the
+        # sleep's callback never fires, and `_account_loop` hangs at
+        # `await asyncio.sleep(_QUEUE_POLL_INTERVAL)`. `freeze_time
+        # (real_asyncio=True)` is meant to cover this but doesn't on
+        # every freezegun version. We override `loop.time` explicitly
+        # with real monotonic; asyncio scheduling then advances in real
+        # wall time, independent of the frozen clock.
+        self._install_real_loop_time()
+        try:
+            with accelerated_clock(start) as freezer:
+                try:
+                    self._advance_clock_until(end, freezer)
+                finally:
+                    # Always request_stop so the launch thread exits,
+                    # even when the clock advancer raised (e.g. the
+                    # drain timed out). Without this, DrainTimeoutError
+                    # would leak while the launch thread keeps running
+                    # until the daemon shuts down — pushing the e2e
+                    # well past the 10s budget.
+                    self.request_stop()
+        finally:
+            launch_thread.join(timeout=_SHUTDOWN_TIMEOUT_SECONDS)
+            if launch_thread.is_alive():
+                msg = (
+                    f'backtest launch thread did not terminate within '
+                    f'{_SHUTDOWN_TIMEOUT_SECONDS}s of shutdown'
+                )
+                raise RuntimeError(msg)
+
+    def _install_real_loop_time(self) -> None:
+        # Must run AFTER the Praxis event loop exists (i.e. past
+        # `_wait_until_trading_ready`) and BEFORE `accelerated_clock`
+        # engages. The captured `time.monotonic` reference was bound at
+        # this module's import time — before any `freeze_time` block —
+        # so it's the genuine monotonic clock. Binding it onto the loop
+        # instance overrides the default `BaseEventLoop.time` which
+        # would otherwise look up `time.monotonic` dynamically (and be
+        # frozen under freezegun).
+        if self._loop is None:
             msg = (
-                f'backtest launch thread did not terminate within '
-                f'{_SHUTDOWN_TIMEOUT_SECONDS}s of shutdown'
+                '_install_real_loop_time: event loop not running yet; '
+                'call only after _wait_until_trading_ready'
             )
             raise RuntimeError(msg)
+        self._loop.time = _REAL_MONOTONIC  # type: ignore[method-assign]
 
     def _wait_until_trading_ready(self) -> None:
         # freezegun patches every public `time.*` clock (time.monotonic,
@@ -333,8 +446,130 @@ class BacktestLauncher(Launcher):
             )
             raise RuntimeError(msg)
 
-    @staticmethod
-    def _advance_clock_until(end: datetime, freezer: object) -> None:
+    def _record_submitted_command(self, command_id: str) -> None:
+        # Called by action_submitter's `on_submit` hook. The lock guards
+        # the counter only — actual drain coordination happens on the
+        # main clock thread in `_advance_clock_until`, which reads the
+        # counter and compares it to the adapter's delivered-order count.
+        del command_id
+        with self._submit_lock:
+            self._submitted_commands += 1
+
+    def _delivered_command_count(self) -> int:
+        # Every `adapter.submit_order` call terminates by assigning into
+        # `account.orders[venue_order_id]` — whether the order filled,
+        # partially filled, or was rejected (`record_rejection` writes
+        # the same dict). So the total across all accounts is the count
+        # of submit_order coroutines that have completed.
+        #
+        # We reach into the private `_accounts`/`_history` on the
+        # `SimulatedVenueAdapter` rather than inventing a new public
+        # accessor — the drain is a backtest-internal coordination and
+        # the adapter class is a concrete backtest class, not a real
+        # venue.
+        adapter = self._venue_adapter
+        active = getattr(adapter, '_accounts', {})
+        history = getattr(adapter, '_history', {})
+        return sum(len(a.orders) for a in active.values()) + \
+               sum(len(a.orders) for a in history.values())
+
+    def _drain_pending_submits(self) -> None:
+        """Block until every submitted command_id has landed at the adapter.
+
+        Praxis's `account_loop` polls its submit queue on a 0.1s cadence,
+        then awaits `adapter.submit_order`. The main clock thread must
+        not advance frozen time past a submit that account_loop hasn't
+        yet dispatched — otherwise the adapter's trade-window lookahead
+        will miss the trades that would have filled the order.
+
+        Simply `time.sleep` between checks releases the GIL but does not
+        guarantee the asyncio event loop iterates. With heavy main-thread
+        clock ticking, account_loop can be starved by the scheduler. The
+        drain instead schedules a no-op coroutine onto Praxis's loop and
+        awaits its completion — that guarantees the loop reaches at
+        least one full iteration per drain cycle, which is enough for
+        account_loop to pick up the queued command and for
+        `adapter.submit_order` to write the resulting order entry.
+
+        A truly stuck command (adapter.submit_order raises into the task
+        and never stores an order) is bounded by `_DRAIN_TIMEOUT_SECONDS`
+        with a warning for the operator.
+        """
+        drain_start = os.times()[4]
+        while True:
+            with self._submit_lock:
+                submitted = self._submitted_commands
+            delivered = self._delivered_command_count()
+            if delivered >= submitted:
+                return
+            if os.times()[4] - drain_start > _DRAIN_TIMEOUT_SECONDS:
+                diag = self._praxis_queue_sizes()
+                msg = (
+                    f'drain timeout: submitted={submitted} delivered={delivered} '
+                    f'after {_DRAIN_TIMEOUT_SECONDS:.2f}s; praxis_state={diag}'
+                )
+                raise DrainTimeoutError(msg)
+            self._yield_to_loop_once()
+
+    def _yield_to_loop_once(self) -> None:
+        # Force the event loop to complete one iteration. `asyncio.sleep(0)`
+        # scheduled onto the loop returns only after the loop has run
+        # pending callbacks — which is when account_loop can wake from
+        # its `await asyncio.sleep(_QUEUE_POLL_INTERVAL)` and see the
+        # non-empty queue.
+        if self._loop is None:
+            time.sleep(_DRAIN_POLL_INTERVAL_SECONDS)
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(asyncio.sleep(0), self._loop)
+            fut.result(timeout=_DRAIN_POLL_INTERVAL_SECONDS)
+        except TimeoutError:
+            # Event loop hasn't iterated in `_DRAIN_POLL_INTERVAL_SECONDS`
+            # real — it's busy running something blocking. The next drain
+            # iteration will try again; the outer timeout bounds total
+            # wait. Don't sleep extra here because that would double the
+            # delay without giving the loop any new yield point.
+            _log.debug('yield-to-loop timed out; event loop busy')
+
+    def _praxis_queue_sizes(self) -> dict[str, dict[str, object]]:
+        # Per-account diagnostic. Reports, for each registered account,
+        # whether account_loop is alive or crashed, what its coroutine
+        # stack looks like (where it's currently awaiting), and the
+        # current sizes of the three queues it drains. This is the only
+        # way to tell apart:
+        #   - "cmd stuck in queue, account_loop never iterates"
+        #   - "account_loop task died silently"
+        #   - "account_loop spinning on ws_event_queue, never reaches cmd"
+        if self._trading is None:
+            return {}
+        exec_mgr = getattr(self._trading, '_execution_manager', None)
+        if exec_mgr is None:
+            return {}
+        accounts = getattr(exec_mgr, '_accounts', {})
+        out: dict[str, dict[str, object]] = {}
+        for aid, rt in accounts.items():
+            task = getattr(rt, 'task', None)
+            entry: dict[str, object] = {
+                'cmd_q': rt.command_queue.qsize(),
+                'ws_q': rt.ws_event_queue.qsize(),
+                'prio_q': rt.priority_queue.qsize(),
+            }
+            if task is not None:
+                entry['task_done'] = task.done()
+                if task.done():
+                    exc = task.exception() if not task.cancelled() else 'cancelled'
+                    entry['task_exc'] = repr(exc)
+                else:
+                    # Inspect where the task is currently suspended. Limit
+                    # stack depth so the log line stays readable.
+                    frames = task.get_stack(limit=3)
+                    entry['await_at'] = [
+                        f'{f.f_code.co_name}:{f.f_lineno}' for f in frames
+                    ]
+            out[aid] = entry
+        return out
+
+    def _advance_clock_until(self, end: datetime, freezer: object) -> None:
         # PredictLoop schedules its ticks via `threading.Timer`, whose
         # wait loop uses real monotonic time regardless of freezegun.
         # `accelerated_clock` patches `threading.Timer.run` to poll the
@@ -343,8 +578,8 @@ class BacktestLauncher(Launcher):
         # advance the frozen clock. Here we do: tick by
         # `_CLOCK_TICK_SECONDS` each iteration, pause briefly in real
         # time to let the Timer thread + strategy callbacks + venue
-        # adapter + reconciliation process the tick, repeat until the
-        # frozen window end.
+        # adapter + reconciliation process the tick, drain any pending
+        # submits, repeat until the frozen window end.
         real_start = os.times()[4]
         while datetime.now(UTC) < end:
             if os.times()[4] - real_start > _REAL_TIME_CAP_SECONDS:
@@ -356,3 +591,16 @@ class BacktestLauncher(Launcher):
                 return
             freezer.tick(_CLOCK_TICK_SECONDS)  # type: ignore[attr-defined]
             time.sleep(_CLOCK_TICK_REAL_PAUSE_SECONDS)
+            self._drain_pending_submits()
+        # Grace drain: frozen time drifts because multiple threads
+        # (main + per-Timer conditional-sleep) tick it concurrently, so
+        # the Timer chain can fire a last strategy tick at a frozen
+        # instant slightly past `end` — right as the main loop is
+        # exiting. Pause briefly for any such late tick to reach
+        # `send_command` (the strategy thread blocks on
+        # `future.result()` until the coroutine enqueues), then drain
+        # so the command lands at the venue adapter before we
+        # `request_stop`. Without this, the last ENTER/SELL of the
+        # window is lost and the trade summary undercounts.
+        time.sleep(_CLOCK_TICK_REAL_PAUSE_SECONDS)
+        self._drain_pending_submits()

@@ -41,19 +41,38 @@ def walk_trades(
 
 
 def _walk_market(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFilters) -> list[FillResult]:
+    # Aggregate the tape walk into ONE VWAP fill rather than emitting
+    # one FillResult per consumed tape tick. Two reasons:
+    #   1. Real venues return a handful of fills for a typical MARKET
+    #      order (one per price level hit on the book), not hundreds;
+    #      emitting one per tape tick overstates fill granularity.
+    #   2. Each FillResult generates a `FillReceived` event_spine append
+    #      in Praxis — 283 appends per order blows past any reasonable
+    #      drain budget. Aggregating keeps the backtest honest on total
+    #      cost/qty (VWAP preserves both) while staying realistic on
+    #      fill-event shape.
     remaining = order.qty
-    fills: list[FillResult] = []
+    consumed_qty = Decimal('0')
+    consumed_notional = Decimal('0')
+    last_time: datetime | None = None
     for row in window.iter_rows(named=True):
         if remaining <= 0:
             break
         take = min(remaining, Decimal(str(row['qty'])))
-        fills.append(FillResult(
-            fill_time=_ts(row['time']),
-            fill_price=filters.round_price(Decimal(str(row['price']))),
-            fill_qty=filters.round_qty(take), is_maker=False, reason='market_walk',
-        ))
+        px = Decimal(str(row['price']))
+        consumed_qty += take
+        consumed_notional += take * px
+        last_time = _ts(row['time'])
         remaining -= take
-    return fills
+    if consumed_qty == 0 or last_time is None:
+        return []
+    vwap = consumed_notional / consumed_qty
+    return [FillResult(
+        fill_time=last_time,
+        fill_price=filters.round_price(vwap),
+        fill_qty=filters.round_qty(consumed_qty),
+        is_maker=False, reason='market_vwap',
+    )]
 
 
 def _walk_limit(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFilters) -> list[FillResult]:

@@ -21,6 +21,16 @@ def _make_experiment_dir(tmp_path: Path) -> Path:
     return d
 
 
+def _spec() -> StrategyParamsSpec:
+    return StrategyParamsSpec(
+        symbol='BTCUSDT',
+        capital=Decimal('100000'),
+        kelly_pct=Decimal('10'),
+        estimated_price=Decimal('65000'),
+        stop_bps=Decimal('50'),
+    )
+
+
 def test_build_emits_valid_nexus_manifest(tmp_path: Path) -> None:
     exp = _make_experiment_dir(tmp_path)
     builder = ManifestBuilder(output_dir=tmp_path / 'out')
@@ -32,10 +42,7 @@ def test_build_emits_valid_nexus_manifest(tmp_path: Path) -> None:
         sensor=SensorBinding(
             experiment_dir=exp, permutation_ids=(1, 5), interval_seconds=3600,
         ),
-        strategy_params=StrategyParamsSpec(
-            symbol='BTCUSDT', enter_threshold=0.6,
-            stop_bps=Decimal('50'), qty=Decimal('0.001'),
-        ),
+        strategy_params=_spec(),
     )
     assert built.manifest_path.is_file()
     assert built.strategies_base_path.is_dir()
@@ -57,10 +64,7 @@ def test_manifest_round_trips_via_nexus_loader(tmp_path: Path) -> None:
         sensor=SensorBinding(
             experiment_dir=exp, permutation_ids=(1,), interval_seconds=3600,
         ),
-        strategy_params=StrategyParamsSpec(
-            symbol='BTCUSDT', enter_threshold=0.6,
-            stop_bps=Decimal('50'), qty=Decimal('0.001'),
-        ),
+        strategy_params=_spec(),
     )
     reloaded = load_manifest(built.manifest_path)
     assert reloaded.account_id == 'bts-acct-0'
@@ -83,10 +87,7 @@ def test_build_rejects_missing_experiment_dir(tmp_path: Path) -> None:
                 experiment_dir=tmp_path / 'missing',
                 permutation_ids=(1,), interval_seconds=3600,
             ),
-            strategy_params=StrategyParamsSpec(
-                symbol='BTCUSDT', enter_threshold=0.6,
-                stop_bps=Decimal('50'), qty=Decimal('0.001'),
-            ),
+            strategy_params=_spec(),
         )
 
 
@@ -110,16 +111,19 @@ def test_strategy_file_has_baked_params_substituted(tmp_path: Path) -> None:
             experiment_dir=exp, permutation_ids=(1,), interval_seconds=3600,
         ),
         strategy_params=StrategyParamsSpec(
-            symbol='BTCUSDT', enter_threshold=0.58,
-            stop_bps=Decimal('75'), qty=Decimal('0.002'),
-            side='BUY', prob_key='p_up',
+            symbol='BTCUSDT',
+            capital=Decimal('50000'),
+            kelly_pct=Decimal('7.5'),
+            estimated_price=Decimal('63250.5'),
+            stop_bps=Decimal('75'),
         ),
     )
     body = (built.strategies_base_path / 'long_on_signal.py').read_text(encoding='utf-8')
     assert '__BTS_PARAMS__' not in body, 'template placeholder was not substituted'
     assert '"symbol": "BTCUSDT"' in body
-    assert '"enter_threshold": 0.58' in body
-    assert '"prob_key": "p_up"' in body
+    assert '"capital": "50000"' in body
+    assert '"kelly_pct": "7.5"' in body
+    assert '"estimated_price": "63250.5"' in body
 
 
 def test_strategy_file_is_syntactically_valid_python(tmp_path: Path) -> None:
@@ -134,10 +138,7 @@ def test_strategy_file_is_syntactically_valid_python(tmp_path: Path) -> None:
         sensor=SensorBinding(
             experiment_dir=exp, permutation_ids=(1,), interval_seconds=3600,
         ),
-        strategy_params=StrategyParamsSpec(
-            symbol='BTCUSDT', enter_threshold=0.6,
-            stop_bps=Decimal('50'), qty=Decimal('0.001'),
-        ),
+        strategy_params=_spec(),
     )
     body = (built.strategies_base_path / 'long_on_signal.py').read_text(encoding='utf-8')
     # Parse must not raise — any substitution error would leave invalid Python.
@@ -159,13 +160,17 @@ def test_strategy_params_round_trip_to_yaml(tmp_path: Path) -> None:
             experiment_dir=exp, permutation_ids=(1,), interval_seconds=3600,
         ),
         strategy_params=StrategyParamsSpec(
-            symbol='BTCUSDT', enter_threshold=0.58, stop_bps=Decimal('75'),
-            qty=Decimal('0.002'), side='BUY', prob_key='p_up',
+            symbol='BTCUSDT',
+            capital=Decimal('50000'),
+            kelly_pct=Decimal('7.5'),
+            estimated_price=Decimal('63250.5'),
+            stop_bps=Decimal('75'),
         ),
     )
     data = yaml.safe_load(built.manifest_path.read_text(encoding='utf-8'))
     params = data['strategies'][0]['params']
     assert params['symbol'] == 'BTCUSDT'
-    assert params['enter_threshold'] == 0.58
+    assert params['capital'] == '50000'
+    assert params['kelly_pct'] == '7.5'
+    assert params['estimated_price'] == '63250.5'
     assert params['stop_bps'] == '75'
-    assert params['prob_key'] == 'p_up'

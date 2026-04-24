@@ -1,4 +1,4 @@
-"""Long-on-signal strategy template — `__BTS_PARAMS__` is substituted by ManifestBuilder."""
+"""Preds-based binary-regime, long-only template — `__BTS_PARAMS__` substituted by ManifestBuilder."""
 from __future__ import annotations
 
 import json
@@ -29,19 +29,30 @@ class _Config:
     # `sys.modules.get(cls.__module__).__dict__`.
 
     def __init__(
-        self, symbol: str, side: str, enter_threshold: float,
-        stop_bps: Decimal, qty: Decimal, prob_key: str,
+        self, symbol: str, capital: Decimal, kelly_pct: Decimal,
+        estimated_price: Decimal, stop_bps: Decimal,
     ) -> None:
         self.symbol = symbol
-        self.side = side
-        self.enter_threshold = enter_threshold
+        self.capital = capital
+        self.kelly_pct = kelly_pct
+        self.estimated_price = estimated_price
         self.stop_bps = stop_bps
-        self.qty = qty
-        self.prob_key = prob_key
 
 
 class Strategy(_StrategyBase):
-    """ENTER on probability > threshold; Nexus enforces stop via declared_stop_price.
+    """Binary regime on `_preds`, long-only, Kelly-sized from baked config.
+
+    State machine:
+      preds=1 AND flat  -> ENTER BUY  (size = capital * kelly_pct/100 / est_price)
+      preds=0 AND long  -> ENTER SELL (size = self._entry_qty recorded at ENTER)
+      preds=1 AND long  -> no-op
+      preds=0 AND flat  -> no-op
+
+    Kelly% comes from `backtest_mean_kelly_pct` of the selected decoder
+    (baked at manifest-build time). `estimated_price` is the ClickHouse
+    seed price at window start — the real fill price comes from the venue
+    adapter's next-trade walk, so the qty here is a sizing hint, not a
+    price promise.
 
     Class name is `Strategy` because Nexus's loader looks up that exact
     module attribute; the base is aliased `_StrategyBase` to avoid collision.
@@ -57,56 +68,75 @@ class Strategy(_StrategyBase):
         del params, context
         self._config = _Config(
             symbol=str(_BAKED_CONFIG['symbol']),
-            side=str(_BAKED_CONFIG.get('side', 'BUY')),
-            enter_threshold=float(_BAKED_CONFIG['enter_threshold']),
+            capital=Decimal(str(_BAKED_CONFIG['capital'])),
+            kelly_pct=Decimal(str(_BAKED_CONFIG['kelly_pct'])),
+            estimated_price=Decimal(str(_BAKED_CONFIG['estimated_price'])),
             stop_bps=Decimal(str(_BAKED_CONFIG['stop_bps'])),
-            qty=Decimal(str(_BAKED_CONFIG['qty'])),
-            prob_key=str(_BAKED_CONFIG.get('prob_key', 'probability')),
         )
-        _log.info('LongOnSignal startup', extra={'symbol': self._config.symbol})
+        # Fresh-start defaults; `on_load` overwrites if persisted state exists.
+        self._long: bool = False
+        self._entry_qty: Decimal = Decimal('0')
+        _log.info(
+            'LongOnSignal startup: symbol=%s capital=%s kelly_pct=%s est_price=%s',
+            self._config.symbol, self._config.capital,
+            self._config.kelly_pct, self._config.estimated_price,
+        )
         return []
 
     def on_signal(
         self, signal: Signal, params: StrategyParams, context: StrategyContext,
     ) -> list[Action]:
-        del params
-        _log.info('on_signal fired: values=%s', dict(signal.values))
-        prob = signal.values.get(self._config.prob_key)
-        if prob is None:
-            _log.info('signal missing prob_key %r; keys=%s',
-                      self._config.prob_key, list(signal.values))
+        del params, context
+        preds_raw = signal.values.get('_preds')
+        if preds_raw is None:
+            _log.info('signal missing _preds; keys=%s', list(signal.values))
             return []
-        if float(prob) < self._config.enter_threshold:
-            _log.info('prob %s below threshold %s', prob, self._config.enter_threshold)
-            return []
-        if any(p.symbol == self._config.symbol for p in context.positions):
-            return []
-        # Nexus's `produce_signal` doesn't include the current close in
-        # `signal.values` (it carries only the model's predict-dict output),
-        # so `reference_price` is intentionally None here. The venue
-        # adapter fills MARKET orders at the next-trade price from the
-        # historical stream regardless of what reference we pass — this
-        # keeps the strategy honest without requiring a synthesized
-        # close. A richer strategy would read the price from a side
-        # channel (context or a per-tick market_data provider).
-        side = OrderSide.BUY if self._config.side == 'BUY' else OrderSide.SELL
-        return [Action(
+        preds = int(preds_raw)
+        # `was_long` captures the PRIOR state so the log line is unambiguous —
+        # readers shouldn't have to infer whether `long=...` is pre- or
+        # post-transition. Transitions log their own ENTER BUY / ENTER SELL
+        # line below.
+        was_long = self._long
+        _log.info(
+            'on_signal fired: preds=%s probs=%s was_long=%s',
+            preds, signal.values.get('_probs'), was_long,
+        )
+        if preds == 1 and not was_long:
+            qty = (
+                self._config.capital * self._config.kelly_pct / Decimal('100')
+            ) / self._config.estimated_price
+            self._long = True
+            self._entry_qty = qty
+            _log.info('ENTER BUY: qty=%s was_long=False -> long=True', qty)
+            return [self._build_action(OrderSide.BUY, qty, signal)]
+        if preds == 0 and was_long:
+            qty = self._entry_qty
+            self._long = False
+            self._entry_qty = Decimal('0')
+            _log.info('ENTER SELL (exit long): qty=%s was_long=True -> long=False', qty)
+            return [self._build_action(OrderSide.SELL, qty, signal)]
+        return []
+
+    def _build_action(self, side: OrderSide, qty: Decimal, signal: Signal) -> Action:
+        del signal
+        return Action(
             action_type=ActionType.ENTER,
-            direction=side, size=self._config.qty,
+            direction=side, size=qty,
             execution_mode=ExecutionMode.SINGLE_SHOT,
             order_type=OrderType.MARKET,
             execution_params={
                 'symbol': self._config.symbol,
                 'stop_bps': str(self._config.stop_bps),
             },
-            # Deadline is a future epoch-ms timestamp; 60s from now gives
-            # the venue a reasonable window to fill before the order
-            # expires. The concrete value is less important than its
-            # presence — Nexus's ENTER validator requires a non-null.
-            deadline=int((signal.timestamp.timestamp() + 60) * 1000),
+            # `deadline` is a DURATION in seconds (not an epoch timestamp).
+            # Praxis computes the concrete deadline as
+            # `cmd.created_at + timedelta(seconds=timeout)`, where
+            # `timeout = action.deadline` via Nexus's praxis_outbound.
+            # 60s is a reasonable fill window for a backtest MARKET order.
+            deadline=60,
             trade_id=None, command_id=None,
             maker_preference=None, reference_price=None,
-        )]
+        )
 
     def on_outcome(
         self, outcome: TradeOutcome, params: StrategyParams, context: StrategyContext,
@@ -121,10 +151,15 @@ class Strategy(_StrategyBase):
         return []
 
     def on_load(self, data: bytes) -> None:
-        del data
+        if not data:
+            return
+        payload = json.loads(data.decode('utf-8'))
+        self._long = bool(payload['long'])
+        self._entry_qty = Decimal(str(payload['entry_qty']))
 
     def on_save(self) -> bytes:
-        return b''
+        payload = {'long': self._long, 'entry_qty': str(self._entry_qty)}
+        return json.dumps(payload).encode('utf-8')
 
     def on_shutdown(
         self, params: StrategyParams, context: StrategyContext,

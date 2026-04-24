@@ -1,4 +1,4 @@
-"""ClickHouseFeed — real trades from tdw.binance_trades_complete; klines via Limen."""
+"""ClickHouseFeed — real trades from `origo.binance_daily_spot_trades`; klines via Limen."""
 from __future__ import annotations
 
 import os
@@ -20,6 +20,13 @@ from backtest_simulator.feed.lookahead import (
 # at program start, caches it in `sys.modules` before any `freeze_time`
 # block can patch `datetime`.
 
+# `origo.binance_daily_spot_trades` stores BTCUSDT only — no `symbol`
+# column exists. ClickHouse's `DateTime64(6)` parameter binder rejects
+# ISO-T timestamps with `+00:00` tz suffix; we format explicitly as
+# `'%Y-%m-%d %H:%M:%S.%f'` (naive, microsecond precision) and the server
+# interprets it in UTC because the column is UTC-stored.
+_TRADES_DATETIME_FORMAT = '%Y-%m-%d %H:%M:%S.%f'
+
 
 @dataclass(frozen=True)
 class ClickHouseConfig:
@@ -29,7 +36,8 @@ class ClickHouseConfig:
     port: int
     user: str
     password: str
-    database: str = 'tdw'
+    database: str = 'origo'
+    trades_table: str = 'binance_daily_spot_trades'
 
     @classmethod
     def from_env(cls) -> ClickHouseConfig:
@@ -44,7 +52,8 @@ class ClickHouseConfig:
         port_raw = os.environ.get('CLICKHOUSE_PORT', '')
         user = os.environ.get('CLICKHOUSE_USER', '')
         password = os.environ.get('CLICKHOUSE_PASSWORD', '')
-        database = os.environ.get('CLICKHOUSE_DATABASE', 'tdw')
+        database = os.environ.get('CLICKHOUSE_DATABASE', 'origo')
+        trades_table = os.environ.get('CLICKHOUSE_TRADES_TABLE', 'binance_daily_spot_trades')
         if not host:
             missing.append('CLICKHOUSE_HOST')
         if not port_raw:
@@ -56,15 +65,22 @@ class ClickHouseConfig:
         if missing:
             msg = f'ClickHouseConfig.from_env: missing env vars: {", ".join(missing)}'
             raise RuntimeError(msg)
-        return cls(host=host, port=int(port_raw), user=user, password=password, database=database)
+        return cls(
+            host=host, port=int(port_raw), user=user, password=password,
+            database=database, trades_table=trades_table,
+        )
 
 
 class ClickHouseFeed:
-    """Trades feed backed by `tdw.binance_trades_complete`.
+    """Trades feed backed by `origo.binance_daily_spot_trades`.
 
-    Every `get_trades` call hits the view (archived + recent UNION) and
-    returns rows with `datetime BETWEEN start AND end`. Look-ahead guard
-    enforces `end <= frozen_now()` on every call.
+    Every `get_trades` call hits the table and returns rows with
+    `datetime BETWEEN start AND end`. Look-ahead guard enforces
+    `end <= frozen_now() + venue_lookahead_seconds` on every call.
+
+    The `origo.binance_daily_spot_trades` table stores BTCUSDT only, so
+    there is no `symbol` column to filter on — the `symbol` argument is
+    still accepted for provenance/assertions.
 
     Klines are NOT served here — use `limen.HistoricalData().get_spot_klines()`
     per the experiment pattern. Limen aggregates from the same Binance trade
@@ -113,14 +129,19 @@ class ClickHouseFeed:
         client = self._connect()
         # query_arrow pulls a columnar batch -> Polars in bulk. Row-by-row
         # conversion is O(N x Python-dispatch) and hits ~30s for an hour of
-        # ticks (~50K rows). Arrow is the bulk path.
+        # ticks (~50K rows). Arrow is the bulk path. `datetime` is
+        # DateTime64(6); clickhouse-connect's native datetime binder
+        # rejects timezone-aware inputs for DateTime64 — format the two
+        # bounds ourselves and bind them as strings.
         query = (
             'SELECT datetime, price, quantity, is_buyer_maker, trade_id '
-            f'FROM {self._config.database}.binance_trades_complete '
+            f'FROM {self._config.database}.{self._config.trades_table} '
             'WHERE datetime BETWEEN %(start)s AND %(end)s '
             'ORDER BY datetime, trade_id'
         )
-        arrow = client.query_arrow(query, parameters={'start': start, 'end': end})
+        start_str = _format_datetime64(start)
+        end_str = _format_datetime64(end)
+        arrow = client.query_arrow(query, parameters={'start': start_str, 'end': end_str})
         frame = pl.from_arrow(arrow)
         if not isinstance(frame, pl.DataFrame):
             msg = f'expected DataFrame from Arrow conversion, got {type(frame).__name__}'
@@ -131,17 +152,12 @@ class ClickHouseFeed:
                 'price': pl.Float64, 'qty': pl.Float64,
                 'is_buyer_maker': pl.Boolean, 'trade_id': pl.UInt64,
             })
-        # ClickHouse `DateTime` returns as UInt32 seconds via Arrow. Convert
-        # to tz-aware Datetime[μs, UTC] without `pl.from_epoch` because that
-        # pathway calls `datetime.fromtimestamp` internally, which freezegun
-        # patches — the patched call then stalls under a `freeze_time` block.
-        # Multiplying into microseconds and casting directly to the typed
-        # Datetime is fully numeric, touches no Python datetime object, and
-        # therefore the freezegun patch cannot interpose.
+        # `datetime` comes back as DateTime64(6) — Arrow timestamp[us]. We
+        # rename/retype via Polars without going through `pl.from_epoch`
+        # (that path calls `datetime.fromtimestamp` internally and stalls
+        # under an active `freeze_time` block).
         frame = frame.rename({'datetime': 'time', 'quantity': 'qty'}).with_columns(
-            (pl.col('time').cast(pl.Int64) * 1_000_000)
-                .cast(pl.Datetime('us', 'UTC'))
-                .alias('time'),
+            pl.col('time').cast(pl.Datetime('us', 'UTC')),
             pl.col('is_buyer_maker').cast(pl.Boolean),
             pl.col('trade_id').cast(pl.UInt64),
             pl.col('price').cast(pl.Float64),
@@ -152,3 +168,17 @@ class ClickHouseFeed:
             venue_lookahead_seconds=venue_lookahead_seconds,
         )
         return frame
+
+
+def _format_datetime64(value: datetime) -> str:
+    """Format a datetime for ClickHouse DateTime64(6) parameter binding.
+
+    `DateTime64(6)` rejects ISO-T with `+00:00`; we emit
+    `'%Y-%m-%d %H:%M:%S.%f'` which the server interprets as UTC.
+    Timezone-aware inputs are normalised to UTC first; naive inputs are
+    assumed UTC (caller's contract).
+    """
+    if value.tzinfo is not None:
+        from datetime import UTC
+        value = value.astimezone(UTC).replace(tzinfo=None)
+    return value.strftime(_TRADES_DATETIME_FORMAT)

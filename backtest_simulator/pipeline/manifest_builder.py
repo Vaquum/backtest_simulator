@@ -23,16 +23,26 @@ _TEMPLATES_DIR = Path(__file__).parent / '_strategy_templates'
 
 @dataclass(frozen=True)
 class StrategyParamsSpec:
-    """Runtime parameters the generated strategy will read from StrategyParams.raw."""
+    """Runtime parameters the generated strategy will read at on_startup.
+
+    Binary regime on `_preds`, long-only. Sizing is Kelly-fraction of capital:
+      qty = (capital * kelly_pct / 100) / estimated_price
+
+    `kelly_pct` is baked from the selected decoder's
+    `backtest_mean_kelly_pct` (a mean over the full decoder test period).
+    `estimated_price` is the seed price at window start — the real fill
+    price comes from the venue adapter's historical-trade walk.
+
+    `stop_bps` is kept in the spec for Part 2 honesty hardening
+    (declared-stop enforcement); the Part 1 path writes it into
+    `execution_params` but does not enforce it yet.
+    """
 
     symbol: str
-    enter_threshold: float
+    capital: Decimal
+    kelly_pct: Decimal
+    estimated_price: Decimal
     stop_bps: Decimal
-    qty: Decimal
-    side: str = 'BUY'
-    # Limen's Sensor.predict returns `_probs` (single binary class probability).
-    # `_extract_values` in Nexus carries that key through to `Signal.values`.
-    prob_key: str = '_probs'
 
 
 @dataclass(frozen=True)
@@ -89,11 +99,10 @@ class ManifestBuilder:
 
         raw_params = {
             'symbol': strategy_params.symbol,
-            'side': strategy_params.side,
-            'enter_threshold': strategy_params.enter_threshold,
+            'capital': str(strategy_params.capital),
+            'kelly_pct': str(strategy_params.kelly_pct),
+            'estimated_price': str(strategy_params.estimated_price),
             'stop_bps': str(strategy_params.stop_bps),
-            'qty': str(strategy_params.qty),
-            'prob_key': strategy_params.prob_key,
         }
         # Nexus's StrategySpec schema has no `params` field, and its
         # startup sequencer constructs `StrategyParams(raw={})` — there's
