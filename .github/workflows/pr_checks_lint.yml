@@ -24,7 +24,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          # Bumped from 3.11 → 3.12 to match the honesty gate. The
+          # `.[integration]` install pulls in vaquum-praxis which
+          # declares `requires-python>=3.12`. Keeping the lint gate on
+          # 3.11 would force a Python-version skew between the two
+          # workflows, with a lint coverage step that can't import the
+          # very package it's measuring.
+          python-version: '3.12'
       - name: Set up lint venv
         run: python -m venv .venv-lint
 
