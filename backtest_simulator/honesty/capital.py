@@ -202,8 +202,10 @@ class CapitalLifecycleTracker:
         venue_order_id: str,
         fill_notional: Decimal,
         fees: Decimal,
+        *,
+        release_residual: bool = False,
     ) -> None:
-        """Complete the lifecycle: `order_ack` → `order_fill`.
+        """Complete the lifecycle: `order_ack` → `order_fill` [→ `order_cancel` on terminal partial].
 
         In the backtest, `submit_order` returns fills synchronously so
         the ACK and the FILL collapse to the same handler call. We
@@ -211,6 +213,16 @@ class CapitalLifecycleTracker:
         fill — Nexus's capital state model expects working orders to
         pass through `working_order_notional` before becoming
         `position_notional`.
+
+        When the fill is a TERMINAL PARTIAL (the backtest's strict-live-
+        reality fill model halts MARKET walks on stop breach and returns
+        the pre-breach partial fill as the final result), pass
+        `release_residual=True`. The tracker then drives an extra
+        `order_cancel(venue_order_id)` after `order_fill` so the unfilled
+        residual's reservation is released back to available capital.
+        Without this, the CapitalController would keep the residual in
+        `working_order_notional` indefinitely and the ledger would
+        under-count available capital on every halted entry.
         """
         with self._lock:
             pending = self._pending.get(command_id)
@@ -251,6 +263,30 @@ class CapitalLifecycleTracker:
                         f'category={fill_result.category}'
                     )
                     raise RuntimeError(msg)
+            if release_residual and fill_notional < pending.notional:
+                # Terminal partial: the unfilled residual of the reserved
+                # notional stays in `working_order_notional` until we
+                # explicitly cancel. `order_cancel` pops the residual
+                # TrackedOrder from `_orders` and adds `remaining_total`
+                # back to available capital. Idempotent if the order was
+                # fully filled (order_fill already removed it).
+                cancel_result = self._controller.order_cancel(venue_order_id)
+                if not cancel_result.success:
+                    # Cancel is expected to succeed only when a working
+                    # residual exists. If it doesn't, the fill was
+                    # actually terminal-full — not an error condition.
+                    # We only raise on structural / invariant-breach
+                    # categories; EXPECTED_MISS (order already done)
+                    # is silently tolerated.
+                    if cancel_result.category.name != 'EXPECTED_MISS':
+                        msg = (
+                            f'CapitalController.order_cancel failed releasing '
+                            f'terminal-partial residual for '
+                            f'command_id={command_id} venue_order_id={venue_order_id}: '
+                            f'reason={cancel_result.reason!r} '
+                            f'category={cancel_result.category}'
+                        )
+                        raise RuntimeError(msg)
             self._pending.pop(command_id, None)
 
     def record_rejection(self, command_id: str, venue_order_id: str) -> None:

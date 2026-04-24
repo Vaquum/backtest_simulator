@@ -2,7 +2,9 @@
 
 Covers:
   - `CapitalOvershootError`: actual fill notional exceeds the reservation.
-  - `CapitalPartialFillError`: SubmitResult.status is PARTIALLY_FILLED.
+  - `PARTIALLY_FILLED` (strict-live-reality): the wrapper drives
+    `order_fill(partial) + order_cancel(residual)` to release the
+    unfilled reservation; ledger stays conservation-green.
   - Unmatched BUY client_order_id raises `RuntimeError` (honesty: every BUY
     MUST clear CAPITAL, a missing tracker match means a gate was bypassed).
   - `record_rejection` raises when the CapitalController's underlying
@@ -24,7 +26,6 @@ from backtest_simulator.honesty import (
 )
 from backtest_simulator.launcher.launcher import (
     CapitalOvershootError,
-    CapitalPartialFillError,
     _install_capital_adapter_wrapper,
 )
 
@@ -102,12 +103,29 @@ def test_overshoot_raises_capital_overshoot_error() -> None:
         ))
 
 
-def test_partially_filled_raises_capital_partial_fill_error() -> None:
+def test_partially_filled_releases_residual_reservation() -> None:
+    """PARTIALLY_FILLED drives order_fill(partial) + order_cancel(residual).
+
+    Under the strict-live-reality fill model, `_walk_market` halts
+    on stop breach and returns a partial fill. The wrapper must:
+      1. Record the ack.
+      2. Drive order_fill for the filled notional.
+      3. Cancel the residual so working_order_notional doesn't
+         permanently hold the unfilled reservation.
+
+    Mutation proof: if the wrapper skipped the order_cancel step,
+    `capital_state.working_order_notional` would remain at
+    (reserved - filled) > 0 after the submit, and
+    `capital_state.available` would be under-reported by that amount.
+    This test pins the expected-post-state invariants.
+    """
     _pipeline, _controller, capital_state = build_validation_pipeline(
         capital_pool=Decimal('100000'),
     )
     tracker = _tracker_with_pending(capital_state, notional=Decimal('1000'))
-    # SubmitResult with status=PARTIALLY_FILLED — must raise.
+    # SubmitResult with status=PARTIALLY_FILLED — filled qty 0.5 at 1000
+    # = 500 notional, reservation was 1000, so residual = 500 must
+    # release back to available.
     fills = [
         SimpleNamespace(qty=Decimal('0.5'), price=Decimal('1000'), fee=Decimal('1'))
     ]
@@ -121,12 +139,31 @@ def test_partially_filled_raises_capital_partial_fill_error() -> None:
         adapter=adapter, tracker=tracker, capital_state=capital_state,
         initial_pool=Decimal('100000'), declared_stops={},
     )
-    with pytest.raises(CapitalPartialFillError, match='PARTIALLY_FILLED'):
-        asyncio.run(adapter.submit_order(
-            'bts-acct', 'BTCUSDT', OrderSide.BUY,
-            SimpleNamespace(name='MARKET'), Decimal('1'),
-            client_order_id='SS-cmd1-000',
-        ))
+    # No exception should raise; the wrapper handles the partial as a
+    # terminal state with residual release.
+    asyncio.run(adapter.submit_order(
+        'bts-acct', 'BTCUSDT', OrderSide.BUY,
+        SimpleNamespace(name='MARKET'), Decimal('1'),
+        client_order_id='SS-cmd1-000',
+    ))
+    # Post-state invariants:
+    # - Tracker is clean: partial fills are terminal, no lingering lifecycle.
+    assert tracker.pending_count == 0, (
+        f'expected tracker pending_count=0 after PARTIALLY_FILLED, '
+        f'got {tracker.pending_count} — release path did not fire.'
+    )
+    # - working_order_notional is zero: no residual leak.
+    assert capital_state.working_order_notional == Decimal('0'), (
+        f'expected working_order_notional=0 after terminal partial '
+        f'(residual released via order_cancel), got '
+        f'{capital_state.working_order_notional}. Ledger under-count bug.'
+    )
+    # - position_notional reflects the filled portion (plus fees).
+    # The controller books fill_notional + actual_fees = 500 + 1 = 501.
+    assert capital_state.position_notional == Decimal('501'), (
+        f'expected position_notional=501 (500 fill + 1 fee), got '
+        f'{capital_state.position_notional}.'
+    )
 
 
 def test_unmatched_buy_raises_runtime_error() -> None:

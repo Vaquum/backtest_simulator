@@ -129,12 +129,18 @@ class CapitalOvershootError(RuntimeError):
 
 
 class CapitalPartialFillError(RuntimeError):
-    """Raised when a submit returns `PARTIALLY_FILLED`.
+    """Retained for import-compat; no longer raised by the wrapper.
 
-    Part 2 lifecycle expects terminal FILLED or REJECTED — the VWAP
-    MARKET walk produces one or the other. A PARTIALLY_FILLED status
-    means residual working-notional will remain after we pop the
-    lifecycle, silently under-counting committed capital.
+    Under the strict-live-reality fill model (`_walk_market` halts on
+    stop breach and returns a partial fill), `PARTIALLY_FILLED` is a
+    legitimate terminal status. The wrapper handles it by driving
+    `order_fill(partial_notional) + order_cancel(venue_order_id)` to
+    release the unfilled reservation residual back to available
+    capital. See `CapitalLifecycleTracker.record_ack_and_fill`'s
+    `release_residual` parameter. A future refinement may re-raise
+    this class only when the partial fill lacks a recognised reason
+    (tape exhaustion vs. stop halt), at which point the wrapper
+    should distinguish.
     """
 
 
@@ -242,9 +248,13 @@ def _finalize_successful_fill(
 ) -> None:
     """Fire record_sent + record_ack_and_fill with conservation checks.
 
-    Fails loud on capital overshoot or PARTIALLY_FILLED status — Part 2
-    honesty requires terminal FILLED/REJECTED only, and reservation
-    buffering must absorb any real slippage without silent capping.
+    Fails loud on capital overshoot. On `PARTIALLY_FILLED` — now a
+    legitimate terminal outcome under the strict-live-reality fill
+    model (MARKET walk halts on stop breach, returning partial fill)
+    — drives `record_ack_and_fill(release_residual=True)` so the
+    unfilled reservation is cancelled back to available capital.
+    Without release the ledger would under-count available capital
+    on every halted entry.
     """
     ctx.tracker.record_sent(command_id, venue_order_id)
     assert_conservation(
@@ -264,27 +274,27 @@ def _finalize_successful_fill(
             f'CAPITAL gating.'
         )
         raise CapitalOvershootError(msg)
-    if status_name == 'PARTIALLY_FILLED':
-        msg = (
-            f'PARTIALLY_FILLED command_id={command_id} venue_order_id='
-            f'{venue_order_id}: Part 2 lifecycle expects terminal '
-            f'FILLED or REJECTED. Partial residual working-notional '
-            f'would not be drained and the capital ledger would '
-            f'under-count. Investigate why the MARKET walk did not '
-            f'fully fill the order.'
+    release_residual = status_name == 'PARTIALLY_FILLED'
+    if release_residual:
+        _log.info(
+            'capital lifecycle: command_id=%s PARTIALLY_FILLED — '
+            'driving order_fill(%s) + order_cancel(%s) to release '
+            'unfilled reservation residual back to available capital.',
+            command_id, fill_notional, venue_order_id,
         )
-        raise CapitalPartialFillError(msg)
     ctx.tracker.record_ack_and_fill(
         command_id, venue_order_id, fill_notional, fill_fees,
+        release_residual=release_residual,
     )
     assert_conservation(
         ctx.capital_state, ctx.initial_pool,
         context=f'order_fill command_id={command_id}',
     )
     _log.info(
-        'capital lifecycle: command_id=%s reserve->send->ack->fill '
+        'capital lifecycle: command_id=%s reserve->send->ack->fill%s '
         'venue_order_id=%s fill_notional=%s fees=%s',
-        command_id, venue_order_id, fill_notional, fill_fees,
+        command_id, '+cancel' if release_residual else '',
+        venue_order_id, fill_notional, fill_fees,
     )
 
 
