@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 from praxis.launcher import InstanceConfig, Launcher
 
+from backtest_simulator.feed.protocol import HistoricalFeed
 from backtest_simulator.launcher import BacktestLauncher, BacktestMarketDataPoller
 
 
@@ -103,7 +105,10 @@ def test_launcher_rejects_both_event_spine_and_db_path() -> None:
             return pl.DataFrame()
 
     adapter = SimulatedVenueAdapter(
-        feed=_StubFeed(),  # type: ignore[arg-type]  # Protocol duck-typed stub
+        # `_StubFeed` duck-types HistoricalFeed — cast names the
+        # Protocol boundary explicitly instead of suppressing the
+        # assignment mismatch.
+        feed=cast(HistoricalFeed, _StubFeed()),
         filters=BinanceSpotFilters.binance_spot('BTCUSDT'),
         fees=FeeSchedule(),
     )
@@ -114,6 +119,9 @@ def test_launcher_rejects_both_event_spine_and_db_path() -> None:
     with pytest.raises(ValueError, match='exactly one'):
         BacktestLauncher(
             trading_config=tc, instances=[], venue_adapter=adapter,
-            event_spine=object.__new__(EventSpine),  # type: ignore[arg-type]
+            # `object.__new__(EventSpine)` yields a zombie EventSpine
+            # that only exists to drive the "exactly one of ES/db_path"
+            # guard — no methods called. cast() keeps the type explicit.
+            event_spine=cast(EventSpine, object.__new__(EventSpine)),
             db_path=Path('/tmp/x.sqlite'),
         )

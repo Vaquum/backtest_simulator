@@ -1,21 +1,24 @@
 """Pytest conftest: gracefully skip integration-dependent test modules.
 
-The lint gate's coverage step runs `pytest tests/` inside a lean
-`.venv-lint` that only installs `ruff`, `vulture`, `coverage`,
-`pytest`. Every test that transitively imports nexus / praxis / limen
-/ polars (i.e. most of this suite) would error on collection under
-that environment.
+Both the honesty gate (`pr_checks_honesty.yml`) and the lint gate
+(`pr_checks_lint.yml`) install `.[integration]`, so in CI the full
+suite runs in both places and `collect_ignore_glob` resolves to an
+empty list. The skip logic stays for two local-dev cases where the
+sibling libraries (nexus / praxis / limen / polars) may legitimately
+be absent:
 
-We make collection resilient by dropping the dep-heavy paths from
-`collect_ignore` when the required sibling libraries are missing.
-The honesty gate (`pr_checks_honesty.yml`) installs `.[integration]`
-so those paths are collected and executed there; the lint gate skips
-them and measures coverage only on whatever pure-Python tests CAN
-run without the deps — the coverage floor (50/45) was set with that
-reality in mind.
+  1. A contributor running `pytest tests/tools/` in a clean venv to
+     iterate on bloat-gate scripts, without installing the integration
+     extras.
+  2. Fork CI where the `SIBLING_INSTALL_TOKEN` secret is not
+     provisioned and the `.[integration]` install silently fails.
 
-An honesty check (`test_all_three_siblings_present_together`) at
-module-load guards against the silent-skip failure mode: if ANY of
+In both cases the dep-heavy paths (honesty/*, launcher/*, pipeline/*,
+integration/*) would error on collection, so we drop them from
+collection and let the pure-Python tests still run.
+
+An honesty check (`_ANY_SIBLING_PRESENT and not _ALL_SIBLINGS_PRESENT`)
+at module-load guards against the silent-skip failure mode: if ANY of
 the three libs is present we assert ALL are, so a partially-installed
 environment can't silently skip a subset.
 """

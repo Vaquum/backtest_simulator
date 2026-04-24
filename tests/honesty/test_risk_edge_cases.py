@@ -71,8 +71,12 @@ def test_rpertrade_immutable_frozen_dataclass() -> None:
         qty=Decimal('0.2'),
     )
     import dataclasses
+    # Use setattr() rather than direct attribute assignment so the
+    # frozen-dataclass test doesn't need a `# type: ignore` on the
+    # assignment. FrozenInstanceError is still raised by the dataclass-
+    # generated __setattr__.
     try:
-        r.entry_price = Decimal('80000')  # type: ignore[misc]
+        setattr(r, 'entry_price', Decimal('80000'))
     except dataclasses.FrozenInstanceError:
         pass
     else:

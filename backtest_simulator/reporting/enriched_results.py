@@ -28,6 +28,30 @@ ENRICHED_COLUMNS: Final[frozenset[str]] = frozenset({
     'per_path_profit_factor',
 })
 
+# Columns the backtest run contributes to the enriched table. The
+# missing-parquet path (see `build_enriched_table`) fills these with
+# nulls so downstream tooling sees a stable schema whether a backtest
+# ran or not. Types are pinned so the null columns cast to the same
+# dtypes the backtest would produce.
+_BACKTEST_COLUMN_DTYPES: Final[tuple[tuple[str, pl.DataType], ...]] = (
+    ('n_trades', pl.Int64()),
+    ('total_fees', pl.Float64()),
+    ('r_mean', pl.Float64()),
+    ('r_median', pl.Float64()),
+    ('profit_factor', pl.Float64()),
+    ('sum_pnl_net', pl.Float64()),
+    ('probs_var', pl.Float64()),
+    ('preds_long_share', pl.Float64()),
+    ('tradable', pl.Boolean()),
+    ('train_s', pl.Float64()),
+    ('backtest_wall_s', pl.Float64()),
+    ('window_start', pl.Utf8()),
+    ('window_end', pl.Utf8()),
+    ('n_paths', pl.Int64()),
+    ('per_path_r_mean', pl.Float64()),
+    ('per_path_profit_factor', pl.Float64()),
+)
+
 
 def build_enriched_table(
     experiment_dir: Path,
@@ -56,7 +80,17 @@ def build_enriched_table(
         else set[object]()
     )
     _assert_bijection(limen_ids, bt_ids)
-    joined = limen_results.join(bt, on='round_id', how='left') if not bt.is_empty() else limen_results
+    if not bt.is_empty():
+        joined = limen_results.join(bt, on='round_id', how='left')
+    else:
+        # No backtest parquet on disk: produce the stable enriched
+        # schema anyway with nulls in every backtest-contributed column.
+        # Downstream tooling must be able to read this CSV blind and
+        # get the same columns whether a backtest has run yet or not.
+        joined = limen_results.with_columns([
+            pl.lit(None, dtype=dtype).alias(name)
+            for name, dtype in _BACKTEST_COLUMN_DTYPES
+        ])
     if out_csv is not None:
         out_csv.parent.mkdir(parents=True, exist_ok=True)
         joined.write_csv(out_csv)

@@ -10,7 +10,7 @@ from typing import Final
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIR = REPO_ROOT / 'backtest_simulator'
 
-# 15.00 accommodates:
+# 16.00 accommodates:
 #   (a) Protocol-conformance files (SimulatedVenueAdapter implements the
 #       15-method praxis.infrastructure.venue_adapter.VenueAdapter Protocol;
 #       runtime_checkable isinstance() requires those methods to live on
