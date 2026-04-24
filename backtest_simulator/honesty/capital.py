@@ -159,6 +159,21 @@ class CapitalLifecycleTracker:
             entry = self._pending.get(command_id)
             return entry.notional if entry is not None else None
 
+    def match_pending_by_prefix(self, prefix: str) -> str | None:
+        """Return the pending command_id whose dash-stripped form
+        starts with `prefix`, or None.
+
+        The launcher's adapter wrapper uses this to match Praxis's
+        `SS-<command-prefix>-<seq>` client_order_id back to a full
+        command_id without reaching into the tracker's private
+        `_pending` dict.
+        """
+        with self._lock:
+            for command_id in self._pending:
+                if command_id.replace('-', '').startswith(prefix):
+                    return command_id
+        return None
+
     def record_sent(self, command_id: str, venue_order_id: str) -> None:
         """Transition reservation → in_flight via `send_order`."""
         with self._lock:
@@ -242,10 +257,12 @@ class CapitalLifecycleTracker:
         """Terminal reject: release the reservation back to the pool.
 
         Used when `SimulatedVenueAdapter.submit_order` returns status
-        `REJECTED` (filter violations, min-notional failures). Both
-        `order_reject` (if `send_order` was recorded) and
-        `release_reservation` (if it wasn't) are safe no-ops when the
-        tracker has no pending entry.
+        `REJECTED` (filter violations, min-notional failures) or when
+        the adapter raises mid-submit. The CapitalController's
+        release/reject call is checked against `LifecycleResult`;
+        a silent failure would leave the tracker "clean" but the
+        controller still holding the reservation — explicit
+        `RuntimeError` surfaces that.
         """
         with self._lock:
             pending = self._pending.pop(command_id, None)
@@ -256,9 +273,26 @@ class CapitalLifecycleTracker:
                 )
                 return
             if pending.sent:
-                self._controller.order_reject(venue_order_id)
+                result = self._controller.order_reject(venue_order_id)
+                if not result.success:
+                    msg = (
+                        f'CapitalController.order_reject failed for '
+                        f'command_id={command_id} venue_order_id={venue_order_id}: '
+                        f'reason={result.reason!r} category={result.category}'
+                    )
+                    raise RuntimeError(msg)
             else:
-                self._controller.release_reservation(pending.reservation_id)
+                result = self._controller.release_reservation(
+                    pending.reservation_id,
+                )
+                if not result.success:
+                    msg = (
+                        f'CapitalController.release_reservation failed for '
+                        f'command_id={command_id} reservation_id='
+                        f'{pending.reservation_id}: reason={result.reason!r} '
+                        f'category={result.category}'
+                    )
+                    raise RuntimeError(msg)
 
     @property
     def pending_count(self) -> int:

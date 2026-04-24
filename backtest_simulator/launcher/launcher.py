@@ -177,7 +177,23 @@ def _install_capital_adapter_wrapper(
         # inject the honest declared stop so FillModel.apply_stop
         # can enforce it during the trade walk.
         client_order_id = kwargs.get('client_order_id')
+        # Part 2 SELL-as-close convention: the action_submitter skips
+        # CAPITAL reservation for SELL actions (they are exits, not new
+        # reservations). Those show up here with side=SELL and no
+        # tracker entry — that's expected, not an error.
+        side_arg = args[2] if len(args) > 2 else kwargs.get('side')
+        side_name = getattr(side_arg, 'name', str(side_arg))
         pre_match_command_id = _match_command_id(tracker, client_order_id)
+        if pre_match_command_id is None and side_name == 'BUY':
+            msg = (
+                f'capital lifecycle: BUY submit for '
+                f'client_order_id={client_order_id!r} has no matching '
+                f'reservation in tracker. Part 2 honesty requires '
+                f'every BUY to clear the CAPITAL stage BEFORE dispatch; '
+                f'missing match means the action-submitter skipped the '
+                f'reservation OR the client_order_id format has changed.'
+            )
+            raise RuntimeError(msg)
         if pre_match_command_id is not None and kwargs.get('stop_price') is None:
             declared_stop = tracker.declared_stop_for_command(pre_match_command_id)
             if declared_stop is not None:
@@ -205,10 +221,11 @@ def _install_capital_adapter_wrapper(
         # hex chars of the command_id stripped of dashes.
         command_id = _match_command_id(tracker, client_order_id)
         if command_id is None:
-            _log.warning(
+            _log.info(
                 'capital lifecycle: no pending command matches '
-                'client_order_id=%s; pending_keys=%s',
-                client_order_id, list(tracker._pending.keys()),  # noqa: SLF001
+                'client_order_id=%s (expected for SELL exits); '
+                'pending_count=%d',
+                client_order_id, tracker.pending_count,
             )
             return result
         status = getattr(result, 'status', None)
@@ -297,8 +314,8 @@ def _match_command_id(tracker: 'CapitalLifecycleTracker', client_order_id: objec
 
     Nexus's `generate_client_order_id` takes the original `command_id`
     and strips dashes, then uses the first 16 hex chars as the prefix.
-    We match by checking whether any pending command_id starts with
-    that prefix when dashes are removed.
+    We match via the tracker's public `match_pending_by_prefix`
+    accessor instead of reaching into `_pending`.
     """
     if not isinstance(client_order_id, str):
         return None
@@ -306,11 +323,7 @@ def _match_command_id(tracker: 'CapitalLifecycleTracker', client_order_id: objec
     if len(parts) < 3:
         return None
     prefix = parts[1]
-    with tracker._lock:  # noqa: SLF001 - backtest-internal coordination
-        for command_id in tracker._pending:  # noqa: SLF001
-            if command_id.replace('-', '').startswith(prefix):
-                return command_id
-    return None
+    return tracker.match_pending_by_prefix(prefix)
 
 
 def _wipe_event_spine_artifacts(db_path: Path) -> None:

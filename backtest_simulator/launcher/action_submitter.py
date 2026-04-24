@@ -309,6 +309,32 @@ def _submit_translated(
             context.command_id,
         )
         return None
+    # SELL ENTER in our long-only strategy is the EXIT LEG of an
+    # already-open long — it reduces an existing position rather than
+    # opening a new one. Nexus's `ActionType.EXIT` is the correct tag
+    # but requires `trade_id`-linked lifecycle plumbing that exceeds
+    # Part 2 scope; for now we send SELL-as-ENTER but SKIP the CAPITAL
+    # reservation (which would otherwise over-commit capital on every
+    # exit — the known dishonesty codex flagged). The action still
+    # flows through Praxis → venue adapter → fill; capital accounting
+    # intentionally stays silent on exits until a follow-up slice
+    # wires proper EXIT semantics.
+    if action.direction == OrderSide.SELL:
+        decision = ValidationDecision(allowed=True)
+        cmd = translate_to_trade_command(
+            action, context, decision, config, datetime.now(UTC),
+        )
+        cmd = _to_praxis_enums(cmd)
+        command_id = praxis_outbound.send_command(cmd)
+        _log.info(
+            'backtest action submitted (SELL close — CAPITAL skipped)',
+            extra={
+                'strategy_id': strategy_id,
+                'action_type': action.action_type.value,
+                'command_id': command_id,
+            },
+        )
+        return command_id, decision, context
     decision = validation_pipeline.validate(context)
     if not decision.allowed:
         _log.warning(

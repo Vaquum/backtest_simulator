@@ -56,6 +56,8 @@ The gates check shape, scope, format, ratchets, and named test suites. They do n
 
 **No sitting in the dark.** Do not block callable outputs or script outputs in anyway to save context. Or do not hide sub-agent logs to save your context. Always stay fully aware of what the running thing is doing. 
 
+**No long-running commands.** Do not repeatedly run long-running commands. If something needs to be run repeatedly, immediately profile it, and report back to operator the profile results. The operator is expert in performance hacking, you are not. 
+
 **Minimal scope.** Touch only the files the task demands. Drive-by cleanups go in a separate slice.
 
 **No synthetic data.** Ever. Inventing data is not a shortcut — it corrupts everything downstream. If the real data isn't there, stop and ask.
