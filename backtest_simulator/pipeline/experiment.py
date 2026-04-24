@@ -8,7 +8,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import cast
+from typing import Protocol, cast
 
 import polars as pl
 from limen import Sensor, Trainer, UniversalExperimentLoop
@@ -232,6 +232,24 @@ def _column_predicate(column: str, spec: FilterValue) -> pl.Expr:
     return col == spec
 
 
+class _UELRunProtocol(Protocol):
+    """Pyright-friendly Protocol for the UEL.run signature we actually use.
+
+    Limen's `UniversalExperimentLoop.run` signature includes bare
+    `Callable | None` / `dict | None` parameters. Reading the method
+    via attribute access propagates those as partially-unknown.
+    Defining a Protocol with the exact concrete types we pass lets
+    pyright type-check the call without the Unknown propagation.
+    """
+
+    def __call__(
+        self, *,
+        experiment_name: str,
+        n_permutations: int,
+        resume: bool,
+    ) -> None: ...
+
+
 def _run_uel(
     uel: UniversalExperimentLoop,
     experiment_name: str,
@@ -241,17 +259,11 @@ def _run_uel(
 ) -> None:
     """Call `uel.run(...)` with the MSQ triplet we exercise.
 
-    Limen's `UEL.run` signature uses bare `Callable | None` / `dict | None`
-    parameters; referring to it directly at the call site flags as
-    "type of 'run' is partially unknown". Wrapping the call here pins
-    the signature shape we actually use — positional-kwargs only, no
-    dict/Callable hooks — so the usage site is fully typed.
+    See `_UELRunProtocol` above — it pins the shape of the call we
+    make here so pyright doesn't have to chase the bare-Callable
+    parameters in Limen's full signature.
     """
-    # `uel.run`'s signature includes `Callable | None` / `dict | None`
-    # parameters that pyright reads as partially-unknown. We don't pass
-    # those, but the bare attribute reference still trips the gate.
-    # Bind a typed Callable handle so the call site reads clean.
-    run_fn: Callable[..., None] = uel.run
+    run_fn = cast('_UELRunProtocol', uel.run)
     run_fn(
         experiment_name=experiment_name,
         n_permutations=n_permutations,

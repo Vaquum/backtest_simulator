@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
-import clickhouse_connect
 import polars as pl
 import pyarrow as pa
+from clickhouse_connect import get_client as _ch_get_client
 from clickhouse_connect.driver.client import Client
 
 from backtest_simulator.feed.lookahead import (
@@ -186,24 +186,22 @@ def _format_datetime64(value: datetime) -> str:
     return value.strftime(_TRADES_DATETIME_FORMAT)
 
 
-# clickhouse_connect exposes `get_client` and `Client.query_arrow` via
-# `**kwargs`/un-annotated returns. Pyright marks any direct call site
-# as "partially unknown". These thin wrappers fix the function
-# signature at the boundary: we pass through only the named args we
-# actually use, so the call site itself is fully typed.
-_GetClientFn = Callable[..., Client]
-_QueryArrowFn = Callable[..., object]
-
+# clickhouse_connect exposes `get_client` and `Client.query_arrow`
+# via signatures that include `**kwargs: Any`. Reading those as
+# member-access expressions flags `reportUnknownMemberType`. The
+# fixes used here:
+#   - `get_client` is imported as a top-level symbol via
+#     `from clickhouse_connect import get_client as _ch_get_client`.
+#     The import name resolves at module load (typed), so the call
+#     site reads clean — no member access on the package object.
+#   - `Client.query_arrow` is necessarily a method on the client
+#     instance; we wrap the call once and check the return at the
+#     boundary.
 
 def _make_client(
     *, host: str, port: int, username: str, password: str, database: str,
 ) -> Client:
-    # `clickhouse_connect.get_client` has `**kwargs` in its signature
-    # which makes pyright flag the attribute reference as
-    # `partially unknown`. Take a typed Callable handle to it once so
-    # the call sites read clean.
-    get_client: _GetClientFn = clickhouse_connect.get_client
-    return get_client(
+    return _ch_get_client(
         host=host, port=port, username=username,
         password=password, database=database,
     )
@@ -212,10 +210,7 @@ def _make_client(
 def _query_arrow(
     client: Client, query: str, *, parameters: Mapping[str, str],
 ) -> pa.Table:
-    # Same `**kwargs` story for `Client.query_arrow`; bind a typed
-    # Callable so the call site reads clean.
-    query_arrow: _QueryArrowFn = client.query_arrow
-    raw_result = query_arrow(query, parameters=dict(parameters))
+    raw_result = client.query_arrow(query, parameters=dict(parameters))
     if not isinstance(raw_result, pa.Table):
         msg = (
             f'ClickHouseFeed._query_arrow: expected pyarrow.Table '
