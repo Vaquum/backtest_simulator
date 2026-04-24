@@ -187,8 +187,8 @@ def _format_datetime64(value: datetime) -> str:
 
 
 # clickhouse_connect exposes `get_client` and `Client.query_arrow`
-# via signatures that include `**kwargs: Any`. Reading those as
-# member-access expressions flags `reportUnknownMemberType`. The
+# via signatures that include `**kwargs` typed loosely. Reading those
+# as member-access expressions flags `reportUnknownMemberType`. The
 # fixes used here:
 #   - `get_client` is imported as a top-level symbol via
 #     `from clickhouse_connect import get_client as _ch_get_client`.
