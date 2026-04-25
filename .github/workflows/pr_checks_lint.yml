@@ -24,17 +24,45 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          # Bumped from 3.11 → 3.12 to match the honesty gate. The
+          # `.[integration]` install pulls in vaquum-praxis which
+          # declares `requires-python>=3.12`. Keeping the lint gate on
+          # 3.11 would force a Python-version skew between the two
+          # workflows, with a lint coverage step that can't import the
+          # very package it's measuring.
+          python-version: '3.12'
+      - name: Install uv
+        # Standard pip's resolver treats `git+https://github.com/Vaquum/Limen`
+        # and `git+https://github.com/Vaquum/Limen@v2.4.3` as two distinct
+        # package URLs and aborts with `ResolutionImpossible` when both
+        # appear in one install (Praxis declares the untagged form, Nexus
+        # the tagged one). uv's resolver unifies the two URLs onto the
+        # same package — same path Praxis and Nexus use in their own CI.
+        uses: astral-sh/setup-uv@v4
       - name: Set up lint venv
         run: python -m venv .venv-lint
 
       - name: Install gate toolchain
         run: |
-          .venv-lint/bin/python -m pip install --upgrade pip \
+          uv pip install --python .venv-lint/bin/python \
             'ruff==0.15.11' \
             'vulture>=2.14' \
             'coverage[toml]>=7.6' \
             pytest
+          # The coverage step runs `pytest tests/` across every test
+          # file, including the honesty and launcher suites that import
+          # nexus / praxis / limen / polars at module scope. Without the
+          # sibling-library install we'd collect 0 tests from those
+          # paths (via tests/conftest.py's collect_ignore_glob skip),
+          # which drops coverage to 0% and fails the floor gate. Install
+          # the `.[integration]` extra so the lint gate sees the same
+          # test surface as the honesty gate.
+          # Credential helper: SIBLING_INSTALL_TOKEN is provisioned in
+          # Repo Settings → Secrets; the extra pins Praxis/Nexus/Limen
+          # via git+https URLs that resolve through that PAT.
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.SIBLING_INSTALL_TOKEN }}@github.com" > ~/.git-credentials
+          uv pip install --python .venv-lint/bin/python '.[integration]'
 
       - name: Run ruff lint (bloat-mechanical rules active)
         run: .venv-lint/bin/python -m ruff check backtest_simulator tools tests scripts
@@ -53,6 +81,13 @@ jobs:
 
       - name: Dead-code (vulture)
         run: .venv-lint/bin/python -m vulture backtest_simulator/ --min-confidence 80
+
+      - name: No-swallowed-violations gate
+        # AST gate. Forbids any `except` (bare, dotted, or aliased)
+        # that catches HonestyViolation or any subclass under
+        # backtest_simulator/ or tests/. Honesty violations must reach
+        # the test boundary; production code can never swallow them.
+        run: .venv-lint/bin/python scripts/check_no_swallowed_violations.py
 
       - name: Coverage floor gate
         # Hard-fail only: no soft-fail markers, no pipeline bypass. If

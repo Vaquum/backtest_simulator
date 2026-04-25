@@ -70,15 +70,65 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          # 3.12 matches pr_checks_honesty / pr_checks_lint. Praxis
+          # requires-python>=3.12; without it the integration install
+          # below would fail and pyright would have no resolvable types
+          # for the sibling libs, producing 800+ reportUnknown* errors.
+          python-version: '3.12'
+
+      - name: Install uv
+        # Standard pip's resolver treats `git+https://github.com/Vaquum/Limen`
+        # and `git+https://github.com/Vaquum/Limen@v2.4.3` as two distinct
+        # package URLs and aborts with `ResolutionImpossible` when both
+        # appear in one install (Praxis declares the untagged form, Nexus
+        # the tagged one). uv's resolver unifies the two URLs onto the
+        # same package — same path Praxis and Nexus use in their own CI.
+        uses: astral-sh/setup-uv@v4
 
       - name: Install build dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -e .
+          # Install integration extras so pyright can resolve nexus /
+          # praxis / limen imports. Without these every `from nexus
+          # import X` becomes reportMissingImports and every X.method()
+          # cascades into reportUnknownMemberType — blocking the
+          # error-count ratchet at ~880 errors that have nothing to do
+          # with this PR's actual typing discipline.
+          # SIBLING_INSTALL_TOKEN is the same fine-grained PAT the
+          # honesty and lint gates already use.
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.SIBLING_INSTALL_TOKEN }}@github.com" > ~/.git-credentials
+          uv pip install --system -e '.[integration]'
+
+      - name: Plant py.typed markers in sibling libraries
+        run: |
+          # Nexus / Praxis / Limen / clickhouse_connect ship without
+          # py.typed, so pyright's reportMissingTypeStubs flags every
+          # import. They DO have type annotations in source (used
+          # internally), so once we mark them as typed pyright reads
+          # the source directly via useLibraryCodeForTypes (default
+          # true). This drops ~65 reportMissingTypeStubs errors and a
+          # long tail of cascading reportUnknown* errors that flow
+          # from the unresolved member types.
+          #
+          # The marker is a single empty `py.typed` file at the
+          # package root; PEP 561 spec.
+          set -euo pipefail
+          python -c "
+          import os, sys
+          import nexus, praxis, limen, clickhouse_connect
+          for pkg in (nexus, praxis, limen, clickhouse_connect):
+              root = os.path.dirname(pkg.__file__)
+              marker = os.path.join(root, 'py.typed')
+              if not os.path.exists(marker):
+                  with open(marker, 'w') as f:
+                      pass
+                  print(f'planted: {marker}')
+              else:
+                  print(f'present: {marker}')
+          "
 
       - name: Install pyright
-        run: pip install 'pyright==1.1.408'
+        run: uv pip install --system 'pyright==1.1.408'
 
       - name: Resolve base ref and fetch base-ref budget
         id: base

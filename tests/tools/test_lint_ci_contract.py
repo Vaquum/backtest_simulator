@@ -65,6 +65,19 @@ EXPECTED_RUFF_POLICY: Final[dict[str, object]] = {
             'FIX001', 'FIX002', 'FIX003', 'FIX004',
             'ERA001', 'D200', 'D205', 'D415',
         ],
+        # Part 2 Protocol-conformance exemption: SimulatedVenueAdapter
+        # implements praxis.infrastructure.venue_adapter.VenueAdapter's
+        # 9-parameter `submit_order` signature. The Protocol is
+        # runtime_checkable — the method and its full parameter list
+        # must live on the class itself; a dataclass-bundle helper
+        # pattern would break the isinstance() check. Exempt this
+        # single file from PLR0913 (max-args=6).
+        'backtest_simulator/venue/simulated.py': ['PLR0913'],
+        # Same Protocol-conformance reason for launcher.py's
+        # `wrapped_submit` — it mirrors the 9-param submit_order
+        # signature exactly so it can replace the adapter's method
+        # via setattr without breaking the Protocol.
+        'backtest_simulator/launcher/launcher.py': ['PLR0913'],
     },
 }
 

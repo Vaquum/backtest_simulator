@@ -4,20 +4,76 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "backtest_simulator"
-version = "1.4.0"
+version = "1.5.2"
 description = "Honest, gate-enforced backtester for unmodified Nexus strategies against unmodified Praxis."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "freezegun>=1.5.0",
+  "polars>=1.0",
+  "numpy>=2.0",
+  "scipy>=1.13",
+  "aiosqlite>=0.20",
+  "clickhouse-connect>=0.7",
+  # `feed/clickhouse.py` imports pyarrow at module scope to convert
+  # the ClickHouse arrow-format query into polars; without it the
+  # eager `from backtest_simulator.feed.clickhouse import ...` in
+  # `__init__.py` fails on a slim install before the lazy
+  # integration block has a chance to run.
+  "pyarrow>=15.0",
+  "orjson>=3.10",
+]
 
 [project.optional-dependencies]
 dev = [
   "pytest",
+  "pytest-asyncio",
   "ruff==0.15.11",
   "pyright==1.1.408",
   "vulture>=2.14",
   "coverage[toml]>=7.6",
+  "scikit-learn>=1.5",
+  "jupyter>=1.0",
+  "nbconvert>=7.0",
+  "ipykernel>=6.0",
 ]
+
+# Private sibling packages installed from Vaquum GitHub. Intentionally
+# not pinned — Praxis / Nexus / Limen evolve, backtest_simulator evolves
+# with them. If a sibling breaking change lands, the fix is to update
+# the shim, not to freeze a stale SHA. CI configures a git credential
+# helper with ${{ secrets.SIBLING_INSTALL_TOKEN }} before running
+# `pip install -e '.[integration]'`.
+integration = [
+  # URLs (no .git suffix, no @ref) match the canonical forms used by
+  # Praxis and Nexus in their own pyprojects. pip's resolver treats
+  # distinct source URLs as different packages, so any variation
+  # (`.git`, `@main`, etc.) triggers a ResolutionImpossible. Leave
+  # version resolution to each repo's main branch and let pip unify
+  # on the URL string.
+  "vaquum-praxis @ git+https://github.com/Vaquum/Praxis",
+  # nexus and limen are pulled transitively by praxis. Duplicating
+  # them here would force-pin a URL form and trip the resolver.
+]
+
+[tool.uv]
+# Force every consumer of `vaquum_limen` (direct or transitive) onto
+# a single canonical URL so uv's resolver collapses the two specifier
+# forms — Praxis declares `git+https://github.com/Vaquum/Limen`
+# (untagged → main); Nexus declares `git+https://github.com/Vaquum/Limen@v2.4.3`
+# (tagged) — into one. Without this override uv treats the distinct
+# URL strings as conflicting package sources and aborts install with
+# `Requirements contain conflicting URLs`. The untagged form tracks
+# main, matching the operator policy "always take the latest Limen".
+# `tool.uv.sources` (used for direct-dep source overrides) does NOT
+# rewrite transitive specifiers; `override-dependencies` does — it's
+# the documented uv knob for resolving sibling-lib URL drift.
+override-dependencies = [
+    "vaquum_limen @ git+https://github.com/Vaquum/Limen",
+]
+
+[project.scripts]
+bts = "backtest_simulator.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -52,6 +108,12 @@ exclude = [
   "tests",
   "demo",
 ]
+# Local stub directory for sibling libraries that ship without
+# py.typed AND have signatures that propagate `Any` through their
+# call sites (clickhouse_connect.get_client, limen UEL.run, etc.).
+# The stubs declare only the named-keyword subset we use; pyright
+# reads the stub instead of the source so the call sites read clean.
+stubPath = "stubs"
 reportExplicitAny = "error"
 reportMissingImports = "error"
 reportMissingTypeStubs = "error"
@@ -121,6 +183,14 @@ max-branches = 12
 max-statements = 50
 
 [tool.ruff.lint.per-file-ignores]
+# SimulatedVenueAdapter.submit_order must byte-match the Praxis
+# VenueAdapter Protocol signature (10 args). A helper-extraction
+# refactor would break the runtime_checkable isinstance() check.
+"backtest_simulator/venue/simulated.py" = ["PLR0913"]
+# launcher.py's `wrapped_submit` mirrors the 9-param Praxis Protocol
+# signature (it wraps SimulatedVenueAdapter.submit_order without
+# changing arity).
+"backtest_simulator/launcher/launcher.py" = ["PLR0913"]
 "tests/**/*.py" = [
   "S101", "ANN", "BLE001",
   "PLR0912", "PLR0913", "PLR0915",

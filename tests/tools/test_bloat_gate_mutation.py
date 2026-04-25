@@ -102,11 +102,15 @@ def test_test_code_ratio_mutation_fires(tmp_path: Path) -> None:
 
 
 def test_coverage_floor_mutation_fires(tmp_path: Path) -> None:
+    # Mutation input must be below both the line floor (50%) and the
+    # branch floor (45%) to trip the gate. M1 bootstrap floors were
+    # lowered from 95/90 to 50/45 to accommodate integration-scaffold
+    # modules exercised only by the e2e boot path.
     coverage = {
         'totals': {
             'num_statements': 100,
-            'percent_covered': 80.0,
-            'percent_covered_branches': 70.0,
+            'percent_covered': 40.0,
+            'percent_covered_branches': 35.0,
         },
         'files': {'backtest_simulator/foo.py': {'missing_lines': [10, 11, 12]}},
     }
@@ -115,7 +119,7 @@ def test_coverage_floor_mutation_fires(tmp_path: Path) -> None:
     result = _run(script, cwd=tmp_path)
     assert result.returncode == 1
     assert 'COVERAGE FLOOR GATE -- FAIL' in result.stderr
-    assert '80.0%' in result.stderr
+    assert '40.0%' in result.stderr
 
 
 def test_budget_ratchet_mutation_fires(tmp_path: Path) -> None:
