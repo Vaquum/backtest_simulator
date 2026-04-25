@@ -3,8 +3,12 @@
 # Thin wrapper over `backtest_simulator.cli._run_window.run_window_in_subprocess`
 # that consumes one decoder + one window and either prints the human-
 # readable summary (`--output-format text`) or emits the structured JSON
-# report (`--output-format json`). `slippage_realised_bps` reflects the
-# calibrated SlippageModel applied to every taker fill in this run;
+# report (`--output-format json`). The slippage fields
+# (`slippage_realised_bps`, `slippage_realised_cost_bps`,
+# `slippage_realised_buy_bps`, `slippage_realised_sell_bps`,
+# `slippage_n_samples`, `slippage_n_excluded`) report measurements taken
+# against the rolling mid; the SlippageModel does NOT adjust fill_price
+# (walk_trades returns realistic taker prices from the historical tape).
 # `book_gap_max_seconds` and `market_impact_realised_bps` are populated
 # by their own wiring tasks once they land.
 from __future__ import annotations
@@ -81,11 +85,12 @@ def _run(args: argparse.Namespace) -> int:
             'declared_stops': stops_raw,
             'book_gap_max_seconds': None,
             # Signed mean (directional). Operator should NOT cite
-            # this as cost — see `slippage_realised_adverse_bps`.
+            # this as cost — see `slippage_realised_cost_bps`.
             'slippage_realised_bps': result.get('slippage_realised_bps'),
-            # Cost metric: mean(|bps|). Survives round-trip cancellation.
-            'slippage_realised_adverse_bps': result.get(
-                'slippage_realised_adverse_bps',
+            # Cost metric: side-normalized mean. Positive = paid
+            # spread; negative = price improvement.
+            'slippage_realised_cost_bps': result.get(
+                'slippage_realised_cost_bps',
             ),
             'slippage_realised_buy_bps': result.get('slippage_realised_buy_bps'),
             'slippage_realised_sell_bps': result.get('slippage_realised_sell_bps'),
@@ -97,7 +102,15 @@ def _run(args: argparse.Namespace) -> int:
         return 0
     trades = [Trade(*row) for row in trades_raw]
     declared_stops = {k: Decimal(str(v)) for k, v in stops_raw.items()}
-    print_run(display_id, window_start.date().isoformat(), trades, declared_stops)
+    slip_raw = result.get('slippage_realised_cost_bps')
+    slip_cost = None if slip_raw is None else Decimal(str(slip_raw))
+    print_run(
+        display_id, window_start.date().isoformat(), trades,
+        declared_stops,
+        slippage_cost_bps=slip_cost,
+        slippage_n_samples=int(result.get('slippage_n_samples', 0)),
+        slippage_n_excluded=int(result.get('slippage_n_excluded', 0)),
+    )
     return 0
 
 

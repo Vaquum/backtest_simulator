@@ -138,10 +138,12 @@ def run_window_in_process(
         'slippage_realised_bps': _emit(
             adapter.slippage_realised_aggregate_bps,
         ),
-        # Cost metric: mean(|bps|). Operator-visible "what slippage
-        # cost this run" — survives BUY/SELL sign cancellation.
-        'slippage_realised_adverse_bps': _emit(
-            adapter.slippage_realised_adverse_bps,
+        # Cost metric: side-normalized mean. BUY contributes +bps,
+        # SELL contributes -bps. Positive = paid spread on average;
+        # negative = price improvement on average. Replaces the
+        # earlier mean(|bps|), which counted favorable fills as cost.
+        'slippage_realised_cost_bps': _emit(
+            adapter.slippage_realised_cost_bps,
         ),
         # Per-side aggregates so the operator can diagnose
         # asymmetric paying.

@@ -100,8 +100,23 @@ def fmt_price(value: Decimal) -> str:
 def print_run(
     perm_id: int, day_label: str,
     trades: list[Trade], declared_stops: dict[str, Decimal],
+    *,
+    slippage_cost_bps: Decimal | None = None,
+    slippage_n_samples: int = 0,
+    slippage_n_excluded: int = 0,
 ) -> None:
-    """One-line headline + per-pair detail."""
+    """One-line headline + per-pair detail.
+
+    `slippage_cost_bps` is the side-normalized realised cost from
+    `SimulatedVenueAdapter.slippage_realised_cost_bps` — positive
+    means the run paid spread on average, negative means it
+    captured price improvement, None means no slippage model was
+    attached. The headline includes a `slip` column so the
+    operator on `bts sweep` (the load-bearing surface, not just
+    `bts run --output-format json`) sees whether slippage was
+    active, how many fills were measured, and what the run paid
+    relative to mid.
+    """
     pairs, _trailing = pair_trades(trades)
     net_pnls: list[Decimal] = []
     return_pcts: list[Decimal] = []
@@ -133,11 +148,19 @@ def print_run(
         fmt_dec(sum(r_mults, Decimal('0')) / len(r_mults), 2)
         if r_mults else '—'
     )
+    if slippage_cost_bps is None:
+        slip_str = 'slip off'
+    else:
+        slip_str = (
+            f'slip {fmt_dec(slippage_cost_bps, 2)}bp '
+            f'n={slippage_n_samples}/excl={slippage_n_excluded}'
+        )
     print(
         f'   perm {perm_id:<4}  {day_label}  '
         f'trades {n_trades:<3}  PF {pf_str:<6}  '
         f'R̄ {r_mean_str:<7}  DD {fmt_dec(-max_dd_pct, 2)}%  '
-        f'total {fmt_dec(total_pct, 2)}%',
+        f'total {fmt_dec(total_pct, 2)}%  '
+        f'{slip_str}',
     )
     for buy, sell in pairs:
         declared = declared_stops.get(buy.client_order_id)

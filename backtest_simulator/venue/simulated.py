@@ -59,11 +59,14 @@ class SimulatedVenueAdapter:
         # `walk_trades` already prices fills against the actual
         # historical trade prints, which IS the live taker reality.
         # The model contributes its `dt_seconds` (rolling-mid window)
-        # to a per-fill *measurement* of realised bps — what the fill
-        # paid relative to mid — for operator-visible reporting
-        # (signed, adverse, per-side aggregates). When None, the
-        # measurement layer is off and aggregate properties return
-        # None as the "feature disabled" signal.
+        # to a per-fill *measurement* of realised bps — where the
+        # fill landed relative to mid (fill-price deviation, sign-
+        # neutral; cost / improvement interpretation belongs to the
+        # `slippage_realised_cost_bps` aggregate). For operator-
+        # visible reporting
+        # (signed mean, side-normalized cost, per-side aggregates).
+        # When None, the measurement layer is off and aggregate
+        # properties return None as the "feature disabled" signal.
         self._slippage_model = slippage_model
         self._slippage_realised_bps: list[Decimal] = []
         self._slippage_realised_sides: list[NexusOrderSide] = []
@@ -106,14 +109,17 @@ class SimulatedVenueAdapter:
         pays in live. Slippage here is observability only: for each
         taker fill, record the deviation from the rolling mid over
         `slippage_model.dt_seconds` preceding `fill_time`. Maker fills
-        (`is_maker=True`) are recorded too — they fill at limit, so
-        their realised "slippage" against mid is meaningful (often
-        negative cost = price improvement).
+        (`is_maker=True`) are SKIPPED in this method — they pin to the
+        declared limit price and the cost convention there is a future
+        feature; only taker fills contribute to the measurement
+        aggregates today.
 
         The signed bps is stored alongside the side so the aggregator
-        can report per-side and adverse (|bps|) means — a plain signed
-        mean would let a round trip cancel to zero even though the
-        strategy paid spread on both legs (the audit's P1 #3).
+        can report per-side and side-normalized cost means (cost =
+        +bps for BUY, -bps for SELL). A plain signed mean would let a
+        round trip cancel to zero even though the strategy paid spread
+        on both legs (the audit's P1 #3); the cost view is the
+        operator-visible cost / improvement metric.
 
         Fills whose preceding `dt_seconds` window has zero trades
         (start-of-tape, halt) are recorded under `n_excluded` rather
@@ -186,31 +192,53 @@ class SimulatedVenueAdapter:
 
     @property
     def slippage_realised_aggregate_bps(self) -> Decimal | None:
-        """Signed mean realised bps across all taker fills.
+        """Signed mean of `(fill_price - mid) / mid * 10000` across recorded taker fills.
 
-        Positive when the population of fills paid above mid (more
-        BUY aggressors); negative when below. NOT a cost metric on
-        its own — a balanced round-trip can register near zero even
-        when each leg paid spread. Pair with `slippage_realised_adverse_bps`
-        for the gross cost view. None when no slippage model attached.
+        Positive when the average recorded fill landed above mid;
+        negative when below. NOT a cost metric on its own — a SELL
+        filling above mid produces positive bps but is price
+        improvement, not paid spread. The side interpretation
+        belongs to `slippage_realised_cost_bps` (cost = +bps for
+        BUY, -bps for SELL). Pair the two: use signed for "where
+        did fills land relative to mid?", cost for "what did the
+        run pay?". None when no slippage model attached.
         """
         return self._aggregate_bps_when_active()
 
     @property
-    def slippage_realised_adverse_bps(self) -> Decimal | None:
-        """Mean of `|bps|` — the round-trip-honest cost metric.
+    def slippage_realised_cost_bps(self) -> Decimal | None:
+        """Side-normalized realised slippage cost in bps.
 
-        Always non-negative: every taker fill contributes its absolute
-        deviation from mid regardless of side. This is the bps the
-        operator should cite when answering "what did slippage cost
-        this run". None when slippage off.
+        For each taker fill, the bps cost relative to mid is:
+          - BUY aggressor:  cost =  bps   (paid above mid → positive cost)
+          - SELL aggressor: cost = -bps   (received below mid → positive cost)
+
+        Mean of these costs across recorded taker fills (maker
+        fills are skipped — see `_record_slippage`). Sign convention:
+          - Positive: the run paid spread on average.
+          - Negative: the run captured price improvement on average.
+          - Zero: no measurements yet (model attached) OR sample-
+            mean cancels exactly.
+
+        This replaces the earlier `adverse_bps = mean(|bps|)`, which
+        was wrong: it counted favorable fills (BUY below mid, SELL
+        above mid) as cost. The audit caught the math error;
+        `cost_bps` is the side-normalized correction. None when no
+        slippage model attached.
         """
         if self._slippage_model is None:
             return None
         if not self._slippage_realised_bps:
             return Decimal('0')
-        total = sum((abs(bps) for bps in self._slippage_realised_bps), Decimal('0'))
-        return total / Decimal(len(self._slippage_realised_bps))
+        cost_samples = [
+            bps if side == NexusOrderSide.BUY else -bps
+            for bps, side in zip(
+                self._slippage_realised_bps,
+                self._slippage_realised_sides,
+                strict=True,
+            )
+        ]
+        return sum(cost_samples, Decimal('0')) / Decimal(len(cost_samples))
 
     @property
     def slippage_realised_buy_bps(self) -> Decimal | None:

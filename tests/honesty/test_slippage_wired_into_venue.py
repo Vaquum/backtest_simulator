@@ -10,17 +10,27 @@ as `(fill_price - rolling_mid) / rolling_mid * 10000` over the
 same `dt_seconds` lookback the calibration used.
 
 The contract:
-  - `slippage_realised_aggregate_bps` is the SIGNED mean (positive
-    when BUY-aggressors dominate; negative when SELL-aggressors do).
-    NOT a cost metric — round trips can cancel.
-  - `slippage_realised_adverse_bps` is `mean(|bps|)` — the
-    operator-visible gross cost. Always non-negative.
+  - `slippage_realised_aggregate_bps` is the signed mean of
+    `(fill_price - mid) / mid * 10000` across recorded taker fills:
+    positive when the average fill landed above mid, negative when
+    below. NOT a cost metric — a SELL above mid produces positive
+    bps but is improvement, not paid spread. Side interpretation
+    belongs to `cost_bps`.
+  - `slippage_realised_cost_bps` is the side-normalized mean —
+    operator-visible cost. Positive = run paid spread on
+    average; negative = run captured price improvement on
+    average. The earlier `mean(|bps|)` design was rejected by
+    the auditor for counting favorable fills as cost; the
+    `cost_bps` correction normalizes by side (BUY: cost=+bps,
+    SELL: cost=-bps) so the sign is honest.
   - `slippage_realised_buy_bps` and `slippage_realised_sell_bps`
     isolate per-side means.
   - `slippage_realised_n_excluded` separates measured-zero from
     no-mid-available (audit P1 #2 in measurement form).
-  - All five properties return None when no model attached
-    (feature-disabled signal).
+  - The four bps aggregates (signed, cost, buy, sell) return None
+    when no model attached (feature-disabled signal); the two
+    counters (n_samples, n_excluded) stay integer-typed and read
+    0 when no model attached.
   - `fill_price` is byte-identical with vs without model attached
     — the model only measures, never adjusts (audit P1 #1 fix).
 """
@@ -156,23 +166,22 @@ def test_slippage_records_realised_bps_when_model_attached() -> None:
         f'{adapter.slippage_realised_n_samples}'
     )
     signed = adapter.slippage_realised_aggregate_bps
-    adverse = adapter.slippage_realised_adverse_bps
+    cost = adapter.slippage_realised_cost_bps
     buy_only = adapter.slippage_realised_buy_bps
     sell_only = adapter.slippage_realised_sell_bps
     assert signed is not None
-    assert adverse is not None
+    assert cost is not None
     assert buy_only is not None
     assert sell_only is not None  # zero-sample side returns 0, not None
-    assert adverse >= Decimal('0'), (
-        f'adverse must be non-negative; got {adverse}'
-    )
-    assert adverse >= abs(signed), (
-        f'adverse mean(|bps|) must dominate |signed mean| over a '
-        f'population of mixed-sign fills; got adverse={adverse} '
-        f'|signed|={abs(signed)}'
-    )
-    # Single BUY fill: per-BUY mean equals the overall signed mean.
+    # Single BUY fill: per-BUY mean equals the overall signed mean,
+    # and `cost = +bps` (BUY normalization). The cost and signed
+    # match in sign on a one-sided population — the difference shows
+    # up on round trips, exercised in the dedicated test below.
     assert buy_only == signed
+    assert cost == signed, (
+        f'on a BUY-only population, cost (=+bps) equals signed mean; '
+        f'got cost={cost} signed={signed}'
+    )
     # No SELL fills: per-SELL mean is zero (the property's "no
     # samples" branch).
     assert sell_only == Decimal('0')
@@ -187,36 +196,35 @@ def test_slippage_aggregates_are_none_without_model() -> None:
         'a', 'BTCUSDT', OrderSide.BUY, OrderType.MARKET, Decimal('0.05'),
     ))
     assert adapter.slippage_realised_aggregate_bps is None
-    assert adapter.slippage_realised_adverse_bps is None
+    assert adapter.slippage_realised_cost_bps is None
     assert adapter.slippage_realised_buy_bps is None
     assert adapter.slippage_realised_sell_bps is None
     assert adapter.slippage_realised_n_samples == 0
     assert adapter.slippage_realised_n_excluded == 0
 
 
-def test_slippage_aggregates_distinguish_signed_adverse_per_side() -> None:
-    """Audit P1 #3: signed/adverse/per-side aggregates report what they claim.
+def test_slippage_cost_is_side_normalized_paid_spread_round_trip() -> None:
+    """Audit P1 #3: signed/cost/per-side aggregates report what they claim.
 
-    This test injects controlled bps into the adapter's state
-    (bypassing walk_trades) so each leg's contribution is known
-    exactly. Real-tape walking is symmetric for BUY/SELL on
-    `walk_trades` (both sides consume the same head-of-queue
-    trades), so a tape-driven test cannot demonstrate sign
-    cancellation between sides. Direct injection isolates the
-    aggregator's logic from the fill engine's symmetry.
+    Construction: a BUY leg pays +5 bps (above mid → cost +5),
+    and a SELL leg pays -5 bps (below mid → cost +5 because for
+    SELL aggressors `cost = -bps`). The signed mean cancels to 0;
+    the side-normalized cost is +5 (both legs paid spread).
 
-    Construction: BUY leg pays +5 bps; SELL leg pays -5 bps. The
-    signed mean cancels to 0; the adverse mean = mean(|bps|) = 5.
     A pre-fix implementation that reported only the signed mean
-    would tell the operator "0 bps slippage" — exactly the audit's
-    cost-hiding scenario.
+    would tell the operator "0 bps slippage" on this round trip
+    — exactly the audit's P1 #3 failure mode. `cost_bps` is the
+    side-normalized correction.
     """
     feed = _TapeFeed()
     submit_t = datetime(2024, 1, 1, 12, 15, tzinfo=UTC)
     model = _calibrate(feed, submit_t)
     adapter = _make_adapter(feed, model, submit_t)
 
-    # Inject the +5 BUY / -5 SELL distribution directly.
+    # Inject the +5 BUY / -5 SELL distribution directly. Real-tape
+    # walking is symmetric for BUY/SELL on `walk_trades` (both
+    # sides consume the same head-of-queue trades), so a tape-
+    # driven test cannot demonstrate the cost-vs-signed split.
     from nexus.core.domain.enums import OrderSide as NexusOrderSide
     adapter._slippage_realised_bps = [Decimal('5'), Decimal('-5')]
     adapter._slippage_realised_sides = [
@@ -224,18 +232,16 @@ def test_slippage_aggregates_distinguish_signed_adverse_per_side() -> None:
     ]
 
     signed = adapter.slippage_realised_aggregate_bps
-    adverse = adapter.slippage_realised_adverse_bps
+    cost = adapter.slippage_realised_cost_bps
     buy_bps = adapter.slippage_realised_buy_bps
     sell_bps = adapter.slippage_realised_sell_bps
 
     assert signed == Decimal('0'), (
         f'signed mean of +5 / -5 must cancel to 0; got {signed}'
     )
-    assert adverse == Decimal('5'), (
-        f'adverse mean of |+5|, |-5| must equal 5; got {adverse}. '
-        f'A signed-only aggregator would also report 0 here, '
-        f'silently hiding the round-trip cost — that was the '
-        f'audit P1 #3 failure mode.'
+    assert cost == Decimal('5'), (
+        f'side-normalized cost: BUY +5 + SELL -(-5) = +5+5; mean = +5; '
+        f'got {cost}. A signed-only aggregator would report 0 here.'
     )
     assert buy_bps == Decimal('5'), (
         f'BUY-only mean must equal +5; got {buy_bps}'
@@ -243,12 +249,44 @@ def test_slippage_aggregates_distinguish_signed_adverse_per_side() -> None:
     assert sell_bps == Decimal('-5'), (
         f'SELL-only mean must equal -5; got {sell_bps}'
     )
-    # The audit's point in one assertion: adverse strictly
-    # dominates |signed| precisely when the signed aggregate
-    # would mislead the operator.
-    assert adverse > abs(signed), (
-        f'adverse must strictly dominate |signed| when sides '
-        f'cancel; got adverse={adverse} |signed|={abs(signed)}'
+
+
+def test_slippage_cost_is_negative_when_run_captures_price_improvement() -> None:
+    """Audit P1 #2: favorable fills must show as NEGATIVE cost, not positive.
+
+    The earlier `adverse_bps = mean(|bps|)` was wrong: a BUY filling
+    BELOW mid is FAVORABLE (price improvement), not cost. The
+    side-normalized cost: BUY cost = +bps, SELL cost = -bps. So
+    a BUY at -3 bps has cost = -3 (improvement); a SELL at +2 bps
+    has cost = -2 (improvement). Mean cost = -2.5 (improvement).
+
+    Pre-fix `adverse = mean(|-3|, |2|) = 2.5`, the wrong sign — it
+    would tell the operator "you paid 2.5 bps" when the truth was
+    "you saved 2.5 bps".
+    """
+    feed = _TapeFeed()
+    submit_t = datetime(2024, 1, 1, 12, 15, tzinfo=UTC)
+    model = _calibrate(feed, submit_t)
+    adapter = _make_adapter(feed, model, submit_t)
+
+    from nexus.core.domain.enums import OrderSide as NexusOrderSide
+    # BUY at -3 bps (favorable: filled below mid).
+    # SELL at +2 bps (favorable: received above mid).
+    adapter._slippage_realised_bps = [Decimal('-3'), Decimal('2')]
+    adapter._slippage_realised_sides = [
+        NexusOrderSide.BUY, NexusOrderSide.SELL,
+    ]
+    cost = adapter.slippage_realised_cost_bps
+    assert cost is not None
+    expected_cost = Decimal('-2.5')  # ((-3) + (-2)) / 2
+    assert cost == expected_cost, (
+        f'two favorable fills (BUY -3 bps, SELL +2 bps) must mean '
+        f'NEGATIVE cost (price improvement). Expected '
+        f'{expected_cost}, got {cost}. The earlier mean(|bps|) '
+        f'would report +2.5 — exactly the audit P1 #2 failure mode.'
+    )
+    assert cost < Decimal('0'), (
+        f'cost on a favorable run must be negative; got {cost}'
     )
 
 
@@ -427,11 +465,13 @@ def test_slippage_n_excluded_separates_no_mid_from_measured_zero() -> None:
     # And the aggregates: with samples=0 and a model attached, the
     # measurement-active aggregator returns Decimal(0) rather than
     # None. None is reserved for "no model attached" only. Pin all
-    # five aggregate properties — without the per-side checks the
-    # contract would let buy_bps/sell_bps regress to None on the
-    # zero-measurement-with-model state. Codex r4 caught this gap.
+    # four bps aggregate properties (signed, cost, buy, sell);
+    # n_samples / n_excluded are integer counters, not in this
+    # set. Without the per-side checks the contract would let
+    # buy_bps/sell_bps regress to None on the zero-measurement-
+    # with-model state. Codex r4 caught this gap.
     assert adapter.slippage_realised_aggregate_bps == Decimal('0')
-    assert adapter.slippage_realised_adverse_bps == Decimal('0')
+    assert adapter.slippage_realised_cost_bps == Decimal('0')
     assert adapter.slippage_realised_buy_bps == Decimal('0'), (
         f'BUY-side aggregate must return Decimal(0) (model attached, '
         f'no measurements yet) — None is reserved for "no model '

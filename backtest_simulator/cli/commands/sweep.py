@@ -119,7 +119,16 @@ def _run(args: argparse.Namespace) -> int:
             assert isinstance(stops_raw, dict)
             trades = [Trade(*row) for row in trades_raw]
             declared_stops = {k: Decimal(str(v)) for k, v in stops_raw.items()}
-            print_run(display_id, day_label, trades, declared_stops)
+            slip_raw = result.get('slippage_realised_cost_bps')
+            slip_cost = (
+                None if slip_raw is None else Decimal(str(slip_raw))
+            )
+            print_run(
+                display_id, day_label, trades, declared_stops,
+                slippage_cost_bps=slip_cost,
+                slippage_n_samples=int(result.get('slippage_n_samples', 0)),
+                slippage_n_excluded=int(result.get('slippage_n_excluded', 0)),
+            )
     t_wall = time.perf_counter() - t_total
     print(f'\ndone   {total_runs} run(s) in {t_wall:.1f}s')
     return 0
