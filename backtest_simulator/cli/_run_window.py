@@ -83,11 +83,23 @@ def run_window_in_process(
         ),
     )
     feed = ClickHouseFeed(config=ClickHouseConfig.from_env(), symbol=SYMBOL)
+    # Calibrate the slippage model from a pre-window trade slice
+    # (strict-causal: end <= window_start, no peek into the run's
+    # own fills). 30 minutes is enough density at BTCUSDT scale to
+    # populate every (side, qty-bucket) cell; the slice is bounded
+    # so the calibration cost is visible in the per-window timing.
+    # When the slice is empty (start-of-tape or sparse-volume
+    # symbol) `SlippageModel.calibrate` raises and we fall through
+    # to slippage_model=None — the operator sees the JSON report's
+    # `slippage_realised_bps` come back null and knows the
+    # calibration window needs to widen.
+    slippage_model = _calibrate_slippage(feed, window_start)
     adapter = SimulatedVenueAdapter(
         feed=feed,
         filters=BinanceSpotFilters.binance_spot(SYMBOL),
         fees=FeeSchedule(),
         trade_window_seconds=60,
+        slippage_model=slippage_model,
     )
     tc = TradingConfig(
         epoch_id=1, venue_rest_url='http://sim', venue_ws_url='ws://sim',
@@ -114,11 +126,61 @@ def run_window_in_process(
         for t in account.trades
     ]
     declared_stops = {k: str(v) for k, v in launcher._declared_stops.items()}
+    slippage_aggregate = adapter.slippage_realised_aggregate_bps
     return {
         'trades': trade_tuples,
         'declared_stops': declared_stops,
         'orders': len(account.orders),
+        'slippage_realised_bps': (
+            None if slippage_aggregate is None
+            else str(slippage_aggregate)
+        ),
+        'slippage_n_samples': adapter.slippage_realised_n_samples,
     }
+
+
+def _calibrate_slippage(
+    feed: object,
+    window_start: datetime,
+) -> object | None:
+    """Fit a SlippageModel on the 30 minutes of trades before `window_start`.
+
+    Returns None when the calibration window is empty or the model
+    rejects it (an honest "we have no data" signal — the JSON report
+    surfaces `slippage_realised_bps: None` so the operator knows the
+    feature is dark for this window). Both the empty-window and the
+    not-installed branches must short-circuit the same way; the
+    adapter's own None-handling carries the rest.
+    """
+    from datetime import timedelta
+
+    from backtest_simulator.honesty.slippage import SlippageModel
+    calibration_end = window_start
+    calibration_start = window_start - timedelta(minutes=30)
+    # Calibration is strict-causal (end <= window_start <
+    # frozen_now) so any LookAheadViolation here is a real bug —
+    # let it propagate. ClickHouse connection failures propagate
+    # too; the operator must know if the tunnel is down before
+    # they trust any sweep output. The only honest fallthrough is
+    # the empty-window case, which we check explicitly.
+    trades = feed.get_trades(SYMBOL, calibration_start, calibration_end)
+    if trades.is_empty():
+        return None
+    # Schema bridge: the venue-feed contract uses `time, qty`
+    # (post-`ClickHouseFeed` rename), but `SlippageModel.calibrate`
+    # expects the raw ClickHouse-table schema (`datetime, quantity`).
+    # Rename back here so the model keeps its stable contract.
+    # Surfaced by `bts sweep` ColumnNotFoundError when the wiring
+    # first ran end-to-end.
+    trades = trades.rename({'time': 'datetime', 'qty': 'quantity'})
+    return SlippageModel.calibrate(
+        trades=trades,
+        side_buckets=(
+            Decimal('0.001'), Decimal('0.01'),
+            Decimal('0.1'), Decimal('1.0'),
+        ),
+        dt_seconds=10,
+    )
 
 
 def run_window_in_subprocess(

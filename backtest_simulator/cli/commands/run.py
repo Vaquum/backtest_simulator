@@ -3,10 +3,10 @@
 # Thin wrapper over `backtest_simulator.cli._run_window.run_window_in_subprocess`
 # that consumes one decoder + one window and either prints the human-
 # readable summary (`--output-format text`) or emits the structured JSON
-# report (`--output-format json`). The JSON report is what tasks 11/12/13
-# extend with `book_gap_max_seconds`, `slippage_realised_bps`, and
-# `market_impact_realised_bps`; until those land, the report only carries
-# `trades`, `orders`, and `declared_stops`.
+# report (`--output-format json`). `slippage_realised_bps` reflects the
+# calibrated SlippageModel applied to every taker fill in this run;
+# `book_gap_max_seconds` and `market_impact_realised_bps` are populated
+# by their own wiring tasks once they land.
 from __future__ import annotations
 
 import argparse
@@ -79,9 +79,9 @@ def _run(args: argparse.Namespace) -> int:
             'orders': result['orders'],
             'trades': trades_raw,
             'declared_stops': stops_raw,
-            # Tasks 11/12/13 will populate these from in-process metrics.
             'book_gap_max_seconds': None,
-            'slippage_realised_bps': None,
+            'slippage_realised_bps': result.get('slippage_realised_bps'),
+            'slippage_n_samples': result.get('slippage_n_samples', 0),
             'market_impact_realised_bps': None,
         }
         sys.stdout.write(json.dumps(report) + '\n')
