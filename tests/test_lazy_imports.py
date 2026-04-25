@@ -11,7 +11,7 @@ names raises a clear `ImportError` with install guidance.
 
 These tests run on the integration install (so the lazy names ARE
 loaded). To exercise the slim-install branch we temporarily inject
-a fake `_INTEGRATION_ERROR` into the module and verify the fallback
+a fake `_integration_error` into the module and verify the fallback
 behaviour, then restore it.
 """
 from __future__ import annotations
@@ -33,12 +33,12 @@ def test_pure_python_reexports_always_work() -> None:
 
 
 @pytest.mark.skipif(
-    bs._INTEGRATION_ERROR is not None,
+    bs._integration_error is not None,
     reason='requires the [integration] extra to be installed',
 )
 def test_integration_names_load_eagerly_with_extras() -> None:
     # On the integration install (the test runner's environment) the
-    # eager try-block succeeded, _INTEGRATION_ERROR is None, and the
+    # eager try-block succeeded, _integration_error is None, and the
     # integration names resolve directly off the module. On a slim
     # install this test is skipped — the slim path is exercised by
     # `test_getattr_raises_loud_when_integration_missing` below
@@ -50,11 +50,11 @@ def test_integration_names_load_eagerly_with_extras() -> None:
 
 def test_getattr_raises_loud_when_integration_missing() -> None:
     # Simulate a slim install by injecting an ImportError into the
-    # module's `_INTEGRATION_ERROR` slot. `__getattr__` must raise an
+    # module's `_integration_error` slot. `__getattr__` must raise an
     # ImportError with install guidance, NOT silently fall through
     # to AttributeError or return None.
-    saved = bs._INTEGRATION_ERROR
-    bs._INTEGRATION_ERROR = ImportError('simulated: limen not installed')
+    saved = bs._integration_error
+    bs._integration_error = ImportError('simulated: limen not installed')
     try:
         with pytest.raises(ImportError, match=r'requires the \[integration\] extra'):
             bs.__getattr__('BacktestLauncher')
@@ -63,7 +63,7 @@ def test_getattr_raises_loud_when_integration_missing() -> None:
         with pytest.raises(ImportError, match=r'requires the \[integration\] extra'):
             bs.__getattr__('install_cache')
     finally:
-        bs._INTEGRATION_ERROR = saved
+        bs._integration_error = saved
 
 
 def test_getattr_unknown_name_raises_attribute_error() -> None:
@@ -78,7 +78,7 @@ def test_partial_integration_cleanup_drops_succeeded_names() -> None:
 
     Pre-cleanup pattern: `_limen_cache` succeeds, `launcher` fails.
     `install_cache` stays in module globals from the first import,
-    `bs.install_cache` returns the live function, but `_INTEGRATION_ERROR`
+    `bs.install_cache` returns the live function, but `_integration_error`
     is set — the surface is inconsistent (some lazy names work, others
     raise). Post-fix the except branch drops every name in `_LAZY_NAMES`
     so all four resolve uniformly through `__getattr__`.
@@ -92,11 +92,11 @@ def test_partial_integration_cleanup_drops_succeeded_names() -> None:
     bs_globals = vars(bs)
     # Snapshot every lazy-name binding (including absent ones).
     saved = {n: bs_globals.get(n, _ABSENT) for n in bs._LAZY_NAMES}
-    saved_error = bs._INTEGRATION_ERROR
+    saved_error = bs._integration_error
     sentinel = object()
     try:
         bs_globals['install_cache'] = sentinel
-        bs._INTEGRATION_ERROR = ImportError('simulated partial')
+        bs._integration_error = ImportError('simulated partial')
         # Re-run the cleanup snippet the except branch uses.
         for _n in bs._LAZY_NAMES:
             bs_globals.pop(_n, None)
@@ -109,7 +109,7 @@ def test_partial_integration_cleanup_drops_succeeded_names() -> None:
         with pytest.raises(ImportError, match=r'requires the \[integration\] extra'):
             bs.__getattr__('install_cache')
     finally:
-        bs._INTEGRATION_ERROR = saved_error
+        bs._integration_error = saved_error
         # Restore every snapshot — set the ones that were present,
         # leave the ones that were absent absent.
         for name, value in saved.items():

@@ -31,7 +31,7 @@ try:
     from backtest_simulator.launcher import BacktestLauncher, BacktestMarketDataPoller
     from backtest_simulator.venue.simulated import SimulatedVenueAdapter
 except ImportError as _e:
-    _INTEGRATION_ERROR: ImportError | None = _e
+    _integration_error: ImportError | None = _e
     # Drop any names that succeeded before the failed import. Without
     # this cleanup a partial-integration env (e.g. limen installed but
     # praxis absent) leaves the earlier name in globals and bypasses
@@ -41,19 +41,18 @@ except ImportError as _e:
     # idempotent for names that were never assigned.
     for _n in _LAZY_NAMES:
         globals().pop(_n, None)
-    del _n
 else:
-    _INTEGRATION_ERROR = None
+    _integration_error = None
 
 
 def __getattr__(name: str) -> object:
-    if _INTEGRATION_ERROR is not None and name in _LAZY_NAMES:
+    if _integration_error is not None and name in _LAZY_NAMES:
         msg = (
             f'backtest_simulator.{name} requires the [integration] extra. '
             f'Install: pip install backtest_simulator[integration]. '
-            f'Underlying ImportError: {_INTEGRATION_ERROR}'
+            f'Underlying ImportError: {_integration_error}'
         )
-        raise ImportError(msg) from _INTEGRATION_ERROR
+        raise ImportError(msg) from _integration_error
     raise AttributeError(f'module backtest_simulator has no attribute {name!r}')
 
 
