@@ -32,6 +32,7 @@
   "backtest_simulator/pipeline/_strategy_templates/long_on_signal.py": 140,
   "backtest_simulator/strategies/__init__.py": 30,
   "backtest_simulator/strategies/buy_and_hold.py": 160,
+  "backtest_simulator/strategies/inverse_prescient.py": 200,
   "backtest_simulator/strategies/over_trading.py": 160,
   "backtest_simulator/strategies/random_timing.py": 200,
   "backtest_simulator/strategies/zero_trade.py": 80,
