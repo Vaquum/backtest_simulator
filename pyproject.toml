@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "backtest_simulator"
-version = "1.5.2"
+version = "1.6.0"
 description = "Honest, gate-enforced backtester for unmodified Nexus strategies against unmodified Praxis."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -191,6 +191,16 @@ max-statements = 50
 # signature (it wraps SimulatedVenueAdapter.submit_order without
 # changing arity).
 "backtest_simulator/launcher/launcher.py" = ["PLR0913"]
+# The CLI subcommand modules legitimately print() per-run summaries to
+# stdout (the operator's debug surface) and the sweep / run / pipeline
+# orchestration carries enough branches to exceed PLR0912 / PLR0915.
+# These are CLI surfaces, not library code; the bloat caps are aimed
+# at the latter. Same exemption set as `scripts/`.
+"backtest_simulator/cli/**/*.py" = [
+  "C901", "PLR0912", "PLR0913", "PLR0915",
+  "T201",
+  "ERA001", "D200", "D205", "D415",
+]
 "tests/**/*.py" = [
   "S101", "ANN", "BLE001",
   "PLR0912", "PLR0913", "PLR0915",

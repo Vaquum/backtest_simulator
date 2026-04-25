@@ -78,6 +78,16 @@ EXPECTED_RUFF_POLICY: Final[dict[str, object]] = {
         # signature exactly so it can replace the adapter's method
         # via setattr without breaking the Protocol.
         'backtest_simulator/launcher/launcher.py': ['PLR0913'],
+        # M2 Task 1 (slice #17): the CLI subcommand modules
+        # legitimately print() per-run summaries to stdout (the
+        # operator's debug surface) and the sweep / run / pipeline
+        # orchestration carries enough branches to exceed PLR0912 /
+        # PLR0915. Same exemption set as `scripts/`.
+        'backtest_simulator/cli/**/*.py': [
+            'C901', 'PLR0912', 'PLR0913', 'PLR0915',
+            'T201',
+            'ERA001', 'D200', 'D205', 'D415',
+        ],
     },
 }
 
