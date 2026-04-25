@@ -71,7 +71,13 @@ The plan: drive the existing pipeline (UEL → ManifestBuilder → BacktestLaunc
 - [ ] **Task 24.** 3 integration test files: `test_end_to_end`, `test_cli_end_to_end`, `test_notebook_execution`.
 - [ ] **Task 25.** `notebooks/sweep_and_analyze.ipynb` — operator-facing demo notebook; `jupyter nbconvert --to script | python -` runs end-to-end.
 
-### Final phase (after all 25 tasks land)
+### P0 architectural honesty gaps surfaced mid-slice (added 2026-04-25)
+
+- [ ] **Task 26.** Outcome-driven strategy state. `StrategyContext.positions` and `capital_available` are populated from real `CapitalState` + `Account` (currently empty / zero in `launcher.py:687`). Strategy templates flip `_long` / `_entry_qty` only inside `on_outcome` after a confirmed fill (currently flipped at action-emit time in over_trading / buy_and_hold). Partial fills surface back so the strategy emits a corrective close for the *actual* filled qty. Without this fix a rejection or partial-fill leaves the strategy believing it owns a position it does not, then later emits a SELL for the wrong quantity.
+- [ ] **Task 27.** SELL closes flow through CAPITAL stage. `action_submitter.py:367` short-circuits SELL with `ValidationDecision(allowed=True)` and logs "CAPITAL skipped" — the close never lands in `validation_pipeline.validate`. Fix routes SELL through `validate` so reservation release, PnL update, and position decrement land in the canonical lifecycle. Allow remains True for a close, but the *machinery* runs.
+- [ ] **Task 28.** Scope `threading.Timer.run` patch to `accelerated_clock`. `launcher/clock.py:117` does `setattr(threading.Timer, 'run', _frozen_aware_timer_run)` at module import — any process that imports `backtest_simulator` gets timer semantics globally rewritten, including paper/live code that imports the package for *any* reason. Move the patch inside the `accelerated_clock` context manager (save the original and restore on exit) so the rewrite is scoped to the frozen-clock backtest only.
+
+### Final phase (after all 28 tasks land)
 
 - Codex full-PR review until codex approves the PR.
 - Re-request `zero-bang`; address comments; re-request until zero-bang approves.

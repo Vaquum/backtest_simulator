@@ -22,7 +22,7 @@ from praxis.infrastructure.venue_adapter import (
     SymbolFilters as PraxisSymbolFilters,
 )
 
-from backtest_simulator.feed.protocol import HistoricalFeed
+from backtest_simulator.feed.protocol import VenueFeed
 from backtest_simulator.venue import _adapter_internals as _I
 from backtest_simulator.venue.fees import FeeSchedule
 from backtest_simulator.venue.fills import walk_trades
@@ -35,7 +35,7 @@ class SimulatedVenueAdapter:
 
     def __init__(
         self,
-        feed: HistoricalFeed,
+        feed: VenueFeed,
         filters: BinanceSpotFilters,
         fees: FeeSchedule,
         fill_config: FillModelConfig | None = None,
@@ -127,7 +127,12 @@ class SimulatedVenueAdapter:
             return SubmitResult(
                 venue_order_id=venue_order_id, status=OrderStatus.REJECTED, immediate_fills=(),
             )
-        trades = self._feed.get_trades(
+        # The venue carve-out: peek up to `trade_window_seconds` past
+        # `frozen_now()` to simulate a realistic submit→fill window.
+        # The strategy-facing `get_trades` does not accept a kwarg for
+        # this — `_get_trades_for_venue` is the only path with the
+        # bounded peek. See `feed/protocol.py` for the rationale.
+        trades = self._feed._get_trades_for_venue(
             symbol, order.submit_time,
             order.submit_time + _I.window_seconds(self._trade_window_seconds),
             venue_lookahead_seconds=self._trade_window_seconds,

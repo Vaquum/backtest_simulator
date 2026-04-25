@@ -7,7 +7,7 @@ from typing import cast
 import pytest
 from praxis.launcher import InstanceConfig, Launcher
 
-from backtest_simulator.feed.protocol import HistoricalFeed
+from backtest_simulator.feed.protocol import VenueFeed
 from backtest_simulator.launcher import BacktestLauncher, BacktestMarketDataPoller
 
 
@@ -100,15 +100,21 @@ def test_launcher_rejects_both_event_spine_and_db_path() -> None:
         def get_trades(self, *_a: object, **_k: object) -> object:
             import polars as pl
             return pl.DataFrame()
+        def _get_trades_for_venue(self, *_a: object, **_k: object) -> object:
+            import polars as pl
+            return pl.DataFrame()
         def get_window(self, *_a: object, **_k: object) -> object:
             import polars as pl
             return pl.DataFrame()
 
     adapter = SimulatedVenueAdapter(
-        # `_StubFeed` duck-types HistoricalFeed — cast names the
-        # Protocol boundary explicitly instead of suppressing the
-        # assignment mismatch.
-        feed=cast(HistoricalFeed, _StubFeed()),
+        # `_StubFeed` duck-types VenueFeed — cast names the Protocol
+        # boundary explicitly instead of suppressing the assignment
+        # mismatch. The adapter requires `_get_trades_for_venue` for
+        # the bounded fill-window peek; a strategy-only `HistoricalFeed`
+        # stub would satisfy the wider Protocol but crash on submit,
+        # so the stub here implements both methods.
+        feed=cast(VenueFeed, _StubFeed()),
         filters=BinanceSpotFilters.binance_spot('BTCUSDT'),
         fees=FeeSchedule(),
     )

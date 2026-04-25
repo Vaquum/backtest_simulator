@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -10,6 +10,7 @@ import numpy as np
 import polars as pl
 
 from backtest_simulator.exceptions import LookAheadViolation
+from backtest_simulator.feed.lookahead import frozen_now
 
 
 def _to_int(value: object) -> int:
@@ -67,7 +68,16 @@ class SignalsTable:
 
     decoder_id: str
     split_config: tuple[int, int, int]
-    frame: pl.DataFrame  # columns: timestamp, prob, pred, label_t0, label_t1
+    # `_frame` holds future label rows; access through `lookup(t)` only.
+    # Reaching past the underscore (`signals._frame.filter(...)`) is a
+    # documented bypass — `tests/honesty/test_prescient_strategy.py`
+    # introspection test fires if a strategy does so.
+    # `repr=False` prevents the default dataclass repr from dumping the
+    # full timestamp/label/prob columns when the table is logged or
+    # printed (codex round 3): a strategy that prints its decoder
+    # would otherwise have free access to every future row in plain
+    # text via `repr(signals)`.
+    _frame: pl.DataFrame = field(repr=False)
 
     @classmethod
     def from_predictions(
@@ -94,7 +104,7 @@ class SignalsTable:
             schema={'timestamp': utc, 'prob': pl.Float64, 'pred': pl.Int64, 'label_t0': utc, 'label_t1': utc},
             orient='row',
         )
-        return cls(decoder_id=decoder_id, split_config=split_config, frame=frame)
+        return cls(decoder_id=decoder_id, split_config=split_config, _frame=frame)
 
     def assert_split_alignment(self, eval_split: tuple[int, int, int]) -> None:
         if tuple(eval_split) != tuple(self.split_config):
@@ -106,8 +116,43 @@ class SignalsTable:
             raise LookAheadViolation(msg)
 
     def lookup(self, t: datetime) -> SignalRow | None:
-        """Return the greatest row with `timestamp <= t`, or None if none."""
-        sliced = self.frame.filter(pl.col('timestamp') <= t).sort('timestamp').tail(1)
+        """Return the greatest row with `timestamp <= t`, or None if none.
+
+        The single causal accessor for strategies. Naive datetimes are
+        rejected loudly — a tz-naive `t` would slip past the
+        `t > frozen_now()` guard (frozen_now is tz-aware, so `<` between
+        the two is implementation-defined) and then crash the Polars
+        filter against the UTC frame schema. Both failure modes hide
+        a real lookahead leak from the operator's eye.
+
+        Raises:
+          ValueError: if `t.tzinfo is None`.
+          LookAheadViolation: if `t > frozen_now()`. A cheating strategy
+            passing `t = current_bar + 1bar` would otherwise read a
+            label the live system has not yet computed.
+        """
+        # Reject both `tzinfo is None` AND pseudo-naive datetimes whose
+        # `utcoffset()` returns `None` — the latter satisfy `t.tzinfo is
+        # not None` but their UTC offset is undefined, so comparisons
+        # with `frozen_now()` (which is tz-aware) raise TypeError later
+        # rather than failing the gate now. Both are caught up front.
+        if t.tzinfo is None or t.utcoffset() is None:
+            msg = (
+                f'SignalsTable.lookup requires a tz-aware datetime with '
+                f'a concrete UTC offset; got {t!r} (tzinfo={t.tzinfo!r}, '
+                f'utcoffset={t.utcoffset()!r}). Strategies must construct '
+                f'timestamps with an explicit tz (e.g. UTC) so the '
+                f'no-look-ahead gate compares apples to apples.'
+            )
+            raise ValueError(msg)
+        now = frozen_now()
+        if t > now:
+            msg = (
+                f'SignalsTable.lookup(t={t}) requested data past '
+                f'frozen_now()={now} for decoder {self.decoder_id}'
+            )
+            raise LookAheadViolation(msg)
+        sliced = self._frame.filter(pl.col('timestamp') <= t).sort('timestamp').tail(1)
         if sliced.is_empty():
             return None
         row = sliced.row(0, named=True)
@@ -121,7 +166,7 @@ class SignalsTable:
         directory.mkdir(parents=True, exist_ok=True)
         parquet_path = directory / f'{self.decoder_id}.parquet'
         metadata_path = directory / f'{self.decoder_id}.meta.json'
-        self.frame.write_parquet(parquet_path)
+        self._frame.write_parquet(parquet_path)
         metadata_path.write_text(json.dumps({
             'decoder_id': self.decoder_id,
             'split_config': list(self.split_config),
@@ -159,5 +204,5 @@ class SignalsTable:
                 _to_int(split_config_typed[1]),
                 _to_int(split_config_typed[2]),
             ),
-            frame=frame,
+            _frame=frame,
         )

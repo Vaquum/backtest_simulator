@@ -31,17 +31,63 @@ os.environ.setdefault('CLICKHOUSE_USER', 'default')
 os.environ.setdefault('CLICKHOUSE_DATABASE', 'origo')
 
 
+_REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
+_DOTENV_PATH: Final[Path] = _REPO_ROOT / '.env'
+
+
+def _hydrate_environ_from_dotenv() -> None:
+    """Inject `<repo>/.env` keys into `os.environ` if not already set.
+
+    Why: subprocess workers (`bts sweep`'s per-run forks) re-read
+    `os.environ` via `ClickHouseFeed.from_env()` and never see the
+    project `.env` on their own. Loading once at module import in the
+    parent makes the values inherit naturally to every child fork.
+    `setdefault` is used so a real shell-exported value still wins —
+    the `.env` is the bottom of the resolution stack.
+    """
+    if not _DOTENV_PATH.is_file():
+        return
+    for raw in _DOTENV_PATH.read_text(encoding='utf-8').splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        k, _, v = line.partition('=')
+        key = k.strip()
+        val = v.strip()
+        if not key:
+            continue
+        # Strip a single matching pair of surrounding quotes — `.env`
+        # convention so values with whitespace round-trip cleanly.
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+            val = val[1:-1]
+        os.environ.setdefault(key, val)
+
+
+# Run on import so any subprocess forked AFTER this module loads in
+# the parent inherits the populated environment.
+_hydrate_environ_from_dotenv()
+
+
 def _require_password() -> str:
-    """Return CLICKHOUSE_PASSWORD or fail loud with the env-var name."""
+    """Return ClickHouse password from environment (which now includes .env).
+
+    `.env` is hydrated into `os.environ` at module import (see
+    `_hydrate_environ_from_dotenv`), so a single `os.environ` lookup
+    covers shell-exported, dotenv-loaded, and subprocess-inherited
+    paths uniformly. Fails loud with both setup paths if neither is
+    available — never swallowed: bts sweep / run cannot proceed
+    without a real password.
+    """
     pw = os.environ.get('CLICKHOUSE_PASSWORD')
-    if not pw:
-        msg = (
-            'CLICKHOUSE_PASSWORD is not set. Export it in your shell '
-            '(e.g. via direnv or `export CLICKHOUSE_PASSWORD=...`) '
-            'before running `bts run` / `bts sweep`.'
-        )
-        raise RuntimeError(msg)
-    return pw
+    if pw:
+        return pw
+    msg = (
+        'ClickHouse password unavailable. Set CLICKHOUSE_PASSWORD in '
+        f'your shell or add `CLICKHOUSE_PASSWORD=...` to {_DOTENV_PATH} '
+        '(the project-root .env file is gitignored). Without one of '
+        'these, `bts run` / `bts sweep` cannot reach the tdw database.'
+    )
+    raise RuntimeError(msg)
 
 SYMBOL: Final[str] = 'BTCUSDT'
 EXP_DIR: Final[Path] = Path('/tmp/bts_sweep/experiments')
@@ -68,18 +114,56 @@ _NUMERIC_COLS: Final[tuple[str, ...]] = (
 def preflight_tunnel() -> None:
     """Verify the ClickHouse tunnel by querying for one recent BTCUSDT trade.
 
-    Fails loud with the exact reopen command (in the error message) so
-    the operator knows what to do. Connection params come from the env
-    vars set above.
+    Three failure modes reported separately so the operator knows
+    exactly what to fix:
+
+      1. Password missing — the `_require_password()` error surfaces
+         unchanged (env-var or `<repo>/.env`).
+      2. Tunnel down / port not reachable — narrow socket-level probe
+         on `(host, port)` BEFORE invoking `clickhouse_connect`. Emits
+         the exact `ssh -fN -L` reopen command. Codex pinned this:
+         `clickhouse_connect.get_client()` runs autoconnect server
+         queries during init, so wrapping `get_client()` in a generic
+         try/except would misclassify auth refusals as tunnel failures.
+      3. Database / auth / query failed — `get_client(...)` and the
+         probe query raised. Surface the underlying error verbatim
+         (auth refused, table missing, etc.) instead of pretending
+         the tunnel is down.
     """
+    import socket
+
     import clickhouse_connect
+
+    # Resolve password OUTSIDE the try blocks — its failure is its own
+    # error class and must not be repackaged as a tunnel hint.
+    password = _require_password()
+    host = os.environ['CLICKHOUSE_HOST']
+    port = int(os.environ['CLICKHOUSE_PORT'])
+    user = os.environ['CLICKHOUSE_USER']
+    database = os.environ['CLICKHOUSE_DATABASE']
+
+    # Tunnel-class: narrow socket-level connectivity probe. If the
+    # local tunnel port is not bound or the server side is not
+    # reachable through it, the socket connect raises here — well
+    # before clickhouse_connect's init can confuse the diagnosis.
+    try:
+        with socket.create_connection((host, port), timeout=2.0):
+            pass
+    except OSError as exc:
+        msg = (
+            f'ClickHouse tunnel unreachable at {host}:{port} ({exc!r}). '
+            f'Open the tunnel with: '
+            f'ssh -fN -L {port}:127.0.0.1:8123 root@<clickhouse-host>'
+        )
+        raise RuntimeError(msg) from exc
+
+    # Auth/query-class: get_client() may issue server queries during
+    # init (autoconnect common-settings probe), and the probe query
+    # below validates database access. Both raise into the same class.
     try:
         client = clickhouse_connect.get_client(
-            host=os.environ['CLICKHOUSE_HOST'],
-            port=int(os.environ['CLICKHOUSE_PORT']),
-            username=os.environ['CLICKHOUSE_USER'],
-            password=_require_password(),
-            database=os.environ['CLICKHOUSE_DATABASE'],
+            host=host, port=port, username=user, password=password,
+            database=database,
         )
         rows = client.query(
             'SELECT toString(datetime) FROM origo.binance_daily_spot_trades '
@@ -87,12 +171,17 @@ def preflight_tunnel() -> None:
         ).result_rows
     except Exception as exc:
         msg = (
-            f'ClickHouse tunnel preflight failed ({exc!r}). Reopen with: '
-            f'ssh -fN -L 18123:127.0.0.1:8123 root@<clickhouse-host>'
+            f'ClickHouse query failed against {host}:{port}/{database} '
+            f'({exc!r}). The tunnel is reachable (socket probe OK) but '
+            f'auth or database access was refused — verify '
+            f'CLICKHOUSE_PASSWORD matches what the server expects.'
         )
         raise RuntimeError(msg) from exc
     if not rows:
-        msg = 'origo.binance_daily_spot_trades returned zero rows.'
+        msg = (
+            f'origo.binance_daily_spot_trades returned zero rows on '
+            f'{host}:{port}; the tdw table is empty or filtered out.'
+        )
         raise RuntimeError(msg)
 
 

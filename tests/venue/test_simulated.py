@@ -19,24 +19,16 @@ from typing import cast
 import polars as pl
 from praxis.core.domain.enums import OrderSide, OrderStatus, OrderType
 
-from backtest_simulator.feed.protocol import HistoricalFeed
+from backtest_simulator.feed.protocol import VenueFeed
 from backtest_simulator.venue.fees import FeeSchedule
 from backtest_simulator.venue.filters import BinanceSpotFilters
 from backtest_simulator.venue.simulated import SimulatedVenueAdapter
 
 
 class _EmptyFeed:
-    """HistoricalFeed that returns no trades for any window — exercises the no-fill path."""
+    """VenueFeed that returns no trades for any window — exercises the no-fill path."""
 
-    def get_trades(
-        self,
-        symbol: str,
-        start: datetime,
-        end: datetime,
-        *,
-        venue_lookahead_seconds: int = 0,
-    ) -> pl.DataFrame:
-        del symbol, start, end, venue_lookahead_seconds
+    def _empty_frame(self) -> pl.DataFrame:
         # `walk_trades` filters on a `time` column comparing against a
         # tz-aware UTC literal — the empty frame must declare the same
         # tz-aware Datetime dtype so the comparison's schema validates.
@@ -47,10 +39,25 @@ class _EmptyFeed:
             'trade_id': pl.Int64,
         })
 
+    def get_trades(self, symbol: str, start: datetime, end: datetime) -> pl.DataFrame:
+        del symbol, start, end
+        return self._empty_frame()
+
+    def _get_trades_for_venue(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        *,
+        venue_lookahead_seconds: int,
+    ) -> pl.DataFrame:
+        del symbol, start, end, venue_lookahead_seconds
+        return self._empty_frame()
+
 
 def _adapter() -> SimulatedVenueAdapter:
     return SimulatedVenueAdapter(
-        feed=cast(HistoricalFeed, _EmptyFeed()),
+        feed=cast(VenueFeed, _EmptyFeed()),
         filters=BinanceSpotFilters.binance_spot('BTCUSDT'),
         fees=FeeSchedule(),
         trade_window_seconds=60,
