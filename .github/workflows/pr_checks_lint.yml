@@ -82,6 +82,13 @@ jobs:
       - name: Dead-code (vulture)
         run: .venv-lint/bin/python -m vulture backtest_simulator/ --min-confidence 80
 
+      - name: No-swallowed-violations gate
+        # AST gate. Forbids any `except` (bare, dotted, or aliased)
+        # that catches HonestyViolation or any subclass under
+        # backtest_simulator/ or tests/. Honesty violations must reach
+        # the test boundary; production code can never swallow them.
+        run: .venv-lint/bin/python scripts/check_no_swallowed_violations.py
+
       - name: Coverage floor gate
         # Hard-fail only: no soft-fail markers, no pipeline bypass. If
         # pytest blows up during the coverage run the gate fails exactly

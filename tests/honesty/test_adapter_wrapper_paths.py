@@ -170,6 +170,72 @@ def test_partially_filled_releases_residual_reservation() -> None:
     )
 
 
+def test_expired_zero_fill_releases_reservation() -> None:
+    """EXPIRED (validated, no liquidity in window) must release the reservation.
+
+    Pre-fix the wrapper only treated REJECTED as a release-and-return
+    terminal; EXPIRED fell through to `_finalize_successful_fill` with
+    `fill_notional=0`. That popped the lifecycle but left the
+    CapitalController's `working_order_notional` locked at the original
+    reservation, under-counting available capital on every subsequent
+    validation. Post-fix EXPIRED routes through `record_rejection`
+    (releases reservation cleanly).
+
+    Mutation proof: if the launcher's status branch reverts to
+    `if status_name == 'REJECTED'` only, this test fires by either
+    (a) tracker.pending_count != 0 (lifecycle still hanging), or
+    (b) capital_state.reservation_notional != 0 (lock leaked).
+    """
+    _pipeline, _controller, capital_state = build_validation_pipeline(
+        capital_pool=Decimal('100000'),
+    )
+    tracker = _tracker_with_pending(capital_state, notional=Decimal('1000'))
+    # Pre-state assertion: the reservation IS holding 1000 (with fees) in
+    # `reservation_notional`. The test verifies it's released after the
+    # EXPIRED outcome.
+    assert capital_state.reservation_notional > 0
+    result = SimpleNamespace(
+        status=SimpleNamespace(name='EXPIRED'),
+        venue_order_id='VENUE-1',
+        immediate_fills=[],
+    )
+    adapter = _FakeAdapter(result)
+    _install_capital_adapter_wrapper(
+        adapter=adapter, tracker=tracker, capital_state=capital_state,
+        initial_pool=Decimal('100000'), declared_stops={},
+    )
+    asyncio.run(adapter.submit_order(
+        'bts-acct', 'BTCUSDT', OrderSide.BUY,
+        SimpleNamespace(name='MARKET'), Decimal('1'),
+        client_order_id='SS-cmd1-000',
+    ))
+    # Post-state invariants:
+    assert tracker.pending_count == 0, (
+        f'expected tracker pending_count=0 after EXPIRED, '
+        f'got {tracker.pending_count} — release path did not fire.'
+    )
+    assert capital_state.reservation_notional == Decimal('0'), (
+        f'expected reservation_notional=0 after EXPIRED release, got '
+        f'{capital_state.reservation_notional}. Capital lock leaked.'
+    )
+    # Critical regression catch: if the wrapper falls back to
+    # `_finalize_successful_fill` on EXPIRED, `record_ack_and_fill(
+    # fill_notional=0)` moves the reservation through `send_order` →
+    # `order_ack` → `order_fill(0)` and parks the un-filled notional in
+    # `working_order_notional`. The reservation_notional check above
+    # would still pass under that regression. This invariant is the
+    # one that fails loud if the EXPIRED status branch is removed.
+    assert capital_state.working_order_notional == Decimal('0'), (
+        f'expected working_order_notional=0 after EXPIRED release, got '
+        f'{capital_state.working_order_notional}. The EXPIRED status was '
+        f'routed through the fill path instead of the release path.'
+    )
+    assert capital_state.position_notional == Decimal('0'), (
+        f'expected position_notional=0 (no fill happened), got '
+        f'{capital_state.position_notional}.'
+    )
+
+
 def test_unmatched_buy_raises_runtime_error() -> None:
     # No pending reservation → a BUY that reaches the wrapper has
     # bypassed the CAPITAL gate. Must fail loud.

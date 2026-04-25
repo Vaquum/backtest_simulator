@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "backtest_simulator"
-version = "1.5.1"
+version = "1.5.2"
 description = "Honest, gate-enforced backtester for unmodified Nexus strategies against unmodified Praxis."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,6 +15,12 @@ dependencies = [
   "scipy>=1.13",
   "aiosqlite>=0.20",
   "clickhouse-connect>=0.7",
+  # `feed/clickhouse.py` imports pyarrow at module scope to convert
+  # the ClickHouse arrow-format query into polars; without it the
+  # eager `from backtest_simulator.feed.clickhouse import ...` in
+  # `__init__.py` fails on a slim install before the lazy
+  # integration block has a chance to run.
+  "pyarrow>=15.0",
   "orjson>=3.10",
 ]
 

@@ -41,13 +41,28 @@ class BinanceSpotFilters:
         multiples = (price / self.tick_size).to_integral_value(rounding='ROUND_HALF_EVEN')
         return multiples * self.tick_size
 
-    def validate(self, qty: Decimal, price: Decimal) -> str | None:
-        """Return rejection reason string, or None if the order is acceptable."""
+    def validate(self, qty: Decimal, price: Decimal | None = None) -> str | None:
+        """Return rejection reason string, or None if the order is acceptable.
+
+        Enforces LOT_SIZE (min/max qty AND step_size multiple). When
+        `price` is provided, also enforces PRICE_FILTER (tick_size
+        multiple) and MIN_NOTIONAL (qty * price >= min_notional).
+        MARKET orders pass `price=None` and are exempt from the price-
+        side checks since their reference price is the tape, not a
+        declared limit. This matches Binance Spot's actual filter
+        behaviour: orders with bad qty/price increments are rejected
+        before they hit the book, not silently rounded.
+        """
         if qty < self.min_qty:
             return f'LOT_SIZE: qty {qty} < min_qty {self.min_qty}'
         if qty > self.max_qty:
             return f'LOT_SIZE: qty {qty} > max_qty {self.max_qty}'
-        notional = qty * price
-        if notional < self.min_notional:
-            return f'MIN_NOTIONAL: {notional} < {self.min_notional}'
+        if self.step_size > 0 and qty % self.step_size != 0:
+            return f'LOT_SIZE: qty {qty} not a multiple of step_size {self.step_size}'
+        if price is not None:
+            if self.tick_size > 0 and price % self.tick_size != 0:
+                return f'PRICE_FILTER: price {price} not a multiple of tick_size {self.tick_size}'
+            notional = qty * price
+            if notional < self.min_notional:
+                return f'MIN_NOTIONAL: {notional} < {self.min_notional}'
         return None

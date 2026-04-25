@@ -59,6 +59,14 @@ _INTEGRATION_DEPENDENT_GLOBS: tuple[str, ...] = (
     'launcher/*',
     'pipeline/*',
     'integration/*',
+    # `tests/venue/test_simulated.py` imports praxis at module scope
+    # for the OrderSide / OrderStatus / OrderType enums, so it can't
+    # be collected without the integration libs. `tests/venue/test_filters.py`
+    # only needs `backtest_simulator.venue.filters` (pure-Python),
+    # but the directory pattern is dropped wholesale to keep the skip
+    # rule simple. (Slim install sees only `tests/test_lazy_imports.py`
+    # and `tests/tools/`.)
+    'venue/*',
 )
 
 collect_ignore_glob: list[str] = (

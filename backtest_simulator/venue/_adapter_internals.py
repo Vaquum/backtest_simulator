@@ -30,6 +30,27 @@ TYPE_MAP: dict[OrderType, str] = {
 }
 
 
+def zero_fill_status(order_type: str, time_in_force: str) -> OrderStatus:
+    """Pick the terminal status for a validated-but-unfilled order.
+
+    Live Binance keeps any GTC order on the book until it triggers,
+    crosses, or is cancelled — that includes LIMIT, STOP_LOSS,
+    STOP_LOSS_LIMIT, TAKE_PROFIT (and family). Only MARKET (which
+    never rests by definition) and IOC / FOK / GTX (which expire on
+    no immediate execution) terminate as EXPIRED on a zero-fill
+    window. Returning OPEN for the GTC family lets `query_open_orders`
+    surface still-live orders correctly; the simulator does NOT yet
+    re-attempt fills on subsequent windows for resting orders, but
+    the status reporting must match live's contract for backtest ≡
+    paper ≡ live status parity.
+    """
+    if order_type == 'MARKET':
+        return OrderStatus.EXPIRED
+    if time_in_force.upper() == 'GTC':
+        return OrderStatus.OPEN
+    return OrderStatus.EXPIRED
+
+
 @dataclass
 class Account:
     """Per-account bookkeeping kept by the simulated venue."""
@@ -76,13 +97,40 @@ def resolve_order(
 def reject_reason(
     order: PendingOrder, filters: BinanceSpotFilters, price: Decimal | None,
 ) -> str | None:
-    reference = price or order.stop_price
-    if reference is not None:
-        return filters.validate(order.qty, reference)
-    if order.qty < filters.min_qty:
-        return f'LOT_SIZE: qty {order.qty} < min_qty {filters.min_qty}'
-    if order.qty > filters.max_qty:
-        return f'LOT_SIZE: qty {order.qty} > max_qty {filters.max_qty}'
+    # `filters.validate(qty, price)` does the qty-side LOT_SIZE checks
+    # always, plus the price-side PRICE_FILTER + MIN_NOTIONAL when a
+    # `price` is given. The stop_price branch below is split by
+    # order_type because Binance treats stop_price differently:
+    #   - MARKET: stop_price is a backtest-side risk anchor (the fill
+    #     engine halts on breach). The venue NEVER sees it as a quoted
+    #     price, so PRICE_FILTER's tick_size rule does not apply — only
+    #     a min-notional sanity check. (Pre-fix `reference =
+    #     price or order.stop_price` would reject a MARKET BUY just
+    #     because its kelly-derived risk stop fell on a sub-tick
+    #     boundary like 69649.9876.)
+    #   - STOP_LOSS / STOP_LOSS_LIMIT / TAKE_PROFIT (and the LIMIT
+    #     variants): stop_price IS the venue-quoted trigger, so it
+    #     must be tick-aligned. Live Binance rejects a sub-tick
+    #     stopPrice; backtest must too, otherwise paper/live diverge.
+    reason = filters.validate(order.qty, price)
+    if reason is not None:
+        return reason
+    # Venue-quoted stop trigger: must be tick-aligned (and notional-sane
+    # on its own) for STOP_LOSS / STOP_LOSS_LIMIT / TAKE_PROFIT / TP_LIMIT.
+    # The check runs whether or not a limit price was also given —
+    # STOP_LOSS_LIMIT carries BOTH a tick-validated price AND a tick-
+    # validated stop_price, and live Binance rejects either if sub-tick.
+    if order.stop_price is not None and order.order_type != 'MARKET':
+        reason = filters.validate(order.qty, order.stop_price)
+        if reason is not None:
+            return reason
+    # MARKET-with-stop: stop is a risk anchor, no tick. When no limit
+    # price was given, still apply a min-notional sanity check via the
+    # stop reference.
+    if price is None and order.order_type == 'MARKET' and order.stop_price is not None:
+        notional = order.qty * order.stop_price
+        if notional < filters.min_notional:
+            return f'MIN_NOTIONAL: {notional} < {filters.min_notional}'
     return None
 
 

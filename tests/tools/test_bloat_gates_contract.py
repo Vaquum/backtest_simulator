@@ -22,6 +22,7 @@ GATE_SCRIPTS: Final[list[str]] = [
     'check_file_size_balance.py',
     'check_coverage_floor.py',
     'check_budget_ratchet.py',
+    'check_no_swallowed_violations.py',
 ]
 
 GATE_BANNERS: Final[dict[str, str]] = {
@@ -31,6 +32,7 @@ GATE_BANNERS: Final[dict[str, str]] = {
     'check_file_size_balance.py': 'FILE SIZE BALANCE GATE',
     'check_coverage_floor.py': 'COVERAGE FLOOR GATE',
     'check_budget_ratchet.py': 'BUDGET RATCHET GATE',
+    'check_no_swallowed_violations.py': 'NO SWALLOWED VIOLATIONS GATE',
 }
 
 
@@ -62,7 +64,7 @@ def test_module_budgets_covers_every_m1_path_from_issue_10() -> None:
         f'extra={sorted(bts_paths - actual_paths)}, '
         f'missing={sorted(actual_paths - bts_paths)}'
     )
-    assert len(script_paths) == 7, f'expected 7 scripts paths, got {len(script_paths)}'
+    assert len(script_paths) == 8, f'expected 8 scripts paths, got {len(script_paths)}'
 
 
 def _actual_bts_paths() -> set[str]:

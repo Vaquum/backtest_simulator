@@ -372,17 +372,56 @@ def _install_capital_adapter_wrapper(
             return result
         venue_order_id = result.venue_order_id
         status_name = result.status.name
-        if status_name == 'REJECTED':
+        # REJECTED (filter rejection, never reached the venue) and
+        # EXPIRED (validated, sent to the venue, didn't fill in window)
+        # both terminate without a fill, but their lifecycle audit
+        # trails differ:
+        #   - REJECTED: pre-send terminal. `record_rejection` while
+        #     `pending.sent=False` takes the `release_reservation`
+        #     path — releases capital before any send/ack lifecycle.
+        #   - EXPIRED: post-send terminal. The venue actually saw the
+        #     order, just didn't have liquidity. `record_sent` first
+        #     so the tracker's `pending.sent=True`, then
+        #     `record_rejection` takes the post-send `order_reject`
+        #     path (which is the right release method for an
+        #     accepted-then-expired order).
+        # Without the `record_sent` for EXPIRED, the audit trail would
+        # call `release_reservation` on an order that the venue had
+        # actually seen, diverging from live's accepted→expired shape.
+        if status_name in ('REJECTED', 'EXPIRED'):
+            if status_name == 'EXPIRED':
+                tracker.record_sent(command_id, venue_order_id)
             tracker.record_rejection(command_id, venue_order_id)
             assert_conservation(
                 capital_state, initial_pool,
                 context=f'order_reject command_id={command_id}',
             )
             _log.info(
-                'capital lifecycle: command_id=%s REJECTED (reservation released)',
-                command_id,
+                'capital lifecycle: command_id=%s %s (reservation released)',
+                command_id, status_name,
             )
             return result
+        if status_name == 'OPEN':
+            # `OPEN` means a GTC LIMIT / STOP_LOSS / STOP_LOSS_LIMIT /
+            # TAKE_PROFIT order is resting on the book waiting to
+            # trigger or cross. The capital lifecycle should keep the
+            # reservation locked AND keep the tracker entry alive
+            # (cancel/fill events arrive later). M1's strategy template
+            # only emits MARKET orders, so OPEN should never appear
+            # here in practice; if it does, fall through to
+            # `_finalize_successful_fill` would silently leak working-
+            # order notional. Fail loud with a pointer to the gap so
+            # future LIMIT support adds the proper resting-order path
+            # rather than masking it.
+            msg = (
+                f'OPEN status returned for command_id={command_id} venue_order_id='
+                f'{venue_order_id}: M1 emits MARKET only and the resting-order '
+                f'capital lifecycle path (record_resting / cancel coordination) '
+                f'is not yet wired. Adding LIMIT-style support requires extending '
+                f'`CapitalLifecycleTracker` and this branch together — see '
+                f'`_finalize_successful_fill` for the analogous fill path.'
+            )
+            raise RuntimeError(msg)
         _finalize_successful_fill(
             ctx, command_id, result, venue_order_id, status_name,
         )

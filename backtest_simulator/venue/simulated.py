@@ -95,10 +95,20 @@ class SimulatedVenueAdapter:
         account = self._require_account(account_id)
         venue_order_id = self._mint_order_id()
         coid = client_order_id or f'BTS-{venue_order_id}'
+        # `OrderType.LIMIT_IOC` collapses to `'LIMIT'` in `TYPE_MAP`,
+        # so without this nudge a caller that passes the IOC enum but
+        # leaves `time_in_force=None` would land on PendingOrder with
+        # `time_in_force='GTC'` and the zero-fill branch would mis-
+        # report the order as OPEN (resting) instead of EXPIRED. Force
+        # `IOC` whenever the enum carries it. (Other TIF mappings —
+        # FOK, GTX, GTC explicit — must be passed by the caller.)
+        effective_tif = time_in_force or (
+            'IOC' if order_type == OrderType.LIMIT_IOC else 'GTC'
+        )
         order = PendingOrder(
             order_id=venue_order_id, side=side.name, order_type=_I.TYPE_MAP[order_type],
             qty=qty, limit_price=price, stop_price=stop_price,
-            time_in_force=time_in_force or 'GTC', submit_time=self._now(), symbol=symbol,
+            time_in_force=effective_tif, submit_time=self._now(), symbol=symbol,
         )
         # Resolve the per-symbol filter record. `_symbol_filters` is the
         # authoritative source (populated via `load_filters()` at boot
@@ -132,10 +142,24 @@ class SimulatedVenueAdapter:
             fills, self._mint_trade_id,
         )
         filled_qty = sum((f.qty for f in immediate), Decimal('0'))
+        # Validation rejection (filter failure) returned earlier with
+        # status=REJECTED via the early branch above. By the time we
+        # reach this line the order passed validation. A zero-fill
+        # outcome's terminal status depends on `(order_type, TIF)`:
+        #   - MARKET (any TIF): there's no resting concept — no
+        #     liquidity in the window means the order failed to
+        #     execute; map to EXPIRED.
+        #   - LIMIT with GTC: live Binance keeps the order on the
+        #     book until it crosses or is cancelled. Mark OPEN so
+        #     `query_open_orders` surfaces it.
+        #   - LIMIT with IOC / FOK / GTX: window closed without
+        #     execution → EXPIRED.
+        # Pre-fix this branch returned REJECTED uniformly, conflating
+        # venue-rejection with no-fill-in-window.
         status = (
             OrderStatus.FILLED if filled_qty >= qty
             else OrderStatus.PARTIALLY_FILLED if filled_qty > 0
-            else OrderStatus.REJECTED
+            else _I.zero_fill_status(order.order_type, order.time_in_force)
         )
         account.orders[venue_order_id] = VenueOrder(
             venue_order_id=venue_order_id, client_order_id=coid,
