@@ -31,12 +31,20 @@ jobs:
           # workflows, with a lint coverage step that can't import the
           # very package it's measuring.
           python-version: '3.12'
+      - name: Install uv
+        # Standard pip's resolver treats `git+https://github.com/Vaquum/Limen`
+        # and `git+https://github.com/Vaquum/Limen@v2.4.3` as two distinct
+        # package URLs and aborts with `ResolutionImpossible` when both
+        # appear in one install (Praxis declares the untagged form, Nexus
+        # the tagged one). uv's resolver unifies the two URLs onto the
+        # same package — same path Praxis and Nexus use in their own CI.
+        uses: astral-sh/setup-uv@v4
       - name: Set up lint venv
         run: python -m venv .venv-lint
 
       - name: Install gate toolchain
         run: |
-          .venv-lint/bin/python -m pip install --upgrade pip \
+          uv pip install --python .venv-lint/bin/python \
             'ruff==0.15.11' \
             'vulture>=2.14' \
             'coverage[toml]>=7.6' \
@@ -54,7 +62,7 @@ jobs:
           # via git+https URLs that resolve through that PAT.
           git config --global credential.helper store
           echo "https://x-access-token:${{ secrets.SIBLING_INSTALL_TOKEN }}@github.com" > ~/.git-credentials
-          .venv-lint/bin/python -m pip install '.[integration]'
+          uv pip install --python .venv-lint/bin/python '.[integration]'
 
       - name: Run ruff lint (bloat-mechanical rules active)
         run: .venv-lint/bin/python -m ruff check backtest_simulator tools tests scripts
