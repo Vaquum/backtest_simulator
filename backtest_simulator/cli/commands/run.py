@@ -80,8 +80,17 @@ def _run(args: argparse.Namespace) -> int:
             'trades': trades_raw,
             'declared_stops': stops_raw,
             'book_gap_max_seconds': None,
+            # Signed mean (directional). Operator should NOT cite
+            # this as cost — see `slippage_realised_adverse_bps`.
             'slippage_realised_bps': result.get('slippage_realised_bps'),
+            # Cost metric: mean(|bps|). Survives round-trip cancellation.
+            'slippage_realised_adverse_bps': result.get(
+                'slippage_realised_adverse_bps',
+            ),
+            'slippage_realised_buy_bps': result.get('slippage_realised_buy_bps'),
+            'slippage_realised_sell_bps': result.get('slippage_realised_sell_bps'),
             'slippage_n_samples': result.get('slippage_n_samples', 0),
+            'slippage_n_excluded': result.get('slippage_n_excluded', 0),
             'market_impact_realised_bps': None,
         }
         sys.stdout.write(json.dumps(report) + '\n')

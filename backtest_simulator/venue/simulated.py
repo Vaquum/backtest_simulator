@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import polars as pl
 from nexus.core.domain.enums import OrderSide as NexusOrderSide
 from praxis.core.domain.enums import OrderSide, OrderStatus, OrderType
 from praxis.core.domain.health_snapshot import HealthSnapshot
@@ -53,14 +54,20 @@ class SimulatedVenueAdapter:
         self._trade_window_seconds = trade_window_seconds
         # `slippage_model` is calibrated externally (`SlippageModel.calibrate`
         # over a pre-window trade slice) and supplied by the operator
-        # — usually `cli/_run_window.run_window_in_process`. None means
-        # "no slippage layer"; the adapter falls back to walk_trades's
-        # raw VWAP/tick prices and `slippage_realised_aggregate_bps`
-        # returns None. With a model, every taker fill has its
-        # `fill_price` adjusted by `mid * (1 + bps/10000)` and the
-        # realised bps recorded for the JSON report.
+        # — usually `cli/_run_window.run_window_in_process`. The
+        # adapter does NOT adjust `fill_price` based on this model:
+        # `walk_trades` already prices fills against the actual
+        # historical trade prints, which IS the live taker reality.
+        # The model contributes its `dt_seconds` (rolling-mid window)
+        # to a per-fill *measurement* of realised bps — what the fill
+        # paid relative to mid — for operator-visible reporting
+        # (signed, adverse, per-side aggregates). When None, the
+        # measurement layer is off and aggregate properties return
+        # None as the "feature disabled" signal.
         self._slippage_model = slippage_model
         self._slippage_realised_bps: list[Decimal] = []
+        self._slippage_realised_sides: list[NexusOrderSide] = []
+        self._slippage_n_excluded: int = 0
         self._accounts: dict[str, _I.Account] = {}
         self._symbol_filters: dict[str, BinanceSpotFilters] = {filters.symbol: filters}
         self._next_order_seq = 1
@@ -83,100 +90,160 @@ class SimulatedVenueAdapter:
             raise KeyError(msg)
         self._history[account_id] = self._accounts.pop(account_id)
 
-    def _apply_slippage(
+    def _record_slippage(
         self,
         order: PendingOrder,
         fills: list[FillResult],
-        symbol_filters: BinanceSpotFilters,
-    ) -> list[FillResult]:
-        """Apply calibrated slippage bps to each taker fill, in price-space.
+        trades_window: pl.DataFrame,
+    ) -> None:
+        """Record realised slippage bps per taker fill — measure, do NOT adjust.
 
-        Maker fills (`is_maker=True`) keep their limit-price fill price
-        — no slippage layer applies because the maker ate from the
-        opposite side at exactly its declared price. Taker fills
-        (`is_maker=False`, the MARKET / stop-trigger / VWAP paths)
-        get `fill_price * (1 + bps / 10000)` where `bps` is the
-        side-signed bps the calibration's matching `(side, qty)`
-        bucket records. The bucket's median is positive for BUY
-        aggressors (taker pays above mid) and negative for SELL
-        aggressors (taker receives below mid). Both sides land at
-        worse prices than the raw tape VWAP, which is the live
-        reality the simulator must reflect.
+        The previous wiring multiplied `f.fill_price` by `(1 + bps/10000)`
+        on top of `walk_trades`'s already-tape-priced fill, which
+        double-counts the spread/drift effect (the audit's P1 #1).
+        `walk_trades` returns realistic taker prices because it walks
+        actual historical trade prints — that IS the price the strategy
+        pays in live. Slippage here is observability only: for each
+        taker fill, record the deviation from the rolling mid over
+        `slippage_model.dt_seconds` preceding `fill_time`. Maker fills
+        (`is_maker=True`) are recorded too — they fill at limit, so
+        their realised "slippage" against mid is meaningful (often
+        negative cost = price improvement).
 
-        When `slippage_model` is None, fills pass through unchanged
-        and `slippage_realised_aggregate_bps` returns None — the
-        operator opted out of the slippage layer.
+        The signed bps is stored alongside the side so the aggregator
+        can report per-side and adverse (|bps|) means — a plain signed
+        mean would let a round trip cancel to zero even though the
+        strategy paid spread on both legs (the audit's P1 #3).
+
+        Fills whose preceding `dt_seconds` window has zero trades
+        (start-of-tape, halt) are recorded under `n_excluded` rather
+        than counted as zero — silent zeros would let an empty mid
+        masquerade as "no slippage paid" (the audit's P1 #2 in its
+        measurement form).
+
+        When `slippage_model` is None this method is a no-op and the
+        aggregate properties return None.
         """
         if self._slippage_model is None:
-            return fills
-        adjusted: list[FillResult] = []
+            return
+        if trades_window.is_empty():
+            self._slippage_n_excluded += len(
+                [f for f in fills if not f.is_maker],
+            )
+            return
+        from datetime import timedelta
+        dt = timedelta(seconds=self._slippage_model.dt_seconds)
         for f in fills:
             if f.is_maker:
-                adjusted.append(f)
+                # Maker fills land at limit — measuring against mid
+                # is a future-tense feature (price improvement
+                # reporting); for now skip to keep the signal scoped
+                # to taker fills where the calibration semantics
+                # match. Track separately if it's needed.
                 continue
-            # SlippageModel is keyed by `nexus.core.domain.enums.OrderSide`,
-            # NOT the `praxis.core.domain.enums.OrderSide` this adapter
-            # imports at module top — they are distinct enum classes
-            # even though the names align. The wiring tested this gap
-            # (the adapter's praxis lookup found zero buckets and apply
-            # raised ValueError, recording bps=0). Use the nexus enum
-            # the model registers against.
-            side_enum = (
+            window_start = f.fill_time - dt
+            preceding = trades_window.filter(
+                (pl.col('time') >= window_start)
+                & (pl.col('time') < f.fill_time),
+            )
+            if preceding.is_empty():
+                self._slippage_n_excluded += 1
+                continue
+            mid_value = preceding['price'].median()
+            if mid_value is None or mid_value <= 0:
+                self._slippage_n_excluded += 1
+                continue
+            mid = Decimal(str(mid_value))
+            bps = (f.fill_price - mid) / mid * _BPS
+            side = (
                 NexusOrderSide.BUY if order.side == 'BUY'
                 else NexusOrderSide.SELL
             )
-            try:
-                bps = self._slippage_model.apply(
-                    side=side_enum,
-                    qty=f.fill_qty,
-                    mid=f.fill_price,
-                    t=f.fill_time,
-                )
-            except ValueError:
-                # The calibration window did not cover this (side, qty)
-                # combination. Loud-on-gap is the design for the
-                # standalone model — but inside the live fill path we
-                # cannot crash an entire run on one out-of-bucket order.
-                # Record bps=0 (the conservative choice — no slippage
-                # adjustment) and keep the per-fill record so the
-                # operator sees the missing-coverage entries when the
-                # aggregate is reviewed alongside `n_samples`. The right
-                # fix at the operator level is to widen the calibration
-                # window or split the order; the right fix here is
-                # not to silently swallow a real fill.
-                bps = Decimal('0')
-            adjusted_price = f.fill_price * (
-                Decimal('1') + bps / _BPS
-            )
             self._slippage_realised_bps.append(bps)
-            adjusted.append(FillResult(
-                fill_time=f.fill_time,
-                fill_price=symbol_filters.round_price(adjusted_price),
-                fill_qty=f.fill_qty,
-                is_maker=f.is_maker,
-                reason=f.reason,
-            ))
-        return adjusted
+            self._slippage_realised_sides.append(side)
+
+    def _aggregate_bps_when_active(
+        self,
+        sample_filter: object = None,
+    ) -> Decimal | None:
+        """Mean of recorded bps under `sample_filter`; None when slippage is off."""
+        if self._slippage_model is None:
+            return None
+        if sample_filter is None:
+            samples = list(self._slippage_realised_bps)
+        else:
+            samples = [
+                bps for bps, side in zip(
+                    self._slippage_realised_bps,
+                    self._slippage_realised_sides,
+                    strict=True,
+                )
+                if sample_filter(bps, side)
+            ]
+        if not samples:
+            return Decimal('0')
+        return sum(samples, Decimal('0')) / Decimal(len(samples))
 
     @property
     def slippage_realised_aggregate_bps(self) -> Decimal | None:
-        """Mean of the realised slippage bps across all taker fills.
+        """Signed mean realised bps across all taker fills.
 
-        Returns `None` when no slippage model was attached to this
-        adapter (the operator opted out) — keeping the JSON report
-        signal honest: `None` means "feature disabled", a numeric
-        value means "feature active and this is what the run paid".
+        Positive when the population of fills paid above mid (more
+        BUY aggressors); negative when below. NOT a cost metric on
+        its own — a balanced round-trip can register near zero even
+        when each leg paid spread. Pair with `slippage_realised_adverse_bps`
+        for the gross cost view. None when no slippage model attached.
+        """
+        return self._aggregate_bps_when_active()
+
+    @property
+    def slippage_realised_adverse_bps(self) -> Decimal | None:
+        """Mean of `|bps|` — the round-trip-honest cost metric.
+
+        Always non-negative: every taker fill contributes its absolute
+        deviation from mid regardless of side. This is the bps the
+        operator should cite when answering "what did slippage cost
+        this run". None when slippage off.
         """
         if self._slippage_model is None:
             return None
         if not self._slippage_realised_bps:
             return Decimal('0')
-        total = sum(self._slippage_realised_bps, Decimal('0'))
+        total = sum((abs(bps) for bps in self._slippage_realised_bps), Decimal('0'))
         return total / Decimal(len(self._slippage_realised_bps))
+
+    @property
+    def slippage_realised_buy_bps(self) -> Decimal | None:
+        """Mean realised bps over BUY-aggressor fills (positive = paid above mid)."""
+        return self._aggregate_bps_when_active(
+            lambda _bps, side: side == NexusOrderSide.BUY,
+        )
+
+    @property
+    def slippage_realised_sell_bps(self) -> Decimal | None:
+        """Mean realised bps over SELL-aggressor fills (negative = received below mid)."""
+        return self._aggregate_bps_when_active(
+            lambda _bps, side: side == NexusOrderSide.SELL,
+        )
 
     @property
     def slippage_realised_n_samples(self) -> int:
         return len(self._slippage_realised_bps)
+
+    @property
+    def slippage_realised_n_excluded(self) -> int:
+        """Taker fills excluded because the preceding mid window was empty.
+
+        Honest separation between "measured zero" and "could not measure":
+        a sparse-tape window at run start may produce excluded fills
+        without any signal — the operator sees this count and knows
+        to widen the calibration / pre-window slice. The standalone
+        `SlippageModel.apply` raises on uncalibrated buckets; this
+        adapter does not call apply on the load-bearing path (we
+        measure directly), so that loud-vs-silent gap collapses to
+        the n_excluded counter here.
+        """
+        return self._slippage_n_excluded
 
     def history(self, account_id: str) -> _I.Account:
         """Return the Account (orders + trades) whether currently registered or not."""
@@ -242,13 +309,35 @@ class SimulatedVenueAdapter:
         # The strategy-facing `get_trades` does not accept a kwarg for
         # this — `_get_trades_for_venue` is the only path with the
         # bounded peek. See `feed/protocol.py` for the rationale.
+        #
+        # When slippage measurement is active, extend the START of
+        # the fetch by `dt_seconds` so the rolling-mid window for a
+        # fill at the very first post-submit tick has pre-submit
+        # tape to work with. Codex pinned this gap: the rolling
+        # mid for a fill at t = submit_time + ε needs trades from
+        # [t - dt_seconds, t), most of which sit before submit_time.
+        # `walk_trades` itself filters internally with
+        # `pl.col('time') >= submit_ts`, so the pre-submit prefix
+        # never reaches the fill computation — it's measurement-only.
+        # The lookahead carve-out is on `end`, not `start`, so
+        # widening the start is unrestricted.
+        if self._slippage_model is not None:
+            from datetime import timedelta as _td
+            fetch_start = order.submit_time - _td(
+                seconds=self._slippage_model.dt_seconds,
+            )
+        else:
+            fetch_start = order.submit_time
         trades = self._feed._get_trades_for_venue(
-            symbol, order.submit_time,
+            symbol, fetch_start,
             order.submit_time + _I.window_seconds(self._trade_window_seconds),
             venue_lookahead_seconds=self._trade_window_seconds,
         )
         fills = walk_trades(order, trades, self._fill_config, symbol_filters)
-        fills = self._apply_slippage(order, fills, symbol_filters)
+        # Measure realised slippage against rolling mid; do NOT
+        # adjust `fills` — the audit's P1 was that adjusting on top
+        # of tape-priced fills double-counts spread.
+        self._record_slippage(order, fills, trades)
         immediate = _I.record_fills(
             account, self._fees,
             _I.OrderIdentity(

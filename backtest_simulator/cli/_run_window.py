@@ -126,16 +126,36 @@ def run_window_in_process(
         for t in account.trades
     ]
     declared_stops = {k: str(v) for k, v in launcher._declared_stops.items()}
-    slippage_aggregate = adapter.slippage_realised_aggregate_bps
+
+    def _emit(value: Decimal | None) -> str | None:
+        return None if value is None else str(value)
+
     return {
         'trades': trade_tuples,
         'declared_stops': declared_stops,
         'orders': len(account.orders),
-        'slippage_realised_bps': (
-            None if slippage_aggregate is None
-            else str(slippage_aggregate)
+        # Signed mean — directional, NOT a cost metric on its own.
+        'slippage_realised_bps': _emit(
+            adapter.slippage_realised_aggregate_bps,
+        ),
+        # Cost metric: mean(|bps|). Operator-visible "what slippage
+        # cost this run" — survives BUY/SELL sign cancellation.
+        'slippage_realised_adverse_bps': _emit(
+            adapter.slippage_realised_adverse_bps,
+        ),
+        # Per-side aggregates so the operator can diagnose
+        # asymmetric paying.
+        'slippage_realised_buy_bps': _emit(
+            adapter.slippage_realised_buy_bps,
+        ),
+        'slippage_realised_sell_bps': _emit(
+            adapter.slippage_realised_sell_bps,
         ),
         'slippage_n_samples': adapter.slippage_realised_n_samples,
+        # Distinct from "measured zero" — fills excluded because
+        # the rolling-mid window had no trades. Operator sees this
+        # to know calibration coverage is incomplete.
+        'slippage_n_excluded': adapter.slippage_realised_n_excluded,
     }
 
 
