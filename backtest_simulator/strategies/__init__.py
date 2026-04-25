@@ -6,8 +6,10 @@
 # (not templates) so they can be instantiated directly in unit tests
 # without going through ManifestBuilder's template-substitution path.
 
+from backtest_simulator.strategies.buy_and_hold import BuyAndHoldStrategy
 from backtest_simulator.strategies.zero_trade import ZeroTradeStrategy
 
 __all__ = [
+    'BuyAndHoldStrategy',
     'ZeroTradeStrategy',
 ]
