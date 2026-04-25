@@ -57,7 +57,7 @@ These were flagged by the operator as "must not defer" but remain unimplemented.
 
 - [ ] **Market impact model.** No own-order book impact; historical tape walked as-is. No gate on order-size vs concurrent trade volume.
 - [ ] **Passive maker-fill realism.** Limit orders get full qty at limit price on first cross. No queue position, no partial fills, no aggressor-size bound.
-- [ ] **Gap-risk on stops.** Fills at declared stop price on crossing, not `min(stop, first_crossing_trade_price)`. Optimistic for adverse gap scenarios.
+- [x] **Gap-risk on stops.** `_walk_market` halts on stop breach and returns a partial fill (no residual booked at the declared stop). `_walk_stop` fills at the breach tick's actual tape price, so adverse gaps below the declared stop produce a worse-than-stop fill (gap slippage). The declared stop is the R measurement unit, not a fill-price promise. Pinned by `tests/honesty/test_stop_enforcement.py`.
 - [ ] **Statistical honesty (CPCV / DSR / PBO / SPA).** Zero code. `SignalsTable.lookup()` takes only `t: datetime` — no path_id, no purge, no embargo.
 - [ ] **R denominator gameability gate.** No ATR-based sanity check on stop distance. `stop = entry × 0.9999` is accepted.
 - [ ] **Parametric thresholds.** All test calibrations are hardcoded constants. No `pytest.param` / env-var override / paired calibration-proof tests.

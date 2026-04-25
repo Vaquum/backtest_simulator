@@ -25,6 +25,7 @@ from __future__ import annotations
 # A violation raises `ConservationViolation` so the backtest aborts at
 # the first offending event boundary with enough context for the
 # operator to find the bug.
+import weakref
 from dataclasses import dataclass
 from decimal import Decimal
 from threading import Lock
@@ -83,26 +84,45 @@ def capital_totals(state: CapitalState) -> CapitalTotals:
 class _PrevPoolTracker:
     """Per-process record of the most recent `capital_pool` snapshot.
 
-    Keyed by the `id()` of the CapitalState object.
-
     INV-1 ("capital_pool is monotonically non-increasing") requires
     comparing new pool to PREVIOUS pool, not only to initial pool.
     Checking only initial would miss a sequence like
     `100_000 -> 99_900 -> 99_950` — the final value is still below
     initial but the middle transition grew the pool, which is a
-    violation. Storing the previous value per CapitalState id
-    catches that.
+    violation. Storing the previous value per CapitalState catches that.
+
+    Keying: `id(state)` — `CapitalState` carries a mutable
+    `per_strategy_deployed` dict so `WeakKeyDictionary` can't key by
+    it directly. CPython recycles object ids after GC, so without
+    cleanup a fresh `CapitalState` could land on a freed id and
+    inherit the prior state's snapshot — false INV-1b violation or,
+    worse, a real one masked. `weakref.finalize` registered at first
+    sighting pops the entry when the state is collected, binding the
+    mapping to the exact object's lifetime instead of id reuse.
     """
 
     _lock: ClassVar[Lock] = Lock()
     _prev: ClassVar[dict[int, Decimal]] = {}
 
     @classmethod
-    def snapshot_and_record(cls, state: CapitalState) -> Decimal:
+    def _remove(cls, sid: int) -> None:
         with cls._lock:
-            prev = cls._prev.get(id(state), state.capital_pool)
-            cls._prev[id(state)] = state.capital_pool
-            return prev
+            cls._prev.pop(sid, None)
+
+    @classmethod
+    def snapshot_and_record(cls, state: CapitalState) -> Decimal:
+        sid = id(state)
+        with cls._lock:
+            first_sighting = sid not in cls._prev
+            prev = cls._prev.get(sid, state.capital_pool)
+            cls._prev[sid] = state.capital_pool
+        if first_sighting:
+            # Register OUTSIDE the lock — `weakref.finalize` synchronises
+            # internally and the callback (`_remove`) re-acquires the
+            # lock, so registering inside would risk deadlock under any
+            # future change that has the finalizer fire synchronously.
+            weakref.finalize(state, cls._remove, sid)
+        return prev
 
 
 def assert_conservation(

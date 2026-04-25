@@ -134,9 +134,13 @@ class Strategy(_StrategyBase):
         # risk close). The stop sits `stop_bps` basis points BELOW the
         # reference price for a BUY — e.g. with `stop_bps=50` and
         # `estimated_price=70000`, `stop_price=69650`. The venue
-        # adapter's `FillModel.apply_stop` enforces the stop during
-        # the trade walk: if a tick breaches the stop during fill,
-        # the fill lands at the stop, not at VWAP.
+        # fill engine (`venue/fills.py::_walk_market`) halts the entry
+        # walk the moment a tick breaches the stop and returns the
+        # already-accumulated partial fill; the residual is NOT booked
+        # at the declared stop. A separate STOP_* close fills at the
+        # breach tick's actual tape price (gap slippage), not at the
+        # declared stop, via `_walk_stop`. The declared stop is the
+        # measurement unit for R, not a promise about where fills land.
         stop_price: Decimal | None = None
         if side == OrderSide.BUY:
             bps = self._config.stop_bps

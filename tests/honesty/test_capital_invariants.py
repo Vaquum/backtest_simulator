@@ -17,15 +17,15 @@ from backtest_simulator.honesty import (
     assert_conservation,
     capital_totals,
 )
-from backtest_simulator.honesty.conservation import _PrevPoolTracker
 
 
 def _fresh_state(pool: Decimal = Decimal('100000')) -> CapitalState:
-    state = CapitalState(capital_pool=pool)
-    # Reset per-state prev-snapshot so INV-1b starts from a known
-    # baseline rather than seeing leftover state from another test.
-    _PrevPoolTracker._prev.pop(id(state), None)
-    return state
+    # `_PrevPoolTracker._prev` is keyed by `id(state)` with a
+    # `weakref.finalize` cleanup at first sighting, so a freshly-
+    # constructed state has no entry by definition (and stale entries
+    # from earlier tests vanish when their state is collected). No
+    # manual reset needed.
+    return CapitalState(capital_pool=pool)
 
 
 def test_pass_on_fresh_state() -> None:
@@ -115,3 +115,39 @@ def test_mutation_negative_fee_reserve_underflow() -> None:
         assert_conservation(
             state, Decimal('100000'), context='mut_fee_underflow',
         )
+
+
+def test_prev_pool_tracker_releases_entry_on_gc() -> None:
+    """A `CapitalState`'s tracker entry must vanish when the state dies.
+
+    Pins the v1.5.1 fix: without `weakref.finalize`-driven cleanup,
+    `_prev[id(state)]` would persist forever and CPython's
+    id-recycling would let a freshly-created `CapitalState` inherit a
+    freed one's snapshot — producing a false INV-1b violation or, worse,
+    masking a real one. This test seeds an entry, drops the state, and
+    asserts the entry's `id` key is gone from `_prev` after GC. It
+    asserts on `id`-membership (not a total count) so it's robust to
+    other tests' states being alive in `_prev` under arbitrary test
+    orderings.
+    """
+    import gc
+
+    from backtest_simulator.honesty.conservation import _PrevPoolTracker
+
+    state = _fresh_state()
+    sid = id(state)
+    assert_conservation(state, Decimal('100000'), context='gc_seed')
+    assert sid in _PrevPoolTracker._prev, (
+        f'expected entry for id={sid} after assert_conservation seeded the tracker'
+    )
+    del state
+    # CPython collects the state deterministically when its last
+    # reference drops; the explicit `gc.collect()` is belt-and-braces
+    # in case the test runner adds a hidden reference (traceback,
+    # assertion-rewrite frame, etc.).
+    gc.collect()
+    assert sid not in _PrevPoolTracker._prev, (
+        f'expected weakref.finalize to release id={sid} on GC; entry '
+        f'still present. _PrevPoolTracker is leaking — id reuse will '
+        f'eventually conflate two distinct CapitalStates.'
+    )
