@@ -115,7 +115,14 @@ class SignalsTable:
             )
             raise LookAheadViolation(msg)
 
-    def lookup(self, t: datetime) -> SignalRow | None:
+    def lookup(
+        self,
+        t: datetime,
+        *,
+        path_id: int | None = None,
+        purge_seconds: int = 0,
+        embargo_seconds: int = 0,
+    ) -> SignalRow | None:
         """Return the greatest row with `timestamp <= t`, or None if none.
 
         The single causal accessor for strategies. Naive datetimes are
@@ -125,17 +132,33 @@ class SignalsTable:
         filter against the UTC frame schema. Both failure modes hide
         a real lookahead leak from the operator's eye.
 
+        Optional kwargs (slice #17 Task 16) implement CPCV-style
+        purge + embargo filtering; their full per-path semantics
+        live in Task 17 (CPCV implementation):
+
+        Args:
+          t: query timestamp (tz-aware, UTC offset concrete).
+          path_id: CPCV path identifier (for future per-path test-
+            group exclusion). `None` = no path-aware filtering;
+            the lookup returns the latest causal row regardless.
+            Stored as a free-form integer here so per-path
+            calibration in Task 17 can key on it.
+          purge_seconds: exclude any row whose label horizon
+            `[label_t0, label_t1]` extends past `t - purge_seconds`.
+            A signal whose label resolves inside the embargo zone
+            leaks the test boundary forward. Default 0 (off).
+          embargo_seconds: shift the causal cutoff back by this
+            many seconds. The returned row satisfies
+            `timestamp <= t - embargo_seconds`. Default 0 (off).
+
         Raises:
-          ValueError: if `t.tzinfo is None`.
-          LookAheadViolation: if `t > frozen_now()`. A cheating strategy
-            passing `t = current_bar + 1bar` would otherwise read a
-            label the live system has not yet computed.
+          ValueError: if `t.tzinfo is None`, or if
+            `purge_seconds < 0`, or if `embargo_seconds < 0`.
+          LookAheadViolation: if `t > frozen_now()`. A cheating
+            strategy passing `t = current_bar + 1bar` would
+            otherwise read a label the live system has not yet
+            computed.
         """
-        # Reject both `tzinfo is None` AND pseudo-naive datetimes whose
-        # `utcoffset()` returns `None` — the latter satisfy `t.tzinfo is
-        # not None` but their UTC offset is undefined, so comparisons
-        # with `frozen_now()` (which is tz-aware) raise TypeError later
-        # rather than failing the gate now. Both are caught up front.
         if t.tzinfo is None or t.utcoffset() is None:
             msg = (
                 f'SignalsTable.lookup requires a tz-aware datetime with '
@@ -145,6 +168,19 @@ class SignalsTable:
                 f'no-look-ahead gate compares apples to apples.'
             )
             raise ValueError(msg)
+        if purge_seconds < 0:
+            msg = (
+                f'SignalsTable.lookup: purge_seconds must be non-negative, '
+                f'got {purge_seconds}.'
+            )
+            raise ValueError(msg)
+        if embargo_seconds < 0:
+            msg = (
+                f'SignalsTable.lookup: embargo_seconds must be non-negative, '
+                f'got {embargo_seconds}.'
+            )
+            raise ValueError(msg)
+        del path_id  # reserved for Task 17 (CPCV per-path filtering)
         now = frozen_now()
         if t > now:
             msg = (
@@ -152,7 +188,16 @@ class SignalsTable:
                 f'frozen_now()={now} for decoder {self.decoder_id}'
             )
             raise LookAheadViolation(msg)
-        sliced = self._frame.filter(pl.col('timestamp') <= t).sort('timestamp').tail(1)
+        from datetime import timedelta
+        cutoff = t - timedelta(seconds=embargo_seconds)
+        sliced = self._frame.filter(pl.col('timestamp') <= cutoff)
+        if purge_seconds > 0:
+            # Drop rows whose label horizon `label_t1` extends into
+            # the purge zone `(t - purge_seconds, t]` — those labels
+            # leak the post-cutoff window into the lookup answer.
+            purge_floor = t - timedelta(seconds=purge_seconds)
+            sliced = sliced.filter(pl.col('label_t1') <= purge_floor)
+        sliced = sliced.sort('timestamp').tail(1)
         if sliced.is_empty():
             return None
         row = sliced.row(0, named=True)
