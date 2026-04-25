@@ -33,6 +33,7 @@
   "backtest_simulator/strategies/__init__.py": 30,
   "backtest_simulator/strategies/buy_and_hold.py": 160,
   "backtest_simulator/strategies/over_trading.py": 160,
+  "backtest_simulator/strategies/random_timing.py": 200,
   "backtest_simulator/strategies/zero_trade.py": 80,
   "backtest_simulator/sensors/__init__.py": 30,
   "backtest_simulator/sensors/precompute.py": 200,

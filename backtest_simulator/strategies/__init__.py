@@ -8,10 +8,12 @@
 
 from backtest_simulator.strategies.buy_and_hold import BuyAndHoldStrategy
 from backtest_simulator.strategies.over_trading import OverTradingStrategy
+from backtest_simulator.strategies.random_timing import RandomTimingStrategy
 from backtest_simulator.strategies.zero_trade import ZeroTradeStrategy
 
 __all__ = [
     'BuyAndHoldStrategy',
     'OverTradingStrategy',
+    'RandomTimingStrategy',
     'ZeroTradeStrategy',
 ]
