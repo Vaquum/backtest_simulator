@@ -56,6 +56,19 @@ integration = [
   # them here would force-pin a URL form and trip the resolver.
 ]
 
+[tool.uv.sources]
+# Override resolution for `vaquum_limen` so the two transitive
+# specifiers — Praxis declares `git+https://github.com/Vaquum/Limen`
+# (untagged → main), Nexus declares `git+https://github.com/Vaquum/Limen@v2.4.3`
+# (tagged) — collapse onto a single source. uv otherwise treats
+# distinct URL strings as conflicting packages even when both
+# resolve to the same `vaquum_limen` package, and aborts install
+# with `Requirements contain conflicting URLs`. The untagged form
+# tracks main; this matches the operator policy "always take the
+# latest Limen" while keeping our own pyproject's `[integration]`
+# extra free of hand-maintained version pins.
+vaquum_limen = { git = "https://github.com/Vaquum/Limen" }
+
 [project.scripts]
 bts = "backtest_simulator.cli:main"
 
