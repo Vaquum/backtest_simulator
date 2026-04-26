@@ -1,3 +1,14 @@
+# v1.7.1
+
+- Audit round 4 follow-ups on the maker-fill chain (1.7.0). Two P2 fixes land here; the P0 (SELL exits bypass capital lifecycle) is documented as a known follow-up that requires Nexus-side `CapitalController` extension and will land in its own slice.
+- `cli/commands/sweep.py` `_print_sweep_maker_summary` math corrected: `fill_eff_mean` now weights by `n_passive_limits` per run (count of passive LIMITs that engaged the maker engine) and aggregates `maker_fill_efficiency_mean` (true arithmetic mean across passive efficiencies). Pre-fix it weighted by `n_limit` (which includes marketable-takers) and aggregated `maker_fill_efficiency_p50` (medians, not means), producing a "weighted mean of medians" that the operator could mis-read as a true mean. Codex round 4 P2.
+- `venue/simulated.py` `SimulatedVenueAdapter` adds `maker_fill_efficiency_mean` and `n_passive_limits` properties; `_run_window` surfaces both into the JSON result so sweep can aggregate honestly.
+- `cli/_run_window.py` `_calibrate_maker_fill` no longer silently returns None on empty pre-window tape — it now raises `RuntimeError` with operator-actionable language ("widen the calibration window or run --maker against a denser-volume window"). Pre-fix the venue would silently fall back to the legacy first-crossing/full-fill LIMIT path while the CLI still advertised maker-engine realism, hiding uncalibrated mode behind a green run line. Codex round 3 P2.
+- `launcher/action_submitter.py` SELL exit comment block expanded to call out the OPEN P0 (SELL bypass of validation pipeline + capital lifecycle) and pin its required Nexus-side primitive (`CapitalController.close_position(reservation_id, fill_notional)`) so the next slice's scope is unambiguous.
+- `venue/simulated.py` LIMIT-touch-refresh comment block expanded to acknowledge the codex round 4 P2 architectural gap (decision-locus is venue-side, not action-side) and document the cleanest fix path.
+- Module budget bumps: `venue/simulated.py` 620 → 680.
+- `pyproject.toml` 1.7.0 → 1.7.1 (patch — audit-finding fixes only).
+
 # v1.7.0
 
 - M2 slice (#17) Tasks 14+15: wire `MakerFillModel` into the `bts run --maker` / `bts sweep --maker` LIMIT-order path so `bts` produces realistic passive-maker fill telemetry distinct from MARKET (taker) sweeps. Without this wiring the maker-fill primitive sat standalone — the audit's "fake / ornamental" failure mode. The chain now flows action → Praxis → venue → maker engine → outcome → strategy state reconciliation, with sweep-summary aggregation and per-run telemetry on the load-bearing operator surface.

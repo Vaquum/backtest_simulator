@@ -168,9 +168,14 @@ def _run(args: argparse.Namespace) -> int:
             n_limit_partial = int(result.get('n_limit_filled_partial', 0))
             n_limit_zero = int(result.get('n_limit_filled_zero', 0))
             n_limit_taker = int(result.get('n_limit_marketable_taker', 0))
+            n_passive = int(result.get('n_passive_limits', 0))
             eff_raw = result.get('maker_fill_efficiency_p50')
             eff_p50 = (
                 None if eff_raw is None else Decimal(str(eff_raw))
+            )
+            eff_mean_raw = result.get('maker_fill_efficiency_mean')
+            eff_mean = (
+                None if eff_mean_raw is None else Decimal(str(eff_mean_raw))
             )
             print_run(
                 display_id, day_label, trades, declared_stops,
@@ -192,8 +197,15 @@ def _run(args: argparse.Namespace) -> int:
             sweep_n_limit_partial += n_limit_partial
             sweep_n_limit_zero += n_limit_zero
             sweep_n_limit_taker += n_limit_taker
-            if eff_p50 is not None:
-                sweep_efficiencies_weighted.append((eff_p50, n_limit))
+            # Weight by `n_passive` (count of passive LIMITs in
+            # this run), NOT `n_limit` (which includes marketable
+            # takers — runs with mostly takers would over-weight
+            # their unrelated p50 in the cross-run mean). The
+            # per-run efficiency was computed only across passive
+            # LIMITs, so the denominator must match. Codex round
+            # 4 P2 caught the prior n_limit weighting.
+            if eff_mean is not None and n_passive > 0:
+                sweep_efficiencies_weighted.append((eff_mean, n_passive))
             if slip_cost is not None:
                 sweep_runs_with_slip += 1
                 sweep_n_samples_total += slip_n
@@ -247,8 +259,14 @@ def _print_sweep_maker_summary(
     when the strategy template emits LIMIT orders. The
     `mkt_taker` count separates marketable LIMITs (limit price
     crossed at submit → taker) from passive LIMITs that engaged
-    the maker engine. `fill_eff_p50` is the median fill
-    efficiency across passive LIMITs.
+    the maker engine. `fill_eff_mean` is the passive-count-
+    weighted arithmetic mean of per-run efficiency means — a
+    true cross-run mean fraction filled across passive LIMITs.
+
+    Aggregation contract:
+      - `weighted_efficiencies` is `[(per_run_eff_mean, n_passive_in_run), ...]`.
+      - Sum of (eff * n) / sum of n = passive-count-weighted mean.
+      - Empty list → `n/a` (no passive LIMITs ran in the sweep).
     """
     if n_total == 0:
         return

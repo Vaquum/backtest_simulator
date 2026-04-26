@@ -376,6 +376,19 @@ def _submit_translated(
     # flows through Praxis → venue adapter → fill; capital accounting
     # intentionally stays silent on exits until a follow-up slice
     # wires proper EXIT semantics.
+    #
+    # KNOWN-OPEN P0 (auditor round 4, predates this slice): the SELL
+    # exit completely bypasses the validation pipeline AND the
+    # CapitalLifecycleTracker's release / position-decrement / PnL-
+    # reconciliation paths. A correct fix needs `CapitalController`
+    # to expose a `close_position(reservation_id, fill_notional)`
+    # primitive (Nexus-side, currently absent) that releases
+    # `position_notional` back into `capital_pool` plus realized
+    # PnL — without that primitive the backtest can't honestly
+    # reconcile capital on close. This belongs in a dedicated EXIT-
+    # lifecycle slice, not folded into the maker-fill wiring.
+    # Auditor flagged P0 in maker-fill round 4; tracking as a
+    # standalone follow-up so it gets its own change boundary.
     if action.direction == OrderSide.SELL:
         decision = ValidationDecision(allowed=True)
         cmd = translate_to_trade_command(

@@ -202,8 +202,12 @@ def run_window_in_process(
         'n_limit_filled_partial': adapter.n_limit_filled_partial,
         'n_limit_filled_zero': adapter.n_limit_filled_zero,
         'n_limit_marketable_taker': adapter.n_limit_marketable_taker,
+        'n_passive_limits': adapter.n_passive_limits,
         'maker_fill_efficiency_p50': _emit(
             adapter.maker_fill_efficiency_p50,
+        ),
+        'maker_fill_efficiency_mean': _emit(
+            adapter.maker_fill_efficiency_mean,
         ),
     }
 
@@ -267,11 +271,22 @@ def _calibrate_slippage(
 def _calibrate_maker_fill(
     feed: object,
     window_start: datetime,
-) -> object | None:
+) -> object:
     """Build a MakerFillModel from the 30 minutes preceding `window_start`.
 
-    Same schema bridge as slippage. Empty pre-window → None;
-    other failures propagate (operator must see tunnel-down).
+    Same schema bridge as slippage. Empty pre-window → RAISE
+    (was: silently return None and let the venue fall back to
+    the legacy first-crossing/full-fill shortcut, while the CLI
+    still advertised maker-engine realism. The operator must
+    see uncalibrated maker mode as a loud failure, not as a
+    legacy-path silent regression — codex round 3 P2.)
+
+    Other failures propagate as well (tunnel-down, schema
+    mismatch). The MakerFillModel.calibrate floor itself raises
+    on edge cases (empty tape passed in, non-positive lookback).
+    `bts run --maker` / `bts sweep --maker` now fail-loud when
+    the calibration window has no trades; the operator widens
+    the window or moves to a denser symbol.
     """
     from datetime import timedelta
 
@@ -282,7 +297,17 @@ def _calibrate_maker_fill(
         window_start,
     )
     if pre.is_empty():
-        return None
+        msg = (
+            f'_calibrate_maker_fill: empty pre-window tape for '
+            f'{SYMBOL} [{window_start - timedelta(minutes=30)}, '
+            f'{window_start}). MakerFillModel cannot calibrate '
+            f'queue position from zero trades; the venue would '
+            f'silently fall back to the legacy LIMIT path while '
+            f'`--maker` still advertises queue/partial-fill '
+            f'realism. Widen the calibration window or run '
+            f'`--maker` against a denser-volume window.'
+        )
+        raise RuntimeError(msg)
     pre = pre.rename({'time': 'datetime', 'qty': 'quantity'})
     return MakerFillModel.calibrate(trades=pre, lookback_minutes=30)
 

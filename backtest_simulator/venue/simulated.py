@@ -460,6 +460,39 @@ class SimulatedVenueAdapter:
         return (ordered[n // 2 - 1] + ordered[n // 2]) / Decimal('2')
 
     @property
+    def maker_fill_efficiency_mean(self) -> Decimal | None:
+        """Arithmetic mean of `(filled_qty / order_qty)` across passive LIMITs.
+
+        Pair with `maker_fill_efficiency_p50` for the operator
+        view: median is robust to skewed runs where one big
+        partial pulls the average down; mean is the "true average
+        fraction filled" the sweep aggregator wants. The sweep
+        summary should weight this by the number of passive
+        LIMITs in the run (NOT total LIMITs — n_marketable_taker
+        is already excluded from `_maker_fill_efficiencies`) so
+        the cross-run aggregate is a real mean across all passive
+        orders, not a mean-of-means with mixed denominators
+        (codex round 4 P2 caught the mis-weighting).
+        """
+        if not self._maker_fill_efficiencies:
+            return None
+        return sum(
+            self._maker_fill_efficiencies, Decimal('0'),
+        ) / Decimal(len(self._maker_fill_efficiencies))
+
+    @property
+    def n_passive_limits(self) -> int:
+        """Count of passive LIMIT orders (excludes marketable takers).
+
+        Equal to `len(self._maker_fill_efficiencies)` — matches
+        the denominator used by `maker_fill_efficiency_p50` /
+        `maker_fill_efficiency_mean`. Sweep summary uses this as
+        the per-run weight so cross-run aggregation stays
+        denominator-consistent.
+        """
+        return len(self._maker_fill_efficiencies)
+
+    @property
     def slippage_n_predicted_samples(self) -> int:
         """Fills where the model's `apply()` succeeded — the gap denominator.
 
@@ -612,6 +645,20 @@ class SimulatedVenueAdapter:
         # the typical 1-tick spread on BTCUSDT, where "best bid"
         # ≈ last_trade - tick. No peek past `submit_time` —
         # `pl.col('time') < submit_time` restricts to causal data.
+        #
+        # KNOWN architectural concern (codex round 4 P2): this
+        # decision is made venue-side — the strategy submits at
+        # `estimated_price` but the venue executes at
+        # `last_trade ± tick`. The cleanest fix is to compute the
+        # touch in the action_submitter (or strategy) before the
+        # action is validated, so the audit trail is a single
+        # source of truth. Doing that requires either (a) feed
+        # access in the strategy/action_submitter or (b) a
+        # touch-tracker bus that snapshots last-trade per symbol
+        # at action-emit time. Both touch slice scope; tracking
+        # as a follow-up. The current behavior IS realistic
+        # (live makers also re-quote constantly); the gap is
+        # explicit-decision-locus, not realism.
         if (
             order_type == OrderType.LIMIT
             and self._maker_fill_model is not None
