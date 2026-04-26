@@ -107,6 +107,12 @@ def print_run(
     slippage_predict_vs_realised_gap_bps: Decimal | None = None,
     slippage_n_uncalibrated_predict: int = 0,
     slippage_n_predicted_samples: int = 0,
+    n_limit_orders_submitted: int = 0,
+    n_limit_filled_full: int = 0,
+    n_limit_filled_partial: int = 0,
+    n_limit_filled_zero: int = 0,
+    n_limit_marketable_taker: int = 0,
+    maker_fill_efficiency_p50: Decimal | None = None,
 ) -> None:
     """One-line headline + per-pair detail.
 
@@ -183,12 +189,27 @@ def print_run(
             slip_str += (
                 f' gap n/a (uncal={slippage_n_uncalibrated_predict})'
             )
+    if n_limit_orders_submitted > 0:
+        eff_str = (
+            'n/a' if maker_fill_efficiency_p50 is None
+            else f'{(maker_fill_efficiency_p50 * Decimal("100")).quantize(Decimal("0.1"))}%'
+        )
+        maker_str = (
+            f'  maker n={n_limit_orders_submitted} '
+            f'full/part/zero={n_limit_filled_full}/'
+            f'{n_limit_filled_partial}/{n_limit_filled_zero}  '
+            f'mkt_taker={n_limit_marketable_taker}  '
+            f'eff_p50={eff_str}'
+        )
+    else:
+        maker_str = ''
     print(
         f'   perm {perm_id:<4}  {day_label}  '
         f'trades {n_trades:<3}  PF {pf_str:<6}  '
         f'R̄ {r_mean_str:<7}  DD {fmt_dec(-max_dd_pct, 2)}%  '
         f'total {fmt_dec(total_pct, 2)}%  '
-        f'{slip_str}',
+        f'{slip_str}'
+        f'{maker_str}',
     )
     for buy, sell in pairs:
         declared = declared_stops.get(buy.client_order_id)

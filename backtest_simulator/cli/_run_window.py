@@ -38,6 +38,8 @@ def run_window_in_process(
     window_start: datetime,
     window_end: datetime,
     experiment_dir: Path,
+    *,
+    maker_preference: bool = False,
 ) -> dict[str, object]:
     """In-process single-window run — picklable result for cross-process use."""
     from praxis.launcher import InstanceConfig
@@ -80,6 +82,7 @@ def run_window_in_process(
             kelly_pct=kelly_pct,
             estimated_price=seed_price,
             stop_bps=Decimal('50'),
+            maker_preference=maker_preference,
         ),
     )
     feed = ClickHouseFeed(config=ClickHouseConfig.from_env(), symbol=SYMBOL)
@@ -94,12 +97,22 @@ def run_window_in_process(
     # `slippage_realised_bps` come back null and knows the
     # calibration window needs to widen.
     slippage_model = _calibrate_slippage(feed, window_start)
+    # MakerFillModel is constructed only when the strategy will
+    # use LIMIT orders (`maker_preference=True`). Without LIMIT
+    # orders the model would be dead weight. The model's lookback
+    # window seeds queue position from the same pre-window tape
+    # the slippage model uses.
+    maker_fill_model = (
+        _calibrate_maker_fill(feed, window_start)
+        if maker_preference else None
+    )
     adapter = SimulatedVenueAdapter(
         feed=feed,
         filters=BinanceSpotFilters.binance_spot(SYMBOL),
         fees=FeeSchedule(),
         trade_window_seconds=60,
         slippage_model=slippage_model,
+        maker_fill_model=maker_fill_model,
     )
     tc = TradingConfig(
         epoch_id=1, venue_rest_url='http://sim', venue_ws_url='ws://sim',
@@ -180,6 +193,18 @@ def run_window_in_process(
         # over a thin slice — the calibration coverage is poor.
         'slippage_n_predicted_samples':
             adapter.slippage_n_predicted_samples,
+        # Maker-fill telemetry. Zero on every count when the
+        # strategy emits MARKET orders only (default). Non-zero
+        # when `bts sweep --maker` runs the LIMIT-on-signal
+        # variant.
+        'n_limit_orders_submitted': adapter.n_limit_orders_submitted,
+        'n_limit_filled_full': adapter.n_limit_filled_full,
+        'n_limit_filled_partial': adapter.n_limit_filled_partial,
+        'n_limit_filled_zero': adapter.n_limit_filled_zero,
+        'n_limit_marketable_taker': adapter.n_limit_marketable_taker,
+        'maker_fill_efficiency_p50': _emit(
+            adapter.maker_fill_efficiency_p50,
+        ),
     }
 
 
@@ -239,12 +264,37 @@ def _calibrate_slippage(
     )
 
 
+def _calibrate_maker_fill(
+    feed: object,
+    window_start: datetime,
+) -> object | None:
+    """Build a MakerFillModel from the 30 minutes preceding `window_start`.
+
+    Same schema bridge as slippage. Empty pre-window → None;
+    other failures propagate (operator must see tunnel-down).
+    """
+    from datetime import timedelta
+
+    from backtest_simulator.honesty.maker_fill import MakerFillModel
+    pre = feed.get_trades(
+        SYMBOL,
+        window_start - timedelta(minutes=30),
+        window_start,
+    )
+    if pre.is_empty():
+        return None
+    pre = pre.rename({'time': 'datetime', 'qty': 'quantity'})
+    return MakerFillModel.calibrate(trades=pre, lookback_minutes=30)
+
+
 def run_window_in_subprocess(
     perm_id: int,
     kelly_pct: Decimal,
     window_start: datetime,
     window_end: datetime,
     experiment_dir: Path,
+    *,
+    maker_preference: bool = False,
 ) -> dict[str, object]:
     """Run one window in a fresh Python interpreter for state isolation."""
     payload = json.dumps({
@@ -253,6 +303,7 @@ def run_window_in_subprocess(
         'window_start': window_start.isoformat(),
         'window_end': window_end.isoformat(),
         'experiment_dir': str(experiment_dir),
+        'maker_preference': bool(maker_preference),
     })
     proc = subprocess.run(
         [sys.executable, '-m', 'backtest_simulator.cli._run_window'],
@@ -282,6 +333,7 @@ def _child_main() -> int:
         datetime.fromisoformat(payload['window_start']),
         datetime.fromisoformat(payload['window_end']),
         Path(payload['experiment_dir']),
+        maker_preference=bool(payload.get('maker_preference', False)),
     )
     print(json.dumps(result), flush=True)
     return 0

@@ -31,12 +31,21 @@ class _Config:
     def __init__(
         self, symbol: str, capital: Decimal, kelly_pct: Decimal,
         estimated_price: Decimal, stop_bps: Decimal,
+        maker_preference: bool = False,
     ) -> None:
         self.symbol = symbol
         self.capital = capital
         self.kelly_pct = kelly_pct
         self.estimated_price = estimated_price
         self.stop_bps = stop_bps
+        # When True the strategy emits LIMIT orders at the
+        # estimated price (passive maker post). When False
+        # (default) it emits MARKET orders. The runtime venue
+        # adapter routes LIMITs through the MakerFillModel —
+        # queue position, partial fills, aggressor-size bound
+        # — so `bts sweep --maker` produces realistic LIMIT-fill
+        # telemetry distinct from MARKET-only sweeps.
+        self.maker_preference = maker_preference
 
 
 class Strategy(_StrategyBase):
@@ -72,10 +81,31 @@ class Strategy(_StrategyBase):
             kelly_pct=Decimal(str(_BAKED_CONFIG['kelly_pct'])),
             estimated_price=Decimal(str(_BAKED_CONFIG['estimated_price'])),
             stop_bps=Decimal(str(_BAKED_CONFIG['stop_bps'])),
+            maker_preference=bool(
+                _BAKED_CONFIG.get('maker_preference', False),
+            ),
         )
         # Fresh-start defaults; `on_load` overwrites if persisted state exists.
         self._long: bool = False
         self._entry_qty: Decimal = Decimal('0')
+        # `_pending_buy` blocks duplicate BUY emissions when a prior
+        # LIMIT BUY is still resting (passive maker). Without this
+        # the strategy would re-emit BUY on every preds=1 signal
+        # while the previous LIMIT had not filled — accumulating
+        # multiple OPEN orders and a corrupted CAPITAL ledger. Set
+        # on emit, cleared in `on_outcome` regardless of terminal
+        # outcome (FILLED/PARTIAL flip `_long`; REJECTED/EXPIRED/
+        # CANCELED clear pending without flipping `_long`).
+        self._pending_buy: bool = False
+        # `_pending_sell` mirrors `_pending_buy` for the exit leg:
+        # `_long` only flips False once the SELL outcome lands, so
+        # without this gate a second `_preds=0` signal arriving
+        # before the OutcomeLoop dispatches the prior SELL would
+        # emit a duplicate exit (double-selling the same
+        # `_entry_qty`, corrupting the position ledger). Codex
+        # round 2 P2 caught this. Set on SELL emit, cleared in
+        # `on_outcome` for SELL outcomes (terminal or fill).
+        self._pending_sell: bool = False
         _log.info(
             'LongOnSignal startup: symbol=%s capital=%s kelly_pct=%s est_price=%s',
             self._config.symbol, self._config.capital,
@@ -101,7 +131,7 @@ class Strategy(_StrategyBase):
             'on_signal fired: preds=%s probs=%s was_long=%s',
             preds, signal.values.get('_probs'), was_long,
         )
-        if preds == 1 and not was_long:
+        if preds == 1 and not was_long and not self._pending_buy:
             qty_raw = (
                 self._config.capital * self._config.kelly_pct / Decimal('100')
             ) / self._config.estimated_price
@@ -113,15 +143,33 @@ class Strategy(_StrategyBase):
             # filled_qty into a partial status even when the walk
             # consumed everything that was step-legal.
             qty = qty_raw.quantize(Decimal('0.00001'), rounding=ROUND_DOWN)
-            self._long = True
-            self._entry_qty = qty
-            _log.info('ENTER BUY: qty=%s was_long=False -> long=True', qty)
+            # `_long` and `_entry_qty` flip in `on_outcome` once the
+            # venue confirms the fill. MARKET BUYs fill in-line so
+            # the outcome arrives synchronously and `_long` is True
+            # before the next `on_signal`. LIMIT BUYs (maker
+            # preference) may rest unfilled — `_pending_buy` keeps
+            # the strategy from re-issuing while the prior order is
+            # still in the lookahead window.
+            self._pending_buy = True
+            _log.info(
+                'ENTER BUY emit: qty=%s was_long=False pending_buy=True', qty,
+            )
             return [self._build_action(OrderSide.BUY, qty, signal)]
-        if preds == 0 and was_long:
+        if preds == 0 and was_long and not self._pending_sell:
             qty = self._entry_qty
-            self._long = False
-            self._entry_qty = Decimal('0')
-            _log.info('ENTER SELL (exit long): qty=%s was_long=True -> long=False', qty)
+            # `_long` and `_entry_qty` flip in `on_outcome` when the
+            # SELL outcome lands. Clearing `_entry_qty` at emit time
+            # would let a SELL that zero/partial-fills (rare for
+            # MARKET, but the venue's 60s lookahead can run dry)
+            # leave the strategy thinking it's flat with size zero
+            # — the next preds=0 would emit a zero-size SELL and
+            # the venue's LOT_SIZE filter would reject. Holding the
+            # qty until the SELL fill confirms is the honest path.
+            self._pending_sell = True
+            _log.info(
+                'ENTER SELL (exit long) emit: qty=%s was_long=True '
+                'pending_sell=True', qty,
+            )
             return [self._build_action(OrderSide.SELL, qty, signal)]
         return []
 
@@ -153,11 +201,31 @@ class Strategy(_StrategyBase):
         }
         if stop_price is not None:
             execution_params['stop_price'] = str(stop_price)
+        # When `maker_preference` is set, BUY entries become passive
+        # LIMITs (the rebate-capture leg). SELL exits stay MARKET so
+        # the strategy's `_long` / `_entry_qty` state — flipped at
+        # signal time — actually matches the executed position. A
+        # SELL LIMIT that zero-fills would leave the strategy
+        # marking flat against an unfilled exit, then double-sell
+        # on the next regime change. Asymmetric routing matches
+        # live market-maker conventions: passive entries (paid for
+        # liquidity) and aggressive exits (paying for execution
+        # certainty). The venue refreshes the BUY limit price to
+        # `last_trade - 1 tick` so it's strictly passive at submit
+        # — see `SimulatedVenueAdapter.submit_order`.
+        is_buy_maker = (
+            self._config.maker_preference and side == OrderSide.BUY
+        )
+        order_type_value = (
+            OrderType.LIMIT if is_buy_maker else OrderType.MARKET
+        )
+        if is_buy_maker:
+            execution_params['price'] = str(self._config.estimated_price)
         return Action(
             action_type=ActionType.ENTER,
             direction=side, size=qty,
             execution_mode=ExecutionMode.SINGLE_SHOT,
-            order_type=OrderType.MARKET,
+            order_type=order_type_value,
             execution_params=execution_params,
             # `deadline` is a DURATION in seconds (not an epoch timestamp).
             # Praxis computes the concrete deadline as
@@ -182,8 +250,116 @@ class Strategy(_StrategyBase):
     def on_outcome(
         self, outcome: TradeOutcome, params: StrategyParams, context: StrategyContext,
     ) -> list[Action]:
-        del outcome, params, context
+        """Reconcile `_long` / `_entry_qty` from the venue's actual fill.
+
+        Strategy state used to flip at signal-emit time, which was
+        safe under MARKET-everywhere (fills always succeed). Under
+        `maker_preference=True` BUY entries become passive LIMITs
+        that may zero-fill; flipping `_long` on emit would let a
+        later preds=0 signal emit a SELL for inventory the venue
+        never gave us. Reconcile here so the next signal sees the
+        truth.
+
+        Outcome handling:
+          - PARTIAL/FILLED + BUY: `_long=True`, `_entry_qty +=
+            outcome.fill_size`. Partials accumulate on the same
+            command_id until terminal.
+          - REJECTED/EXPIRED/CANCELED + BUY: clear `_pending_buy`;
+            don't touch `_long` (no inventory was acquired).
+          - PARTIAL/FILLED + SELL: `_long=False` (exit confirmed).
+          - Any non-fill SELL: leave `_long` alone — exit failed,
+            we still hold inventory. The next preds=0 signal will
+            re-emit.
+        """
+        del params, context
+        from nexus.infrastructure.praxis_connector.trade_outcome_type import (
+            TradeOutcomeType,
+        )
+        is_buy = self._is_buy_command(outcome.command_id)
+        if outcome.outcome_type.is_fill:
+            if outcome.fill_size is None:
+                msg = (
+                    f'TradeOutcome {outcome.outcome_id} is_fill but '
+                    f'fill_size is None; cannot reconcile strategy '
+                    f'position from a fill outcome with no qty.'
+                )
+                raise ValueError(msg)
+            if is_buy:
+                self._long = True
+                self._entry_qty += outcome.fill_size
+                # Codex P1 caught: in this backtest the maker
+                # engine evaluates the entire post-submit lookahead
+                # in one shot, so a PARTIAL outcome is TERMINAL
+                # — no later FILLED arrives for the same command.
+                # Leaving `_pending_buy=True` past PARTIAL would
+                # block every subsequent entry AND let the SELL
+                # outcome get misclassified as a BUY by
+                # `_is_buy_command`. Clear pending on any fill.
+                self._pending_buy = False
+                _log.info(
+                    'on_outcome BUY %s: fill_size=%s entry_qty=%s long=True',
+                    outcome.outcome_type.value, outcome.fill_size,
+                    self._entry_qty,
+                )
+            else:
+                # Reduce inventory by the fill_size; only flip
+                # `_long` to False when the SELL has FULLY closed
+                # the position. A PARTIAL SELL (zero/partial-fill
+                # on a MARKET exit when the 60s tape window is
+                # thin) leaves residual long inventory, which the
+                # next preds=0 should still try to close.
+                self._entry_qty -= outcome.fill_size
+                if (
+                    outcome.outcome_type == TradeOutcomeType.FILLED
+                    or self._entry_qty <= Decimal('0')
+                ):
+                    self._long = False
+                    self._entry_qty = Decimal('0')
+                # SELL outcome arrived — re-open the pending-sell
+                # gate so a subsequent preds=0 (e.g. after a
+                # bounce-and-bust signal flip) can re-issue.
+                self._pending_sell = False
+                _log.info(
+                    'on_outcome SELL %s: fill_size=%s entry_qty=%s long=%s',
+                    outcome.outcome_type.value, outcome.fill_size,
+                    self._entry_qty, self._long,
+                )
+        elif outcome.outcome_type.is_terminal:
+            if is_buy:
+                # REJECTED / EXPIRED / CANCELED on a BUY: no fill,
+                # free the pending slot. The strategy stays flat.
+                self._pending_buy = False
+                _log.info(
+                    'on_outcome BUY %s (no fill): pending_buy=False',
+                    outcome.outcome_type.value,
+                )
+            else:
+                # Terminal-no-fill SELL outcome: free the
+                # pending-sell gate so the next preds=0 can
+                # re-attempt the exit. `_long` stays True (the
+                # position was never closed).
+                self._pending_sell = False
+                _log.info(
+                    'on_outcome SELL %s (no fill): pending_sell=False',
+                    outcome.outcome_type.value,
+                )
         return []
+
+    def _is_buy_command(self, command_id: str) -> bool:
+        """Best-effort side inference for the BUY/SELL state machine.
+
+        BUY emits stamp `pending_buy=True`. The outcome's
+        `command_id` doesn't carry a side directly, but at most
+        one BUY can be in flight (`_pending_buy` gates it) and
+        SELLs only emit when `_long=True`. So: if `_pending_buy`
+        is True OR `_long` is False, the outcome must be a BUY's.
+        Otherwise SELL. Inferring side from state is structurally
+        correct for this single-position strategy and avoids
+        threading the side through TradeOutcome (which Nexus's
+        contract doesn't carry).
+        """
+        del command_id
+        return self._pending_buy or not self._long
 
     def on_timer(
         self, timer_id: str, params: StrategyParams, context: StrategyContext,
@@ -197,9 +373,18 @@ class Strategy(_StrategyBase):
         payload = json.loads(data.decode('utf-8'))
         self._long = bool(payload['long'])
         self._entry_qty = Decimal(str(payload['entry_qty']))
+        # `pending_buy` / `pending_sell` default False on load;
+        # in-flight LIMITs/MARKETs don't survive a strategy reload
+        # across runs in this slice.
+        self._pending_buy = bool(payload.get('pending_buy', False))
+        self._pending_sell = bool(payload.get('pending_sell', False))
 
     def on_save(self) -> bytes:
-        payload = {'long': self._long, 'entry_qty': str(self._entry_qty)}
+        payload = {
+            'long': self._long, 'entry_qty': str(self._entry_qty),
+            'pending_buy': self._pending_buy,
+            'pending_sell': self._pending_sell,
+        }
         return json.dumps(payload).encode('utf-8')
 
     def on_shutdown(

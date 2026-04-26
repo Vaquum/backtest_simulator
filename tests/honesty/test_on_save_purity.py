@@ -575,15 +575,47 @@ def test_on_save_purity_long_on_signal_template(tmp_path: object) -> None:
         strategy.on_startup(StrategyParams(raw={}), _ctx())
         return strategy
 
-    # Drive a single `_preds=1` signal so the pre-save state carries
-    # `_long=True` and a non-zero `_entry_qty`.
+    # Drive a single `_preds=1` signal so an ENTER BUY action is
+    # emitted, then synthesize the matching FILLED outcome so the
+    # pre-save state carries `_long=True` and a non-zero
+    # `_entry_qty`. The previous version flipped `_long` inside
+    # `on_signal` directly; with the maker-fill wiring the
+    # strategy now reconciles state from `on_outcome` (BUY LIMITs
+    # may zero-fill — flipping at emit would lie about
+    # inventory). To keep this round-trip pin testing meaningful
+    # state (not a trivial flat snapshot), emit + outcome the
+    # entry through the live strategy contract.
+    from nexus.infrastructure.praxis_connector.trade_outcome import (
+        TradeOutcome,
+    )
+    from nexus.infrastructure.praxis_connector.trade_outcome_type import (
+        TradeOutcomeType,
+    )
     enter_signal = _signal_at(_T0, _preds=1)
     strategy = _build()
-    _drive_through_signals(strategy, [enter_signal])
+    actions = strategy.on_signal(
+        enter_signal, StrategyParams(raw={}), _ctx(),
+    )
+    assert len(actions) == 1, (
+        f'expected exactly one BUY action from the entry signal, got '
+        f'{len(actions)}'
+    )
+    fill_qty = actions[0].size
+    outcome = TradeOutcome(
+        outcome_id='OUT-FIXTURE-001',
+        command_id='CMD-FIXTURE-001',
+        outcome_type=TradeOutcomeType.FILLED,
+        timestamp=_T0,
+        fill_size=fill_qty,
+        fill_price=Decimal('70000'),
+        fill_notional=fill_qty * Decimal('70000'),
+        actual_fees=Decimal('0.7'),
+    )
+    strategy.on_outcome(outcome, StrategyParams(raw={}), _ctx())
     assert strategy._long is True, (
-        '`long_on_signal` did not enter long on `_preds=1` from flat; '
-        'the fixture pre-save state is trivial and the round-trip '
-        'cannot pin save→load→save honesty.'
+        '`long_on_signal` did not enter long on `_preds=1` from flat '
+        'after FILLED outcome; the fixture pre-save state is trivial '
+        'and the round-trip cannot pin save→load→save honesty.'
     )
     assert strategy._entry_qty != Decimal('0'), (
         '`long_on_signal` entered long but `_entry_qty == 0`; sizing '

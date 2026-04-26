@@ -25,6 +25,7 @@ from praxis.infrastructure.venue_adapter import (
 )
 
 from backtest_simulator.feed.protocol import VenueFeed
+from backtest_simulator.honesty.maker_fill import MakerFillModel
 from backtest_simulator.honesty.slippage import SlippageModel
 from backtest_simulator.venue import _adapter_internals as _I
 from backtest_simulator.venue.fees import FeeSchedule
@@ -46,6 +47,7 @@ class SimulatedVenueAdapter:
         fill_config: FillModelConfig | None = None,
         trade_window_seconds: int = 3600,
         slippage_model: SlippageModel | None = None,
+        maker_fill_model: MakerFillModel | None = None,
     ) -> None:
         self._feed = feed
         self._filters = filters
@@ -83,6 +85,19 @@ class SimulatedVenueAdapter:
         self._slippage_predicted_bps: list[Decimal | None] = []
         self._slippage_n_excluded: int = 0
         self._slippage_n_uncalibrated_predict: int = 0
+        # MakerFillModel routing for LIMIT orders. None = legacy
+        # O(1) "first crossing tick = full fill" path; set =
+        # realistic queue-position + partial-fill engine. Adapter
+        # also tracks LIMIT-order telemetry so `bts sweep` can
+        # surface n_submitted / n_filled_full / n_partial / n_zero
+        # / n_marketable_taker counts.
+        self._maker_fill_model = maker_fill_model
+        self._n_limit_submitted: int = 0
+        self._n_limit_filled_full: int = 0
+        self._n_limit_filled_partial: int = 0
+        self._n_limit_filled_zero: int = 0
+        self._n_limit_marketable_taker: int = 0
+        self._maker_fill_efficiencies: list[Decimal] = []
         self._accounts: dict[str, _I.Account] = {}
         self._symbol_filters: dict[str, BinanceSpotFilters] = {filters.symbol: filters}
         self._next_order_seq = 1
@@ -360,6 +375,90 @@ class SimulatedVenueAdapter:
         """
         return self._slippage_n_uncalibrated_predict
 
+    def _record_limit_outcome(
+        self,
+        order: PendingOrder,
+        fills: list[FillResult],
+    ) -> None:
+        """Track LIMIT-order outcomes for `bts sweep` telemetry.
+
+        Counts are kept regardless of whether `maker_fill_model` is
+        attached — the operator wants to see how many LIMIT orders
+        ran through the sweep, how many filled fully vs partially
+        vs not at all, and how many were marketable (limit price
+        already crossed at submit, fell through to taker). MARKET
+        and STOP_* orders are no-ops here. The maker_fill engine
+        produces multiple FillResults for a single LIMIT order
+        (one per crossing aggressor); they are aggregated to the
+        order level.
+        """
+        if order.order_type != 'LIMIT':
+            return
+        self._n_limit_submitted += 1
+        if not fills:
+            self._n_limit_filled_zero += 1
+            self._maker_fill_efficiencies.append(Decimal('0'))
+            return
+        all_taker = all(not f.is_maker for f in fills)
+        if all_taker:
+            self._n_limit_marketable_taker += 1
+            # Marketable LIMITs don't exercise the maker engine —
+            # don't pollute fill efficiency with a "100%" entry
+            # the operator would mistake for queue-position
+            # success. Track separately above.
+            return
+        total_filled = sum((f.fill_qty for f in fills), Decimal('0'))
+        if total_filled >= order.qty:
+            self._n_limit_filled_full += 1
+        elif total_filled > Decimal('0'):
+            self._n_limit_filled_partial += 1
+        else:
+            self._n_limit_filled_zero += 1
+        if order.qty > Decimal('0'):
+            self._maker_fill_efficiencies.append(
+                total_filled / order.qty,
+            )
+
+    @property
+    def n_limit_orders_submitted(self) -> int:
+        return self._n_limit_submitted
+
+    @property
+    def n_limit_filled_full(self) -> int:
+        return self._n_limit_filled_full
+
+    @property
+    def n_limit_filled_partial(self) -> int:
+        return self._n_limit_filled_partial
+
+    @property
+    def n_limit_filled_zero(self) -> int:
+        return self._n_limit_filled_zero
+
+    @property
+    def n_limit_marketable_taker(self) -> int:
+        """Marketable LIMITs that fell through to taker (limit crossed at submit)."""
+        return self._n_limit_marketable_taker
+
+    @property
+    def maker_fill_efficiency_p50(self) -> Decimal | None:
+        """Median (filled_qty / order_qty) across passive LIMIT orders.
+
+        Excludes marketable LIMITs (which are taker, not a maker
+        engine outcome). None when no passive LIMITs were seen.
+        Operator reads this as "of the LIMITs that went on the
+        book, what fraction of qty actually filled before the
+        window expired?"
+        """
+        if not self._maker_fill_efficiencies:
+            return None
+        ordered = sorted(self._maker_fill_efficiencies)
+        n = len(ordered)
+        # Median: lower-of-pair on even count for determinism.
+        if n % 2 == 1:
+            return ordered[n // 2]
+        return (ordered[n // 2 - 1] + ordered[n // 2]) / Decimal('2')
+
     @property
     def slippage_n_predicted_samples(self) -> int:
         """Fills where the model's `apply()` succeeded — the gap denominator.
@@ -432,11 +531,6 @@ class SimulatedVenueAdapter:
         effective_tif = time_in_force or (
             'IOC' if order_type == OrderType.LIMIT_IOC else 'GTC'
         )
-        order = PendingOrder(
-            order_id=venue_order_id, side=side.name, order_type=_I.TYPE_MAP[order_type],
-            qty=qty, limit_price=price, stop_price=stop_price,
-            time_in_force=effective_tif, submit_time=self._now(), symbol=symbol,
-        )
         # Resolve the per-symbol filter record. `_symbol_filters` is the
         # authoritative source (populated via `load_filters()` at boot
         # and seeded from the adapter's init filter). Falling back to
@@ -449,11 +543,6 @@ class SimulatedVenueAdapter:
                 f'call load_filters([{symbol!r}]) before submitting'
             )
             raise ValueError(msg)
-        if _I.reject_reason(order, symbol_filters, price) is not None:
-            _I.record_rejection(account, order, coid, side, order_type, price)
-            return SubmitResult(
-                venue_order_id=venue_order_id, status=OrderStatus.REJECTED, immediate_fills=(),
-            )
         # The venue carve-out: peek up to `trade_window_seconds` past
         # `frozen_now()` to simulate a realistic submit→fill window.
         # The strategy-facing `get_trades` does not accept a kwarg for
@@ -471,23 +560,105 @@ class SimulatedVenueAdapter:
         # never reaches the fill computation — it's measurement-only.
         # The lookahead carve-out is on `end`, not `start`, so
         # widening the start is unrestricted.
+        submit_time = self._now()
+        from datetime import timedelta as _td
+        fetch_start = submit_time
         if self._slippage_model is not None:
-            from datetime import timedelta as _td
-            fetch_start = order.submit_time - _td(
-                seconds=self._slippage_model.dt_seconds,
+            fetch_start = min(
+                fetch_start,
+                submit_time - _td(seconds=self._slippage_model.dt_seconds),
             )
-        else:
-            fetch_start = order.submit_time
+        # Maker queue calibration must seed from a fresh per-submit
+        # lookback. Codex P1 caught the prior behaviour: the
+        # MakerFillModel was calibrated once at window-start with
+        # `[window_start - 30m, window_start)`, but orders submit
+        # hours later — `MakerFillModel.evaluate()` then derives a
+        # `[submit_time - 30m, submit_time)` slice that's empty
+        # (the stored tape ends at window_start), so queue=0 on
+        # every late-window submit and `bts sweep --maker` over-
+        # reports maker fill efficiency. Widen this submit's fetch
+        # to span the lookback so the venue can hand `_walk_limit`
+        # a fresh pre-submit slice; the model's stored tape is now
+        # only a fallback (test paths that don't pre-fetch).
+        if self._maker_fill_model is not None:
+            fetch_start = min(
+                fetch_start,
+                submit_time - _td(
+                    minutes=self._maker_fill_model.lookback_minutes,
+                ),
+            )
         trades = self._feed._get_trades_for_venue(
             symbol, fetch_start,
-            order.submit_time + _I.window_seconds(self._trade_window_seconds),
+            submit_time + _I.window_seconds(self._trade_window_seconds),
             venue_lookahead_seconds=self._trade_window_seconds,
         )
-        fills = walk_trades(order, trades, self._fill_config, symbol_filters)
+        # Maker-LIMIT touch refresh: when `maker_fill_model` is
+        # attached AND the order is LIMIT, override the caller-
+        # supplied stale `price` with the most recent pre-submit
+        # trade price BIASED ONE TICK INSIDE so the order rests
+        # as a passive maker rather than crossing immediately as
+        # taker. The strategy template bakes `price` at manifest-
+        # build time (window-start seed price) and signals fire
+        # hours later — by then the market has moved and a
+        # stale-priced LIMIT either rejects, sits dead far from
+        # market, or — if pinned at the touch — crosses into
+        # taker on the next aggressor (which defeats the purpose
+        # of measuring maker mechanics). Treat
+        # `maker_preference=True` as "post at the bid (BUY) /
+        # ask (SELL)": one tick inside the most recent print so
+        # the order is strictly non-marketable on submit and the
+        # maker engine's queue-position + aggressor-matching
+        # logic gets a chance to run. A 1-tick bias also matches
+        # the typical 1-tick spread on BTCUSDT, where "best bid"
+        # ≈ last_trade - tick. No peek past `submit_time` —
+        # `pl.col('time') < submit_time` restricts to causal data.
+        if (
+            order_type == OrderType.LIMIT
+            and self._maker_fill_model is not None
+            and price is not None
+            and not trades.is_empty()
+        ):
+            pre_submit = trades.filter(pl.col('time') < submit_time)
+            if not pre_submit.is_empty():
+                last_price = Decimal(str(pre_submit.tail(1)['price'].item()))
+                tick = symbol_filters.tick_size
+                if side == OrderSide.BUY:
+                    price = last_price - tick
+                else:
+                    price = last_price + tick
+        order = PendingOrder(
+            order_id=venue_order_id, side=side.name, order_type=_I.TYPE_MAP[order_type],
+            qty=qty, limit_price=price, stop_price=stop_price,
+            time_in_force=effective_tif, submit_time=submit_time, symbol=symbol,
+        )
+        if _I.reject_reason(order, symbol_filters, price) is not None:
+            _I.record_rejection(account, order, coid, side, order_type, price)
+            return SubmitResult(
+                venue_order_id=venue_order_id, status=OrderStatus.REJECTED, immediate_fills=(),
+            )
+        # Slice the pre-submit prefix from the same widened fetch.
+        # `walk_trades` itself filters `trades` by `time >= submit_time`
+        # for the post-submit window; the pre-submit slice is needed
+        # only for the maker engine's queue-position calibration. We
+        # pass it explicitly so the model gets a fresh per-submit
+        # lookback rather than the stale window-start tape.
+        if self._maker_fill_model is not None:
+            trades_pre_submit = trades.filter(pl.col('time') < submit_time)
+        else:
+            trades_pre_submit = None
+        fills = walk_trades(
+            order, trades, self._fill_config, symbol_filters,
+            maker_model=self._maker_fill_model,
+            trades_pre_submit=trades_pre_submit,
+        )
         # Measure realised slippage against rolling mid; do NOT
         # adjust `fills` — the audit's P1 was that adjusting on top
         # of tape-priced fills double-counts spread.
         self._record_slippage(order, fills, trades)
+        # LIMIT order telemetry: surface fill efficiency on the
+        # load-bearing `bts sweep` path. Counts are zeroed for
+        # MARKET / STOP_* orders.
+        self._record_limit_outcome(order, fills)
         immediate = _I.record_fills(
             account, self._fees,
             _I.OrderIdentity(

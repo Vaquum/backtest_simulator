@@ -52,6 +52,13 @@ def register(sub: argparse._SubParsersAction) -> None:
                    help='text (default) or json structured report.')
     p.add_argument('--seed', type=int, default=None,
                    help='Override seed for reproducible runs.')
+    p.add_argument('--maker', action='store_true', default=False,
+                   help=(
+                       'Strategy emits LIMIT orders at the estimated '
+                       'price (passive maker post). Routes through '
+                       'MakerFillModel for realistic queue + partial '
+                       'fills. Default: MARKET (taker).'
+                   ))
     add_verbosity_arg(p)
     p.set_defaults(func=_run)
 
@@ -69,6 +76,7 @@ def _run(args: argparse.Namespace) -> int:
     perm_id, kelly, exp_dir, display_id = _resolve_decoder(args)
     result = run_window_in_subprocess(
         perm_id, kelly, window_start, window_end, exp_dir,
+        maker_preference=bool(getattr(args, 'maker', False)),
     )
     trades_raw = result['trades']
     stops_raw = result['declared_stops']
@@ -109,6 +117,20 @@ def _run(args: argparse.Namespace) -> int:
             ),
             'slippage_n_predicted_samples': result.get(
                 'slippage_n_predicted_samples', 0,
+            ),
+            # Maker-fill telemetry. Zero unless --maker engaged
+            # the LIMIT-on-signal strategy variant.
+            'n_limit_orders_submitted': result.get(
+                'n_limit_orders_submitted', 0,
+            ),
+            'n_limit_filled_full': result.get('n_limit_filled_full', 0),
+            'n_limit_filled_partial': result.get('n_limit_filled_partial', 0),
+            'n_limit_filled_zero': result.get('n_limit_filled_zero', 0),
+            'n_limit_marketable_taker': result.get(
+                'n_limit_marketable_taker', 0,
+            ),
+            'maker_fill_efficiency_p50': result.get(
+                'maker_fill_efficiency_p50',
             ),
             'market_impact_realised_bps': None,
         }

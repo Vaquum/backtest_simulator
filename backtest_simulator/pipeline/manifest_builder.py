@@ -43,6 +43,13 @@ class StrategyParamsSpec:
     kelly_pct: Decimal
     estimated_price: Decimal
     stop_bps: Decimal
+    # When True, ENTER actions emit LIMIT orders at the
+    # estimated price (passive maker post). When False, MARKET
+    # (default behavior). Plumbed via `bts run --maker` and
+    # `bts sweep --maker` flags so the operator can A/B compare
+    # MARKET vs LIMIT-with-maker-engine fills end-to-end on
+    # the load-bearing sweep path.
+    maker_preference: bool = False
 
 
 @dataclass(frozen=True)
@@ -116,6 +123,7 @@ class ManifestBuilder:
             'kelly_pct': str(strategy_params.kelly_pct),
             'estimated_price': str(strategy_params.estimated_price),
             'stop_bps': str(strategy_params.stop_bps),
+            'maker_preference': bool(strategy_params.maker_preference),
         }
         # Nexus's StrategySpec schema has no `params` field, and its
         # startup sequencer constructs `StrategyParams(raw={})` — there's

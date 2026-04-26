@@ -46,6 +46,13 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument('--kelly-min-q', type=float, default=None)
     p.add_argument('--trade-count-min-q', type=float, default=None)
     p.add_argument('--net-return-min-q', type=float, default=None)
+    p.add_argument('--maker', action='store_true', default=False,
+                   help=(
+                       'Strategy emits LIMIT orders at the estimated '
+                       'price (passive maker post). Routes through '
+                       'MakerFillModel for realistic queue + partial '
+                       'fills. Default: MARKET (taker).'
+                   ))
     add_verbosity_arg(p)
     p.set_defaults(func=_run)
 
@@ -104,6 +111,15 @@ def _run(args: argparse.Namespace) -> int:
     sweep_n_excluded_total = 0
     sweep_n_uncal_total = 0
     sweep_runs_with_slip = 0
+    # Maker-fill telemetry across the sweep. Counts are zero when
+    # no run uses --maker; non-zero when LIMIT orders engaged the
+    # maker engine.
+    sweep_n_limit_total = 0
+    sweep_n_limit_full = 0
+    sweep_n_limit_partial = 0
+    sweep_n_limit_zero = 0
+    sweep_n_limit_taker = 0
+    sweep_efficiencies_weighted: list[tuple[Decimal, int]] = []
     for perm_id, kelly, exp_dir, display_id in picks:
         for day in days:
             window_start = datetime.combine(day.date(), hours_start, tzinfo=UTC)
@@ -117,6 +133,7 @@ def _run(args: argparse.Namespace) -> int:
             try:
                 result = run_window_in_subprocess(
                     perm_id, kelly, window_start, window_end, exp_dir,
+                    maker_preference=bool(getattr(args, 'maker', False)),
                 )
             except Exception as exc:  # noqa: BLE001 - surface per-run errors
                 dt_ms = int((time.perf_counter() - t0) * 1000)
@@ -146,6 +163,15 @@ def _run(args: argparse.Namespace) -> int:
             slip_gap = (
                 None if slip_gap_raw is None else Decimal(str(slip_gap_raw))
             )
+            n_limit = int(result.get('n_limit_orders_submitted', 0))
+            n_limit_full = int(result.get('n_limit_filled_full', 0))
+            n_limit_partial = int(result.get('n_limit_filled_partial', 0))
+            n_limit_zero = int(result.get('n_limit_filled_zero', 0))
+            n_limit_taker = int(result.get('n_limit_marketable_taker', 0))
+            eff_raw = result.get('maker_fill_efficiency_p50')
+            eff_p50 = (
+                None if eff_raw is None else Decimal(str(eff_raw))
+            )
             print_run(
                 display_id, day_label, trades, declared_stops,
                 slippage_cost_bps=slip_cost,
@@ -154,7 +180,20 @@ def _run(args: argparse.Namespace) -> int:
                 slippage_predict_vs_realised_gap_bps=slip_gap,
                 slippage_n_uncalibrated_predict=slip_uncal,
                 slippage_n_predicted_samples=slip_predicted_n,
+                n_limit_orders_submitted=n_limit,
+                n_limit_filled_full=n_limit_full,
+                n_limit_filled_partial=n_limit_partial,
+                n_limit_filled_zero=n_limit_zero,
+                n_limit_marketable_taker=n_limit_taker,
+                maker_fill_efficiency_p50=eff_p50,
             )
+            sweep_n_limit_total += n_limit
+            sweep_n_limit_full += n_limit_full
+            sweep_n_limit_partial += n_limit_partial
+            sweep_n_limit_zero += n_limit_zero
+            sweep_n_limit_taker += n_limit_taker
+            if eff_p50 is not None:
+                sweep_efficiencies_weighted.append((eff_p50, n_limit))
             if slip_cost is not None:
                 sweep_runs_with_slip += 1
                 sweep_n_samples_total += slip_n
@@ -182,7 +221,67 @@ def _run(args: argparse.Namespace) -> int:
         sweep_runs_with_slip,
         total_runs,
     )
+    _print_sweep_maker_summary(
+        sweep_n_limit_total,
+        sweep_n_limit_full,
+        sweep_n_limit_partial,
+        sweep_n_limit_zero,
+        sweep_n_limit_taker,
+        sweep_efficiencies_weighted,
+    )
     return 0
+
+
+def _print_sweep_maker_summary(
+    n_total: int,
+    n_full: int,
+    n_partial: int,
+    n_zero: int,
+    n_taker: int,
+    weighted_efficiencies: list[tuple[Decimal, int]],
+) -> None:
+    """Sweep-level maker-fill summary.
+
+    Silent when no LIMIT orders ran across the sweep (the
+    default MARKET-strategy case). Active under `--maker` mode,
+    when the strategy template emits LIMIT orders. The
+    `mkt_taker` count separates marketable LIMITs (limit price
+    crossed at submit → taker) from passive LIMITs that engaged
+    the maker engine. `fill_eff_p50` is the median fill
+    efficiency across passive LIMITs.
+    """
+    if n_total == 0:
+        return
+    n_passive = n_total - n_taker
+    if weighted_efficiencies:
+        eff_total = sum(
+            (e * Decimal(n) for e, n in weighted_efficiencies),
+            Decimal('0'),
+        )
+        eff_weight = sum(
+            (Decimal(n) for _, n in weighted_efficiencies),
+            Decimal('0'),
+        )
+        mean_eff = eff_total / eff_weight
+        eff_str = (
+            f'{(mean_eff * Decimal("100")).quantize(Decimal("0.1"))}%'
+        )
+    else:
+        eff_str = 'n/a'
+    line = (
+        f'sweep maker      n={n_total} LIMIT order(s)  '
+        f'full={n_full} partial={n_partial} zero={n_zero}  '
+        f'mkt_taker={n_taker}  passive={n_passive}  '
+        f'fill_eff_mean={eff_str}'
+    )
+    if n_passive > 0:
+        zero_pct = Decimal(n_zero) * Decimal('100') / Decimal(n_passive)
+        if zero_pct >= Decimal('50'):
+            line += (
+                '  WARN: >=50% of passive LIMITs went unfilled — '
+                'limit prices may be too far from touch'
+            )
+    print(line)
 
 
 def _print_sweep_slippage_summary(

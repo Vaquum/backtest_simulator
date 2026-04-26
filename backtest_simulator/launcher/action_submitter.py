@@ -203,11 +203,18 @@ def _wrap_single_shot_params(attrs: dict[str, object]) -> None:
     mode is SINGLE_SHOT. Nexus passes through the action's raw dict,
     so we wrap it here.
 
-    Praxis's `validate_trade_command` rejects `stop_price` on MARKET
-    orders. Our backtest's MARKET ENTER still carries a DECLARED
-    protective stop for `FillModel.apply_stop`, so we strip it from
-    the Praxis params but preserve it on the returned namespace as
-    `declared_stop_price` for the lifecycle tracker.
+    Praxis's `validate_trade_command` only allows `stop_price` on
+    order types in `_STOP_REQUIRED_TYPES` (STOP / STOP_LIMIT /
+    TAKE_PROFIT / TP_LIMIT / OCO). MARKET and LIMIT both reject
+    `stop_price` with `"<type> does not use execution_params.stop_price"`.
+    Our backtest's BUY ENTER carries a DECLARED protective stop on
+    `execution_params.stop_price` regardless of `order_type` — it's
+    BTS's R-denominator measurement, NOT Praxis's stop concept.
+    Strip it from the Praxis params for any non-stop order type and
+    preserve it on the returned namespace as `declared_stop_price`
+    for the lifecycle tracker. Pre-fix, the `is_market` shortcut
+    only handled MARKET; LIMIT (the maker-preference path) hit the
+    Praxis validator and crashed every entry.
     """
     if attrs.get('execution_mode') is not _PraxisExecutionMode.SINGLE_SHOT:
         return
@@ -216,8 +223,14 @@ def _wrap_single_shot_params(attrs: dict[str, object]) -> None:
     extracted = _extract_single_shot_price_fields(attrs.get('execution_params'))
     declared_stop_price = extracted['stop_price']
     from praxis.core.domain.enums import OrderType as _PraxisOT  # local import
-    is_market = attrs.get('order_type') is _PraxisOT.MARKET
-    stop_price_for_praxis = None if is_market else extracted['stop_price']
+    stop_required = {
+        _PraxisOT.STOP, _PraxisOT.STOP_LIMIT,
+        _PraxisOT.TAKE_PROFIT, _PraxisOT.TP_LIMIT, _PraxisOT.OCO,
+    }
+    order_type_uses_stop = attrs.get('order_type') in stop_required
+    stop_price_for_praxis = (
+        extracted['stop_price'] if order_type_uses_stop else None
+    )
     attrs['execution_params'] = _PraxisSingleShotParams(
         price=extracted['price'],
         stop_price=stop_price_for_praxis,
