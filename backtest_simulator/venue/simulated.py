@@ -104,6 +104,36 @@ class SimulatedVenueAdapter:
         self._next_trade_seq = 1
         self._history: dict[str, _I.Account] = {}
 
+    def touch_for_symbol(self, symbol: str) -> Decimal | None:
+        """Return the most recent pre-now trade price, or None if empty.
+
+        The action_submitter's LIMIT-touch refresh hook reads this
+        before validation so the strategy's `execution_params['price']`
+        is set to the touch ± tick — keeping the touch decision in
+        the action audit trail rather than venue-side. Codex round 4
+        P2 caught the prior shape (rewrite hidden inside `submit_order`).
+        """
+        from datetime import timedelta
+        now = self._now()
+        trades = self._feed._get_trades_for_venue(
+            symbol, now - timedelta(minutes=1), now,
+            venue_lookahead_seconds=0,
+        )
+        if trades.is_empty():
+            return None
+        return Decimal(str(trades.tail(1)['price'].item()))
+
+    def tick_for_symbol(self, symbol: str) -> Decimal:
+        """Return the symbol's tick size, or raise if not registered."""
+        filters = self._symbol_filters.get(symbol)
+        if filters is None:
+            msg = (
+                f'tick_for_symbol: symbol {symbol!r} not registered; '
+                f'call load_filters([{symbol!r}]) first.'
+            )
+            raise KeyError(msg)
+        return filters.tick_size
+
     def register_account(self, account_id: str, api_key: str, api_secret: str) -> None:
         # If the same account_id was registered + unregistered + re-registered,
         # recover the prior Account so fill/order history survives the cycle.
@@ -625,54 +655,17 @@ class SimulatedVenueAdapter:
             submit_time + _I.window_seconds(self._trade_window_seconds),
             venue_lookahead_seconds=self._trade_window_seconds,
         )
-        # Maker-LIMIT touch refresh: when `maker_fill_model` is
-        # attached AND the order is LIMIT, override the caller-
-        # supplied stale `price` with the most recent pre-submit
-        # trade price BIASED ONE TICK INSIDE so the order rests
-        # as a passive maker rather than crossing immediately as
-        # taker. The strategy template bakes `price` at manifest-
-        # build time (window-start seed price) and signals fire
-        # hours later — by then the market has moved and a
-        # stale-priced LIMIT either rejects, sits dead far from
-        # market, or — if pinned at the touch — crosses into
-        # taker on the next aggressor (which defeats the purpose
-        # of measuring maker mechanics). Treat
-        # `maker_preference=True` as "post at the bid (BUY) /
-        # ask (SELL)": one tick inside the most recent print so
-        # the order is strictly non-marketable on submit and the
-        # maker engine's queue-position + aggressor-matching
-        # logic gets a chance to run. A 1-tick bias also matches
-        # the typical 1-tick spread on BTCUSDT, where "best bid"
-        # ≈ last_trade - tick. No peek past `submit_time` —
-        # `pl.col('time') < submit_time` restricts to causal data.
-        #
-        # KNOWN architectural concern (codex round 4 P2): this
-        # decision is made venue-side — the strategy submits at
-        # `estimated_price` but the venue executes at
-        # `last_trade ± tick`. The cleanest fix is to compute the
-        # touch in the action_submitter (or strategy) before the
-        # action is validated, so the audit trail is a single
-        # source of truth. Doing that requires either (a) feed
-        # access in the strategy/action_submitter or (b) a
-        # touch-tracker bus that snapshots last-trade per symbol
-        # at action-emit time. Both touch slice scope; tracking
-        # as a follow-up. The current behavior IS realistic
-        # (live makers also re-quote constantly); the gap is
-        # explicit-decision-locus, not realism.
-        if (
-            order_type == OrderType.LIMIT
-            and self._maker_fill_model is not None
-            and price is not None
-            and not trades.is_empty()
-        ):
-            pre_submit = trades.filter(pl.col('time') < submit_time)
-            if not pre_submit.is_empty():
-                last_price = Decimal(str(pre_submit.tail(1)['price'].item()))
-                tick = symbol_filters.tick_size
-                if side == OrderSide.BUY:
-                    price = last_price - tick
-                else:
-                    price = last_price + tick
+        # The maker-LIMIT touch-refresh USED to live here (rewrite
+        # `price` to last_trade ± tick when a maker model was
+        # attached). Codex round 4 P2 pinned that as wrong-locus:
+        # the venue would silently execute at a different price
+        # than the strategy/Praxis command requested. The decision
+        # now lives in `action_submitter._maybe_refresh_limit_to_touch`
+        # — the action's `execution_params['price']` is rewritten
+        # BEFORE validation so the entire audit trail (validation
+        # context, TradeCommand, event_spine) sees the touch price
+        # the venue eventually executes. The venue here just
+        # honours the price it receives.
         order = PendingOrder(
             order_id=venue_order_id, side=side.name, order_type=_I.TYPE_MAP[order_type],
             qty=qty, limit_price=price, stop_price=stop_price,

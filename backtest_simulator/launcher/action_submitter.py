@@ -269,6 +269,20 @@ class SubmitterBindings:
     Bundles the per-instance dependencies (Nexus config, pipeline, Praxis
     outbound, strategy budget) so the builder and the per-action helper
     each take a single argument for them instead of five.
+
+    `touch_provider` (optional) returns the most recent pre-submit
+    trade price for a symbol. When supplied AND the action is a
+    LIMIT, the action_submitter rewrites
+    `execution_params['price']` to `touch ± tick` (BUY: -tick,
+    SELL: +tick) so the order rests strictly inside the touch.
+    Pre-fix the same biasing happened inside the venue, which made
+    `bts sweep --maker` execute a different price than the one
+    the strategy emitted (codex round 4 P2). Doing the rewrite
+    here keeps the touch decision in the action / validation
+    audit trail; the venue just executes the price it receives.
+    `tick_provider` returns the symbol's tick size (used for the
+    bias amount). Both default to None, in which case the action
+    is forwarded with its original `price`.
     """
 
     nexus_config: NexusInstanceConfig
@@ -276,6 +290,8 @@ class SubmitterBindings:
     praxis_outbound: PraxisOutbound
     validation_pipeline: ValidationPipeline
     strategy_budget: Decimal
+    touch_provider: Callable[[str], Decimal | None] | None = None
+    tick_provider: Callable[[str], Decimal] | None = None
 
 
 ReservationHook = Callable[[str, ValidationDecision, ValidationRequestContext, Action], None]
@@ -313,7 +329,12 @@ def build_action_submitter(
     through `praxis_outbound.send_abort` unchanged.
     """
     def _submit(actions: list[Action], strategy_id: str) -> None:
-        for action in actions:
+        for raw_action in actions:
+            action = _maybe_refresh_limit_to_touch(
+                raw_action,
+                touch_provider=bindings.touch_provider,
+                tick_provider=bindings.tick_provider,
+            )
             _log.info(
                 'action_submit: type=%s direction=%s size=%s',
                 action.action_type.value,
@@ -336,6 +357,50 @@ def build_action_submitter(
                 on_submit(command_id)
 
     return _submit
+
+
+def _maybe_refresh_limit_to_touch(
+    action: Action,
+    *,
+    touch_provider: Callable[[str], Decimal | None] | None,
+    tick_provider: Callable[[str], Decimal] | None,
+) -> Action:
+    """Rewrite a LIMIT action's `execution_params['price']` to touch ± tick.
+
+    Returns the input action unchanged for non-LIMIT actions, when
+    no providers are supplied, or when the touch provider returns
+    None (no recent trade). Otherwise constructs a new Action via
+    `dataclasses.replace` with updated `execution_params`. The
+    biased price is `touch - tick` for BUY (post just inside the
+    bid) and `touch + tick` for SELL (post just inside the ask).
+
+    The rewrite happens BEFORE validation so the audit trail
+    (event_spine, ValidationRequestContext, TradeCommand) all see
+    the same price the venue eventually executes — a single
+    source of truth for sweep economics. Codex round 4 P2 caught
+    the prior shape: the rewrite was venue-side and silently
+    diverged from the strategy's emitted price.
+    """
+    if action.order_type is None or action.order_type.name != 'LIMIT':
+        return action
+    if touch_provider is None or tick_provider is None:
+        return action
+    if action.direction is None:
+        return action
+    params = dict(action.execution_params or {})
+    symbol_raw = params.get('symbol')
+    symbol = symbol_raw if isinstance(symbol_raw, str) else None
+    if symbol is None:
+        return action
+    touch = touch_provider(symbol)
+    if touch is None:
+        return action
+    tick = tick_provider(symbol)
+    biased = (
+        touch - tick if action.direction.name == 'BUY' else touch + tick
+    )
+    params['price'] = str(biased)
+    return dataclasses.replace(action, execution_params=params)
 
 
 def _submit_translated(

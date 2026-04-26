@@ -259,6 +259,14 @@ def _sum_fill_totals(result: SubmitResult) -> tuple[Decimal, Decimal]:
     return fill_notional, fill_fees
 
 
+def _sum_fill_qty(result: SubmitResult) -> Decimal:
+    """Sum the result's immediate_fills into total filled quantity."""
+    total = Decimal('0')
+    for fill in result.immediate_fills:
+        total += Decimal(str(fill.qty))
+    return total
+
+
 def _finalize_successful_fill(
     ctx: _LifecycleContext,
     command_id: str,
@@ -302,6 +310,10 @@ def _finalize_successful_fill(
             'unfilled reservation residual back to available capital.',
             command_id, fill_notional, venue_order_id,
         )
+    # Capture the strategy_id BEFORE record_ack_and_fill pops the
+    # pending entry — record_open_position (called below) needs
+    # it to attribute the open position to the right strategy.
+    pending_strategy_id = ctx.tracker.strategy_id_for_pending(command_id)
     ctx.tracker.record_ack_and_fill(
         command_id, venue_order_id, fill_notional, fill_fees,
         release_residual=release_residual,
@@ -310,11 +322,80 @@ def _finalize_successful_fill(
         ctx.capital_state, ctx.initial_pool,
         context=f'order_fill command_id={command_id}',
     )
+    # BUY fills open a position; remember the cost basis + entry
+    # fees so the matching SELL can release them on close. The
+    # capital_state.position_notional already carries this amount
+    # (controller.order_fill moved it from working_order_notional);
+    # the tracker keeps a parallel ledger so `record_close_position`
+    # can subtract the exact cost basis without poking through the
+    # controller's internals. Codex round 4 P0 fix.
+    fill_qty = _sum_fill_qty(result)
+    ctx.tracker.record_open_position(
+        command_id=command_id,
+        strategy_id=pending_strategy_id or 'unknown',
+        cost_basis=fill_notional,
+        entry_fees=fill_fees,
+        entry_qty=fill_qty,
+    )
     _log.info(
         'capital lifecycle: command_id=%s reserve->send->ack->fill%s '
-        'venue_order_id=%s fill_notional=%s fees=%s',
+        'venue_order_id=%s fill_notional=%s fees=%s open_positions=%d',
         command_id, '+cancel' if release_residual else '',
         venue_order_id, fill_notional, fill_fees,
+        ctx.tracker.open_position_count,
+    )
+
+
+def _finalize_sell_close(
+    ctx: _LifecycleContext,
+    result: SubmitResult,
+    sell_command_id: str,
+) -> None:
+    """Run the SELL-fill close-position lifecycle.
+
+    Pulls the FIFO-oldest open position via
+    `tracker.record_close_position`, which mutates
+    `capital_state.position_notional` (releases the proportional
+    cost basis + entry fees) and `per_strategy_deployed` (releases
+    proportional attribution). `capital_pool` is NOT touched —
+    the controller treats it as immutable budget, SELL proceeds
+    are realized PnL not new budget. Returns the realized PnL for
+    the closed leg and asserts conservation afterwards.
+
+    Partial SELL fills only release the SOLD portion of the open
+    position; the residual entry stays open for the next preds=0
+    to finish closing (codex round 5 P2).
+
+    The realized PnL is logged on the lifecycle line so the
+    operator can audit per-trade economics directly from the run
+    log; the trade-pair-level R / return are still computed
+    downstream in `cli/_metrics.py::print_run` (those use the
+    declared-stop-anchored R, which doesn't depend on the capital
+    ledger). Pre-fix the SELL exit silently bypassed this whole
+    flow — codex round 4 P0.
+    """
+    sell_proceeds, sell_fees = _sum_fill_totals(result)
+    sell_qty = _sum_fill_qty(result)
+    realized_pnl, closed_record = ctx.tracker.record_close_position(
+        ctx.capital_state,
+        sell_command_id=sell_command_id,
+        sell_qty=sell_qty,
+        sell_proceeds=sell_proceeds,
+        sell_fees=sell_fees,
+    )
+    assert_conservation(
+        ctx.capital_state, ctx.initial_pool,
+        context=f'sell_close sell_command_id={sell_command_id}',
+    )
+    _log.info(
+        'capital lifecycle: SELL close sell_command_id=%s '
+        'paired_buy_command_id=%s released_cost_basis=%s '
+        'released_entry_fees=%s sell_qty=%s sell_proceeds=%s '
+        'sell_fees=%s realized_pnl=%s open_positions=%d',
+        sell_command_id, closed_record.command_id,
+        closed_record.cost_basis, closed_record.entry_fees,
+        sell_qty, sell_proceeds, sell_fees, realized_pnl,
+        ctx.tracker.open_position_count,
     )
 
 
@@ -534,19 +615,45 @@ def _install_capital_adapter_wrapper(
                 assert_conservation(
                     capital_state, initial_pool,
                     context=f'adapter_raised command_id={pre_match_command_id}',
-                )
+                            )
             raise
         command_id = _match_command_id(tracker, client_order_id)
-        if command_id is None:
-            _log.info(
-                'capital lifecycle: no pending command matches '
-                'client_order_id=%s (expected for SELL exits); '
-                'pending_count=%d',
-                client_order_id, tracker.pending_count,
-            )
-            return result
         venue_order_id = result.venue_order_id
         status_name = result.status.name
+        if command_id is None:
+            # SELL exits don't go through the BUY reservation
+            # tracker (no `record_reservation` call) — the
+            # action_submitter's SELL fast-path skips
+            # validation_pipeline.validate. The lifecycle for the
+            # SELL is the CLOSE half: release the matched BUY's
+            # cost basis from `position_notional` back into
+            # `capital_pool` along with the sell proceeds (net of
+            # exit fees). Codex round 4 P0: pre-fix this branch
+            # just logged-and-returned, so position_notional and
+            # capital_pool went permanently out of sync after
+            # every close.
+            if (
+                side == OrderSide.SELL
+                and status_name in ('FILLED', 'PARTIALLY_FILLED')
+                and result.immediate_fills
+            ):
+                # Both FILLED and PARTIALLY_FILLED feed the close
+                # flow; `record_close_position` releases the
+                # proportional share of the matched BUY's cost
+                # basis (sold qty / entry qty) and leaves the
+                # residual open if any. The strategy's
+                # `_pending_sell` clears on the outcome dispatch
+                # so the next preds=0 can finish the residual.
+                _finalize_sell_close(
+                    ctx, result, client_order_id or 'unknown',
+                )
+            else:
+                _log.info(
+                    'capital lifecycle: no pending command matches '
+                    'client_order_id=%s; pending_count=%d',
+                    client_order_id, tracker.pending_count,
+                )
+            return result
         # REJECTED (filter rejection, never reached the venue) and
         # EXPIRED (validated, sent to the venue, didn't fill in window)
         # both terminate without a fill, but their lifecycle audit
@@ -570,7 +677,7 @@ def _install_capital_adapter_wrapper(
             assert_conservation(
                 capital_state, initial_pool,
                 context=f'order_reject command_id={command_id}',
-            )
+                    )
             _log.info(
                 'capital lifecycle: command_id=%s %s (reservation released)',
                 command_id, status_name,
@@ -599,7 +706,7 @@ def _install_capital_adapter_wrapper(
             assert_conservation(
                 capital_state, initial_pool,
                 context=f'limit_open_no_fill command_id={command_id}',
-            )
+                    )
             _log.info(
                 'capital lifecycle: command_id=%s OPEN (LIMIT no-fill in '
                 'lookahead window — reservation released)',
@@ -899,12 +1006,32 @@ class BacktestLauncher(Launcher):
             initial_pool=self._capital_initial_pool,
             declared_stops=self._declared_stops,
         )
+        # Touch + tick providers feed the action_submitter's
+        # LIMIT-touch-refresh hook. The hook rewrites a LIMIT
+        # action's `execution_params['price']` to `touch ± tick`
+        # before validation, so the strategy's submitted price
+        # IS what the venue executes — no silent venue-side
+        # rewrite. Both providers are read-only adapters over
+        # the venue's existing feed + filters dicts.
+        venue_adapter = self._venue_adapter
+        touch_provider = (
+            venue_adapter.touch_for_symbol
+            if hasattr(venue_adapter, 'touch_for_symbol')
+            else None
+        )
+        tick_provider = (
+            venue_adapter.tick_for_symbol
+            if hasattr(venue_adapter, 'tick_for_symbol')
+            else None
+        )
         action_submit = build_action_submitter(
             SubmitterBindings(
                 nexus_config=nexus_config, state=state,
                 praxis_outbound=praxis_outbound,
                 validation_pipeline=pipeline,
                 strategy_budget=allocated_capital,
+                touch_provider=touch_provider,
+                tick_provider=tick_provider,
             ),
             on_reservation=self._record_reservation,
             on_submit=self._record_submitted_command,

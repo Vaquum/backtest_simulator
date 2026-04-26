@@ -139,7 +139,11 @@ def assert_conservation(
              `initial_pool` OR the most recent snapshot of this state.
              Both bounds matter — a pool that grows and then shrinks
              back would pass the initial-only check but still violate
-             event-to-event monotonicity.
+             event-to-event monotonicity. The SELL close-position
+             lifecycle does NOT mutate `capital_pool` (it releases
+             `position_notional` instead), so this invariant remains
+             unweakened across closes — codex round 5 P1 ruled out
+             the prior `allowed_pool_growth` softening.
       INV-2  No component is negative beyond `tolerance`.
       INV-3  `total_deployed <= capital_pool + tolerance` — the
              CapitalController's gating logic uses this; if it's ever
