@@ -242,3 +242,123 @@ def test_on_submit_hook_fires_with_command_id() -> None:
     submit([_enter_action(), _sell_action()], 'long_on_signal')
     assert len(submitted) == 2
     assert all(isinstance(cmd_id, str) for cmd_id in submitted)
+
+
+def test_maybe_refresh_limit_to_touch_buy_biases_below() -> None:
+    """LIMIT BUY action's price gets rewritten to `touch - tick`
+    BEFORE the cmd reaches Praxis (codex round 4 P2).
+
+    Mutation proof: capture the cmd that landed at
+    `praxis_outbound.send_command`. If `_maybe_refresh_limit_to_touch`
+    regresses, the cmd carries the strategy-emitted `price=10000`
+    instead of the touch-biased `49999.99`.
+    """
+    outbound = _OutboundStub()
+    pipeline, state = _pipeline_and_state()
+    bindings = SubmitterBindings(
+        nexus_config=_nexus_config(), state=state,
+        praxis_outbound=cast(PraxisOutbound, outbound),
+        validation_pipeline=pipeline,
+        strategy_budget=Decimal('100000'),
+        touch_provider=lambda _sym: Decimal('50000'),
+        tick_provider=lambda _sym: Decimal('0.01'),
+    )
+    submit = build_action_submitter(bindings)
+    limit_action = Action(
+        action_type=ActionType.ENTER,
+        direction=OrderSide.BUY,
+        size=Decimal('0.001'),
+        execution_mode=ExecutionMode.SINGLE_SHOT,
+        order_type=OrderType.LIMIT,
+        execution_params={
+            'symbol': 'BTCUSDT',
+            'price': '10000',  # stale, far from market
+            'stop_price': '9000',  # declared protective stop
+        },
+        deadline=60,
+        trade_id=None, command_id=None,
+        maker_preference=None,
+        reference_price=Decimal('10000'),
+    )
+    submit([limit_action], 'long_on_signal')
+    assert len(outbound.commands) == 1, (
+        f'expected exactly one cmd to reach send_command, got '
+        f'{len(outbound.commands)} — validation may have rejected.'
+    )
+    cmd = outbound.commands[0]
+    # The action's stale price (10000) must NOT survive into the
+    # Praxis SingleShotParams. The touch-refreshed price 49999.99
+    # (50000 - 0.01) must.
+    assert str(cmd.execution_params.price) == '49999.99', (
+        f'expected SingleShotParams.price=49999.99 (touch - tick), got '
+        f'{cmd.execution_params.price} — touch refresh did not run '
+        f'before validation, or wrong bias direction.'
+    )
+
+
+def test_maybe_refresh_limit_to_touch_sell_biases_above() -> None:
+    """LIMIT SELL action's price gets rewritten to `touch + tick`."""
+    outbound = _OutboundStub()
+    pipeline, state = _pipeline_and_state()
+    bindings = SubmitterBindings(
+        nexus_config=_nexus_config(), state=state,
+        praxis_outbound=cast(PraxisOutbound, outbound),
+        validation_pipeline=pipeline,
+        strategy_budget=Decimal('100000'),
+        touch_provider=lambda _sym: Decimal('50000'),
+        tick_provider=lambda _sym: Decimal('0.01'),
+    )
+    submit = build_action_submitter(bindings)
+    sell_limit = Action(
+        action_type=ActionType.ENTER,
+        direction=OrderSide.SELL,
+        size=Decimal('0.001'),
+        execution_mode=ExecutionMode.SINGLE_SHOT,
+        order_type=OrderType.LIMIT,
+        execution_params={'symbol': 'BTCUSDT', 'price': '10000'},
+        deadline=60,
+        trade_id=None, command_id=None,
+        maker_preference=None,
+        reference_price=Decimal('10000'),
+    )
+    submit([sell_limit], 'long_on_signal')
+    assert len(outbound.commands) == 1
+    cmd = outbound.commands[0]
+    assert str(cmd.execution_params.price) == '50000.01', (
+        f'expected SingleShotParams.price=50000.01 (touch + tick) '
+        f'for SELL maker post, got {cmd.execution_params.price}.'
+    )
+
+
+def test_maybe_refresh_limit_to_touch_skips_market_orders() -> None:
+    """MARKET actions do NOT get the price-refresh treatment.
+
+    The touch refresh must short-circuit when `order_type !=
+    LIMIT` so MARKET MARKET / SELL MARKET pass through unchanged
+    (they don't carry `execution_params['price']` in the first
+    place; rewriting it would either fail or pollute the
+    Praxis SingleShotParams).
+    """
+    outbound = _OutboundStub()
+    pipeline, state = _pipeline_and_state()
+    refresh_calls: list[str] = []
+
+    def _spying_touch(symbol: str) -> Decimal | None:
+        refresh_calls.append(symbol)
+        return Decimal('50000')
+
+    bindings = SubmitterBindings(
+        nexus_config=_nexus_config(), state=state,
+        praxis_outbound=cast(PraxisOutbound, outbound),
+        validation_pipeline=pipeline,
+        strategy_budget=Decimal('100000'),
+        touch_provider=_spying_touch,
+        tick_provider=lambda _sym: Decimal('0.01'),
+    )
+    submit = build_action_submitter(bindings)
+    submit([_enter_action()], 'long_on_signal')
+    assert refresh_calls == [], (
+        f'touch_provider was called for a MARKET action — refresh hook '
+        f'should short-circuit on non-LIMIT order types. Calls: '
+        f'{refresh_calls}'
+    )

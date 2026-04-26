@@ -1,3 +1,13 @@
+# v1.8.1
+
+- Maker-fill chain cleanup before moving on:
+  - `tests/honesty/test_adapter_wrapper_paths.py`: 4 new regression tests for the BUY → SELL close-position lifecycle through `_install_capital_adapter_wrapper` — `test_buy_fill_records_open_position_through_wrapper` (BUY half pinned), `test_buy_then_sell_close_releases_position_and_attribution` (full round trip — `position_notional`/`per_strategy_deployed` released, `capital_pool` untouched), `test_partial_sell_close_shrinks_head_keeps_residual` (codex round 5 P2), `test_sell_close_without_open_position_raises` (state-machine bug surfaces).
+  - `tests/launcher/test_action_submitter.py`: 3 new tests for `_maybe_refresh_limit_to_touch` — `test_maybe_refresh_limit_to_touch_buy_biases_below` (BUY price → `touch - tick` BEFORE the cmd reaches Praxis), `test_maybe_refresh_limit_to_touch_sell_biases_above` (SELL → `touch + tick`), `test_maybe_refresh_limit_to_touch_skips_market_orders` (MARKET passes through unchanged, touch_provider not even called).
+  - `launcher/launcher.py`: SELL-close branch now compares `side.name == 'SELL'` instead of `side == OrderSide.SELL` so the branch fires regardless of which OrderSide enum class (Praxis vs Nexus) the caller passes — both have a `SELL` member but Enum identity-comparison fails across the two distinct classes. Pre-fix the new BUY→SELL regression test caught this.
+  - `launcher/action_submitter.py`: SELL exit comment block rewritten — drops the stale "KNOWN-OPEN P0 ... CapitalController.close_position primitive" language (TODO Task 27 records the architectural decision: BTS-side `record_close_position` IS the canonical close lifecycle; routing SELL through `validate` would over-reserve or no-op, neither of which is correct). Same cleanup in `launcher.py`'s `if command_id is None:` branch — references to "out of sync after every close" replaced with the post-1.8.0 reality.
+  - `TODO.md`: Task 33 marked landed with the post-audit final design (5 codex rounds, commits 2d3515f / 761af43 / 9808fcf). Task 27 marked landed with explicit architectural decision: NOT through `validate`, instead via `CapitalLifecycleTracker.record_close_position`.
+- `pyproject.toml` 1.8.0 → 1.8.1 (patch — audit cleanup + tests, no behaviour change).
+
 # v1.8.0
 
 - Audit follow-ups: move maker LIMIT touch-price selection out of the venue, and wire the SELL exit lifecycle properly. Both items were called out as blockers (P0 + P2 architectural) in the post-1.7.0 audit; codex round 5 then pinned the close-position implementation against the controller's actual semantics.

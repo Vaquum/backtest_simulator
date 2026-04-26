@@ -313,3 +313,244 @@ def test_record_rejection_raises_on_controller_failure() -> None:
     tracker._pending['cmd-fail'].sent = True
     with pytest.raises(RuntimeError, match='order_reject failed'):
         tracker.record_rejection('cmd-fail', 'VENUE-1')
+
+
+def test_buy_fill_records_open_position_through_wrapper() -> None:
+    """BUY fill through the wrapper appends to the open-positions ledger.
+
+    Pre-state: tracker has zero open positions. After a FILLED
+    BUY through the wrapper, the open-position count is 1 with
+    cost_basis = fill_notional and entry_fees = actual fees.
+    capital_state.position_notional reflects the controller's
+    `fill_notional + actual_fees` deployment.
+
+    Mutation proof: if `_finalize_successful_fill` regresses
+    and stops calling `record_open_position`, the count stays
+    at 0 — and the matching SELL close test below would raise
+    `record_close_position: SELL ... has no matching open
+    position`. Pin the BUY half here so a regression on the
+    BUY side surfaces with a precise message.
+    """
+    _pipeline, _controller, capital_state = build_validation_pipeline(
+        capital_pool=Decimal('100000'),
+    )
+    tracker = _tracker_with_pending(capital_state, notional=Decimal('1000'))
+    fills = [
+        SimpleNamespace(qty=Decimal('1'), price=Decimal('1000'), fee=Decimal('1')),
+    ]
+    result = SimpleNamespace(
+        status=SimpleNamespace(name='FILLED'),
+        venue_order_id='VENUE-1',
+        immediate_fills=fills,
+    )
+    adapter = _FakeAdapter(result)
+    _install_capital_adapter_wrapper(
+        adapter=adapter, tracker=tracker, capital_state=capital_state,
+        initial_pool=Decimal('100000'), declared_stops={},
+    )
+    asyncio.run(adapter.submit_order(
+        'bts-acct', 'BTCUSDT', OrderSide.BUY,
+        SimpleNamespace(name='MARKET'), Decimal('1'),
+        client_order_id='SS-cmd1-000',
+    ))
+    assert tracker.open_position_count == 1, (
+        f'expected 1 open position after BUY FILLED, got '
+        f'{tracker.open_position_count} — record_open_position '
+        f'was not called from _finalize_successful_fill.'
+    )
+    # position_notional carries fill_notional + entry_fees per controller's
+    # order_fill semantics.
+    assert capital_state.position_notional == Decimal('1001'), (
+        f'expected position_notional=1001 (1000 fill + 1 fee), got '
+        f'{capital_state.position_notional}.'
+    )
+
+
+def test_buy_then_sell_close_releases_position_and_attribution() -> None:
+    """Full BUY→SELL round trip leaves position_notional and
+    per_strategy_deployed at zero, capital_pool untouched.
+
+    Post-fix conservation invariants — if any regression bypasses
+    `record_close_position`, this test fires:
+      - tracker.open_position_count == 0 after SELL close
+      - capital_state.position_notional == 0 (released cost_basis + entry_fees)
+      - capital_state.per_strategy_deployed has no `bts` entry (released to zero)
+      - capital_state.capital_pool unchanged (immutable budget)
+
+    Mutation proof: if `_finalize_sell_close` regresses to a
+    log-and-return (the codex round 4 P0 shape), the BUY's
+    deployed amount stays committed in `position_notional`
+    forever and the next BUY's CAPITAL stage either denies on
+    over-deployment or silently double-books.
+    """
+    _pipeline, _controller, capital_state = build_validation_pipeline(
+        capital_pool=Decimal('100000'),
+    )
+    tracker = _tracker_with_pending(capital_state, notional=Decimal('1000'))
+    initial_capital_pool = capital_state.capital_pool
+    # BUY fill: 1 unit at 1000 with 1 fee.
+    buy_result = SimpleNamespace(
+        status=SimpleNamespace(name='FILLED'),
+        venue_order_id='VENUE-1',
+        immediate_fills=[
+            SimpleNamespace(qty=Decimal('1'), price=Decimal('1000'), fee=Decimal('1')),
+        ],
+    )
+    buy_adapter = _FakeAdapter(buy_result)
+    _install_capital_adapter_wrapper(
+        adapter=buy_adapter, tracker=tracker, capital_state=capital_state,
+        initial_pool=initial_capital_pool, declared_stops={},
+    )
+    asyncio.run(buy_adapter.submit_order(
+        'bts-acct', 'BTCUSDT', OrderSide.BUY,
+        SimpleNamespace(name='MARKET'), Decimal('1'),
+        client_order_id='SS-cmd1-000',
+    ))
+    # Snapshot post-BUY state.
+    pool_after_buy = capital_state.capital_pool
+    assert tracker.open_position_count == 1
+    assert capital_state.position_notional == Decimal('1001')
+    assert capital_state.per_strategy_deployed.get('bts') == Decimal('1001')
+    # SELL close: 1 unit at 1100 with 1.1 fee — profitable round trip.
+    sell_result = SimpleNamespace(
+        status=SimpleNamespace(name='FILLED'),
+        venue_order_id='VENUE-2',
+        immediate_fills=[
+            SimpleNamespace(qty=Decimal('1'), price=Decimal('1100'), fee=Decimal('1.1')),
+        ],
+    )
+    sell_adapter = _FakeAdapter(sell_result)
+    _install_capital_adapter_wrapper(
+        adapter=sell_adapter, tracker=tracker, capital_state=capital_state,
+        initial_pool=initial_capital_pool, declared_stops={},
+    )
+    asyncio.run(sell_adapter.submit_order(
+        'bts-acct', 'BTCUSDT', OrderSide.SELL,
+        SimpleNamespace(name='MARKET'), Decimal('1'),
+        client_order_id='SS-cmdSELL-000',
+    ))
+    # Post-SELL invariants:
+    assert tracker.open_position_count == 0, (
+        f'expected open_position_count=0 after SELL close, got '
+        f'{tracker.open_position_count} — _finalize_sell_close did not pop.'
+    )
+    assert capital_state.position_notional == Decimal('0'), (
+        f'expected position_notional=0 after SELL close, got '
+        f'{capital_state.position_notional} — cost_basis + entry_fees '
+        f'not released.'
+    )
+    assert 'bts' not in capital_state.per_strategy_deployed, (
+        f'expected per_strategy_deployed[bts] popped to zero after close, '
+        f'got entries: {capital_state.per_strategy_deployed}.'
+    )
+    # capital_pool MUST NOT change on close — codex round 5 P1 caught the
+    # prior shape that credited `sell_proceeds - sell_fees` to the pool.
+    assert capital_state.capital_pool == pool_after_buy, (
+        f'capital_pool changed across SELL close: pre={pool_after_buy} '
+        f'post={capital_state.capital_pool}. capital_pool is immutable '
+        f'budget; SELL proceeds are realized PnL.'
+    )
+
+
+def test_partial_sell_close_shrinks_head_keeps_residual() -> None:
+    """Partial SELL releases only the sold portion; residual stays open.
+
+    Codex round 5 P2: prior implementation popped the entire FIFO
+    head on PARTIALLY_FILLED, collapsing the residual to zero
+    cost_basis. Post-fix the head's `entry_qty`, `cost_basis`,
+    and `entry_fees` shrink proportionally and the entry stays
+    in the ledger for the next SELL to finish.
+    """
+    _pipeline, _controller, capital_state = build_validation_pipeline(
+        capital_pool=Decimal('100000'),
+    )
+    tracker = _tracker_with_pending(capital_state, notional=Decimal('1000'))
+    initial_pool = capital_state.capital_pool
+    # BUY 1.0 unit at 1000, fee 1.
+    buy_result = SimpleNamespace(
+        status=SimpleNamespace(name='FILLED'),
+        venue_order_id='V-BUY',
+        immediate_fills=[
+            SimpleNamespace(qty=Decimal('1'), price=Decimal('1000'), fee=Decimal('1')),
+        ],
+    )
+    buy_adapter = _FakeAdapter(buy_result)
+    _install_capital_adapter_wrapper(
+        adapter=buy_adapter, tracker=tracker, capital_state=capital_state,
+        initial_pool=initial_pool, declared_stops={},
+    )
+    asyncio.run(buy_adapter.submit_order(
+        'bts-acct', 'BTCUSDT', OrderSide.BUY,
+        SimpleNamespace(name='MARKET'), Decimal('1'),
+        client_order_id='SS-cmd1-000',
+    ))
+    # Partial SELL 0.4 unit at 1050, fee 0.42.
+    partial_sell = SimpleNamespace(
+        status=SimpleNamespace(name='PARTIALLY_FILLED'),
+        venue_order_id='V-SELL-1',
+        immediate_fills=[
+            SimpleNamespace(qty=Decimal('0.4'), price=Decimal('1050'), fee=Decimal('0.42')),
+        ],
+    )
+    partial_adapter = _FakeAdapter(partial_sell)
+    _install_capital_adapter_wrapper(
+        adapter=partial_adapter, tracker=tracker, capital_state=capital_state,
+        initial_pool=initial_pool, declared_stops={},
+    )
+    asyncio.run(partial_adapter.submit_order(
+        'bts-acct', 'BTCUSDT', OrderSide.SELL,
+        SimpleNamespace(name='MARKET'), Decimal('0.4'),
+        client_order_id='SS-cmdSELL1-000',
+    ))
+    # Residual stays open — entry_qty 0.6, cost_basis 0.6 * 1000 = 600,
+    # entry_fees 0.6 * 1 = 0.6.
+    assert tracker.open_position_count == 1, (
+        f'partial SELL collapsed the residual: open_position_count='
+        f'{tracker.open_position_count}, expected 1.'
+    )
+    head = tracker._open_positions[0]
+    assert head.entry_qty == Decimal('0.6'), (
+        f'entry_qty after partial SELL: {head.entry_qty}, expected 0.6'
+    )
+    assert head.cost_basis == Decimal('600.0'), (
+        f'cost_basis after partial SELL: {head.cost_basis}, expected 600.0'
+    )
+    # position_notional released: original 1001 - (0.4/1.0 * 1001) = 600.6.
+    assert capital_state.position_notional == Decimal('600.6'), (
+        f'position_notional after partial SELL: '
+        f'{capital_state.position_notional}, expected 600.6.'
+    )
+
+
+def test_sell_close_without_open_position_raises() -> None:
+    """SELL fill with no matching open position raises RuntimeError.
+
+    The strategy's `_long` gate should prevent this in practice;
+    raising loudly when it slips through surfaces the state
+    machine bug rather than silently corrupting capital.
+    """
+    _pipeline, _controller, capital_state = build_validation_pipeline(
+        capital_pool=Decimal('100000'),
+    )
+    from nexus.core.validator.capital_stage import CapitalController
+    controller = CapitalController(capital_state)
+    tracker = CapitalLifecycleTracker(controller)
+    # No BUY fill, no open positions.
+    sell_result = SimpleNamespace(
+        status=SimpleNamespace(name='FILLED'),
+        venue_order_id='V-SELL',
+        immediate_fills=[
+            SimpleNamespace(qty=Decimal('1'), price=Decimal('1100'), fee=Decimal('1.1')),
+        ],
+    )
+    sell_adapter = _FakeAdapter(sell_result)
+    _install_capital_adapter_wrapper(
+        adapter=sell_adapter, tracker=tracker, capital_state=capital_state,
+        initial_pool=Decimal('100000'), declared_stops={},
+    )
+    with pytest.raises(RuntimeError, match='no matching open position'):
+        asyncio.run(sell_adapter.submit_order(
+            'bts-acct', 'BTCUSDT', OrderSide.SELL,
+            SimpleNamespace(name='MARKET'), Decimal('1'),
+            client_order_id='SS-orphanSELL-000',
+        ))

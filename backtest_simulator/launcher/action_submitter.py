@@ -433,27 +433,23 @@ def _submit_translated(
         return None
     # SELL ENTER in our long-only strategy is the EXIT LEG of an
     # already-open long — it reduces an existing position rather than
-    # opening a new one. Nexus's `ActionType.EXIT` is the correct tag
-    # but requires `trade_id`-linked lifecycle plumbing that exceeds
-    # Part 2 scope; for now we send SELL-as-ENTER but SKIP the CAPITAL
-    # reservation (which would otherwise over-commit capital on every
-    # exit — the known dishonesty codex flagged). The action still
-    # flows through Praxis → venue adapter → fill; capital accounting
-    # intentionally stays silent on exits until a follow-up slice
-    # wires proper EXIT semantics.
-    #
-    # KNOWN-OPEN P0 (auditor round 4, predates this slice): the SELL
-    # exit completely bypasses the validation pipeline AND the
-    # CapitalLifecycleTracker's release / position-decrement / PnL-
-    # reconciliation paths. A correct fix needs `CapitalController`
-    # to expose a `close_position(reservation_id, fill_notional)`
-    # primitive (Nexus-side, currently absent) that releases
-    # `position_notional` back into `capital_pool` plus realized
-    # PnL — without that primitive the backtest can't honestly
-    # reconcile capital on close. This belongs in a dedicated EXIT-
-    # lifecycle slice, not folded into the maker-fill wiring.
-    # Auditor flagged P0 in maker-fill round 4; tracking as a
-    # standalone follow-up so it gets its own change boundary.
+    # opening a new one. The action_submitter fast-path skips
+    # `validation_pipeline.validate` (and therefore the CAPITAL
+    # reservation) — see TODO Task 27 for the architectural
+    # decision: `CapitalController` has no `close_position`
+    # primitive, so routing the SELL through `validate` would
+    # either over-reserve (CAPITAL.check_and_reserve always
+    # adds claim) or no-op (the current skip), neither of which
+    # is the canonical close lifecycle. Instead the close lands
+    # in the launcher's adapter wrapper post-fill via
+    # `CapitalLifecycleTracker.record_close_position`, which
+    # mirrors `CapitalController.order_fill` exactly: releases
+    # `cost_basis + entry_fees` from `position_notional` and
+    # decrements `per_strategy_deployed[strategy_id]` by the
+    # same amount. `capital_pool` stays untouched (immutable
+    # strategy budget; SELL proceeds are realized PnL, not new
+    # budget). Realized PnL surfaces on the lifecycle log line
+    # and as the trade-pair PnL in `cli/_metrics.print_run`.
     if action.direction == OrderSide.SELL:
         decision = ValidationDecision(allowed=True)
         cmd = translate_to_trade_command(

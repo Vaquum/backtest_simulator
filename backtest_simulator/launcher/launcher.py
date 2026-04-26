@@ -624,16 +624,31 @@ def _install_capital_adapter_wrapper(
             # SELL exits don't go through the BUY reservation
             # tracker (no `record_reservation` call) — the
             # action_submitter's SELL fast-path skips
-            # validation_pipeline.validate. The lifecycle for the
-            # SELL is the CLOSE half: release the matched BUY's
-            # cost basis from `position_notional` back into
-            # `capital_pool` along with the sell proceeds (net of
-            # exit fees). Codex round 4 P0: pre-fix this branch
-            # just logged-and-returned, so position_notional and
-            # capital_pool went permanently out of sync after
-            # every close.
+            # validation_pipeline.validate (see TODO Task 27 for
+            # the architectural decision: CapitalController has
+            # no close_position primitive, so the close
+            # lifecycle is BTS-side via
+            # `record_close_position`). The CLOSE half releases
+            # the matched BUY's `cost_basis + entry_fees` from
+            # `position_notional` and decrements
+            # `per_strategy_deployed[strategy_id]` by the same
+            # amount; `capital_pool` stays untouched (it's the
+            # immutable strategy budget, not a cash ledger).
+            # Codex round 4 P0: pre-fix this branch just
+            # logged-and-returned, so `position_notional` and
+            # the per-strategy attribution dict went
+            # permanently out of sync after every close.
+            # `.name` comparison instead of `is` / `==` against
+            # Praxis's OrderSide so the branch still fires when
+            # callers pass the Nexus-side OrderSide enum (the
+            # adapter Protocol type-annotates Praxis but Nexus's
+            # action_submitter and several tests use Nexus's
+            # enum — both have `.name == 'SELL'` on the SELL
+            # member). Identity comparison on `is`/`==` returns
+            # False across the two distinct Enum classes even
+            # though they're behaviourally identical.
             if (
-                side == OrderSide.SELL
+                side.name == 'SELL'
                 and status_name in ('FILLED', 'PARTIALLY_FILLED')
                 and result.immediate_fills
             ):
