@@ -93,6 +93,17 @@ def _run(args: argparse.Namespace) -> int:
         f'{total_runs} run(s)   hours {hours_label}\n',
     )
     t_total = time.perf_counter()
+    # Accumulators for the sweep-level slippage summary printed
+    # after all runs finish. The per-run cost_bps is the
+    # side-normalized mean for that run; for the sweep aggregate
+    # we want to weight each run by its sample count so a run with
+    # 100 fills doesn't get the same vote as one with 2.
+    sweep_slip_costs_weighted: list[tuple[Decimal, int]] = []
+    sweep_slip_gaps_weighted: list[tuple[Decimal, int]] = []
+    sweep_n_samples_total = 0
+    sweep_n_excluded_total = 0
+    sweep_n_uncal_total = 0
+    sweep_runs_with_slip = 0
     for perm_id, kelly, exp_dir, display_id in picks:
         for day in days:
             window_start = datetime.combine(day.date(), hours_start, tzinfo=UTC)
@@ -123,15 +134,177 @@ def _run(args: argparse.Namespace) -> int:
             slip_cost = (
                 None if slip_raw is None else Decimal(str(slip_raw))
             )
+            slip_n = int(result.get('slippage_n_samples', 0))
+            slip_excl = int(result.get('slippage_n_excluded', 0))
+            slip_uncal = int(result.get(
+                'slippage_n_uncalibrated_predict', 0,
+            ))
+            slip_predicted_n = int(result.get(
+                'slippage_n_predicted_samples', 0,
+            ))
+            slip_gap_raw = result.get('slippage_predict_vs_realised_gap_bps')
+            slip_gap = (
+                None if slip_gap_raw is None else Decimal(str(slip_gap_raw))
+            )
             print_run(
                 display_id, day_label, trades, declared_stops,
                 slippage_cost_bps=slip_cost,
-                slippage_n_samples=int(result.get('slippage_n_samples', 0)),
-                slippage_n_excluded=int(result.get('slippage_n_excluded', 0)),
+                slippage_n_samples=slip_n,
+                slippage_n_excluded=slip_excl,
+                slippage_predict_vs_realised_gap_bps=slip_gap,
+                slippage_n_uncalibrated_predict=slip_uncal,
+                slippage_n_predicted_samples=slip_predicted_n,
             )
+            if slip_cost is not None:
+                sweep_runs_with_slip += 1
+                sweep_n_samples_total += slip_n
+                sweep_n_excluded_total += slip_excl
+                sweep_n_uncal_total += slip_uncal
+                if slip_n > 0:
+                    sweep_slip_costs_weighted.append((slip_cost, slip_n))
+                # Gap is the mean over fills where BOTH realised and
+                # predicted are available. Use the adapter's own
+                # n_predicted_samples (count of fills with non-None
+                # prediction) as the weight, so a run with many
+                # uncalibrated_predict fills doesn't get over-weighted.
+                if slip_gap is not None and slip_predicted_n > 0:
+                    sweep_slip_gaps_weighted.append(
+                        (slip_gap, slip_predicted_n),
+                    )
     t_wall = time.perf_counter() - t_total
     print(f'\ndone   {total_runs} run(s) in {t_wall:.1f}s')
+    _print_sweep_slippage_summary(
+        sweep_slip_costs_weighted,
+        sweep_slip_gaps_weighted,
+        sweep_n_samples_total,
+        sweep_n_excluded_total,
+        sweep_n_uncal_total,
+        sweep_runs_with_slip,
+        total_runs,
+    )
     return 0
+
+
+def _print_sweep_slippage_summary(
+    weighted_costs: list[tuple[Decimal, int]],
+    weighted_gaps: list[tuple[Decimal, int]],
+    n_samples_total: int,
+    n_excluded_total: int,
+    n_uncal_total: int,
+    runs_with_slip: int,
+    total_runs: int,
+) -> None:
+    """Print a sweep-level slippage summary line + coverage warning.
+
+    The per-run line gave the operator one number per run. The
+    sweep aggregate makes slippage a first-class sweep decision
+    metric:
+      - sample-weighted mean cost across all measured fills
+        (heavier runs vote more — a run with 200 fills shouldn't
+        be drowned by a run with 2).
+      - total samples and excluded across the sweep.
+      - coverage gap warning when excluded / (samples + excluded)
+        crosses 10 % — widening the calibration window or
+        increasing `dt_seconds` is the operator's response.
+      - explicit "all runs slip-off" message when no run had a
+        model attached, so the operator can tell "no slippage
+        signal" from "slippage signal of zero".
+    """
+    if runs_with_slip == 0:
+        print(
+            'sweep slippage  off — no run produced a calibrated '
+            f'SlippageModel ({total_runs} run(s))',
+        )
+        return
+    if n_samples_total == 0:
+        # Some runs had a model but no fills were measured. If
+        # there are any excluded fills, that's a 100% coverage
+        # gap — emit the WARN explicitly. Codex flagged the
+        # earlier "return early without WARN" regression.
+        line = (
+            f'sweep slippage  no fills measured across {runs_with_slip} '
+            f'slip-on run(s); excluded={n_excluded_total}'
+        )
+        if n_excluded_total > 0:
+            line += (
+                '  WARN: 100% coverage gap — every fill landed in '
+                'n_excluded; widen calibration window or increase '
+                'dt_seconds'
+            )
+        print(line)
+        return
+    weighted_total: Decimal = sum(
+        (cost * Decimal(n) for cost, n in weighted_costs),
+        Decimal('0'),
+    )
+    weight_total: Decimal = sum(
+        (Decimal(n) for _, n in weighted_costs),
+        Decimal('0'),
+    )
+    mean_cost = weighted_total / weight_total
+    coverage_denom = n_samples_total + n_excluded_total
+    coverage_pct = (
+        Decimal(n_excluded_total) / Decimal(coverage_denom) * Decimal('100')
+        if coverage_denom > 0 else Decimal('0')
+    )
+    cost_str = f'{"+" if mean_cost > 0 else ""}{mean_cost.quantize(Decimal("0.01"))}'
+    pct_str = f'{coverage_pct.quantize(Decimal("0.1"))}'
+    line = (
+        f'sweep slippage  cost {cost_str}bp  n={n_samples_total} fills '
+        f'across {runs_with_slip} run(s)  excluded={n_excluded_total} '
+        f'({pct_str}% coverage gap)'
+    )
+    if coverage_pct > Decimal('10'):
+        line += (
+            '  WARN: coverage gap >10% — widen calibration window '
+            'or increase dt_seconds'
+        )
+    print(line)
+    # Calibration-loop summary: realised - predicted gap. The
+    # gap denominator is the count of fills where BOTH realised
+    # AND predicted succeeded — NOT n_samples_total (which
+    # includes uncalibrated_predict fills the gap can't cover).
+    # Codex / auditor pinned this weighting bug.
+    n_predicted_samples_total = sum(
+        n for _, n in weighted_gaps
+    )
+    if n_predicted_samples_total == 0:
+        # No successful predictions across the entire sweep.
+        # Don't fabricate a "gap = 0" — that would imply
+        # "calibration matched reality" when the truth is "no
+        # calibration signal at all." Distinct messages for the
+        # two states (no slippage model vs model attached but
+        # zero successful predictions).
+        if n_uncal_total > 0:
+            print(
+                'sweep calibration  no successful predictions  '
+                f'uncalibrated_predict={n_uncal_total} '
+                '(buckets do not cover this run\'s qty distribution)'
+                '  WARN: cannot evaluate calibration loop',
+            )
+        # else: no model engaged on the predict side; the slippage
+        # summary above already conveyed the off/no-fills state.
+        return
+    gap_total = sum(
+        (g * Decimal(n) for g, n in weighted_gaps),
+        Decimal('0'),
+    )
+    mean_gap = gap_total / Decimal(n_predicted_samples_total)
+    gap_str = (
+        f'{"+" if mean_gap > 0 else ""}'
+        f'{mean_gap.quantize(Decimal("0.01"))}'
+    )
+    gap_line = (
+        f'sweep calibration  predict-vs-realised gap {gap_str}bp '
+        f'across {n_predicted_samples_total} predicted fills  '
+        f'uncalibrated_predict={n_uncal_total}'
+    )
+    if abs(mean_gap) > Decimal('1.0'):
+        gap_line += (
+            '  WARN: gap >1bp — calibration window or qty buckets '
+            'do not match this run; recalibrate'
+        )
+    print(gap_line)
 
 
 def _resolve_hours(args: argparse.Namespace) -> tuple[dtime, dtime]:

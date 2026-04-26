@@ -104,6 +104,9 @@ def print_run(
     slippage_cost_bps: Decimal | None = None,
     slippage_n_samples: int = 0,
     slippage_n_excluded: int = 0,
+    slippage_predict_vs_realised_gap_bps: Decimal | None = None,
+    slippage_n_uncalibrated_predict: int = 0,
+    slippage_n_predicted_samples: int = 0,
 ) -> None:
     """One-line headline + per-pair detail.
 
@@ -112,10 +115,14 @@ def print_run(
     means the run paid spread on average, negative means it
     captured price improvement, None means no slippage model was
     attached. The headline includes a `slip` column so the
-    operator on `bts sweep` (the load-bearing surface, not just
-    `bts run --output-format json`) sees whether slippage was
-    active, how many fills were measured, and what the run paid
-    relative to mid.
+    operator on `bts sweep` (the load-bearing surface) sees what
+    the run paid relative to mid.
+
+    `slippage_predict_vs_realised_gap_bps` is the calibration-
+    loop signal: realised cost minus predicted cost averaged
+    across measured fills. Zero = calibration matches reality;
+    large = recalibrate. The headline appends `gap <±bp>` after
+    the slip column when the gap is non-None.
     """
     pairs, _trailing = pair_trades(trades)
     net_pnls: list[Decimal] = []
@@ -155,6 +162,27 @@ def print_run(
             f'slip {fmt_dec(slippage_cost_bps, 2)}bp '
             f'n={slippage_n_samples}/excl={slippage_n_excluded}'
         )
+        # Only show the gap when there's actually a calibration
+        # signal — at least one fill where both realised AND
+        # predicted succeeded. Otherwise `gap 0.00bp` would
+        # falsely imply "calibration matched reality" when the
+        # truth is "no signal." Codex / auditor pinned this.
+        if slippage_predict_vs_realised_gap_bps is not None and (
+            slippage_n_predicted_samples > 0
+        ):
+            slip_str += (
+                f' gap {fmt_dec(slippage_predict_vs_realised_gap_bps, 2)}bp'
+                f' (n_predict={slippage_n_predicted_samples}'
+            )
+            if slippage_n_uncalibrated_predict > 0:
+                slip_str += f'/uncal={slippage_n_uncalibrated_predict}'
+            slip_str += ')'
+        elif slippage_n_uncalibrated_predict > 0:
+            # No successful predictions at all — operator must see
+            # this distinct from "gap was zero".
+            slip_str += (
+                f' gap n/a (uncal={slippage_n_uncalibrated_predict})'
+            )
     print(
         f'   perm {perm_id:<4}  {day_label}  '
         f'trades {n_trades:<3}  PF {pf_str:<6}  '

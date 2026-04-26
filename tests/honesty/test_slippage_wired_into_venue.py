@@ -251,6 +251,195 @@ def test_slippage_cost_is_side_normalized_paid_spread_round_trip() -> None:
     )
 
 
+def test_slippage_calibration_loop_predicts_and_reports_gap() -> None:
+    """Audit gap D: calibration is answerable, not just observable.
+
+    The model's `apply()` produces a PREDICTED bps; the adapter
+    measures the REALISED bps; the difference is the calibration
+    error signal. A run with realised cost 5 bps and predicted
+    cost 3 bps has a gap of +2 bps — the operator sees the
+    calibration is too optimistic by 2 bps.
+
+    Synthetic injection of paired predictions/realisations covers
+    the aggregator math without depending on tape symmetry.
+    Construction:
+      - Fill 0: realised=+5, predicted=+3, side=BUY → cost gap = +5-+3 = +2.
+      - Fill 1: realised=-2, predicted=-1, side=SELL → cost gap = (-(-2)) - (-(-1)) = 2 - 1 = +1.
+    Mean gap = +1.5 (calibration too optimistic).
+    """
+    from nexus.core.domain.enums import OrderSide as NexusOrderSide
+    feed = _TapeFeed()
+    submit_t = datetime(2024, 1, 1, 12, 15, tzinfo=UTC)
+    model = _calibrate(feed, submit_t)
+    adapter = _make_adapter(feed, model, submit_t)
+
+    adapter._slippage_realised_bps = [Decimal('5'), Decimal('-2')]
+    adapter._slippage_realised_sides = [
+        NexusOrderSide.BUY, NexusOrderSide.SELL,
+    ]
+    adapter._slippage_predicted_bps = [Decimal('3'), Decimal('-1')]
+
+    gap = adapter.slippage_predict_vs_realised_gap_bps
+    assert gap == Decimal('1.5'), (
+        f'predict-vs-realised gap = mean(realised_cost - predicted_cost) '
+        f'= mean(+2, +1) = +1.5; got {gap}. The calibration loop is '
+        f'broken — operator cannot tell if calibration matches reality.'
+    )
+    predicted_cost = adapter.slippage_predicted_cost_bps
+    assert predicted_cost == Decimal('2'), (
+        f'predicted cost: BUY +3 + SELL -(-1) = +3+1=+4; mean = +2; '
+        f'got {predicted_cost}'
+    )
+    realised_cost = adapter.slippage_realised_cost_bps
+    assert realised_cost == Decimal('3.5'), (
+        f'realised cost: BUY +5 + SELL -(-2) = +5+2=+7; mean = +3.5; '
+        f'got {realised_cost}'
+    )
+    assert realised_cost - predicted_cost == gap, (
+        f'gap should equal realised_cost - predicted_cost; got '
+        f'gap={gap} but realised-predicted={realised_cost - predicted_cost}'
+    )
+
+
+def test_slippage_uncalibrated_predict_separated_from_excluded_via_live_path() -> None:
+    """A real fill against an uncalibrated bucket raises in apply() and increments n_uncalibrated_predict.
+
+    The earlier version of this test mutated the counter
+    directly. Auditor flagged that as not a real integration
+    test — it pinned the property's read shape but not the
+    actual venue → SlippageModel.apply() interaction. This
+    version drives the live path:
+
+      - Build a SlippageModel with ONE bucket on BUY side
+        (qty_min=0.5, qty_max=None) and an empty SELL side.
+      - Submit a BUY MARKET order with qty=0.05 — below the
+        bucket's qty_min, so SlippageModel.apply() raises
+        ValueError when the adapter calls it for the predicted
+        bps. The realised measurement still succeeds (mid is
+        available from the synthetic pre-submit prints), so
+        n_samples increments AND n_uncalibrated_predict
+        increments — the two counters track distinct failure
+        modes.
+    """
+    from nexus.core.domain.enums import OrderSide as NexusOrderSide
+
+    from backtest_simulator.honesty.slippage import (
+        SlippageBucket,
+        SlippageModel,
+    )
+
+    submit_t = datetime(2024, 1, 1, 12, 0, 30, tzinfo=UTC)
+
+    class _SyntheticFeed:
+        def __init__(self) -> None:
+            rows = [
+                # Pre-submit: gives realised measurement a mid.
+                (submit_t - timedelta(seconds=5), 100.0, 0.5, 0, 1),
+                (submit_t - timedelta(seconds=3), 100.05, 0.5, 0, 2),
+                (submit_t - timedelta(seconds=1), 100.10, 0.5, 0, 3),
+                # Post-submit: a fill at the order's qty.
+                (submit_t + timedelta(seconds=1), 100.20, 1.0, 0, 4),
+            ]
+            self.df = pl.DataFrame(
+                rows,
+                schema={
+                    'time': pl.Datetime('us', 'UTC'),
+                    'price': pl.Float64,
+                    'qty': pl.Float64,
+                    'is_buyer_maker': pl.UInt8,
+                    'trade_id': pl.UInt64,
+                },
+                orient='row',
+            )
+
+        def get_trades(
+            self, symbol: str, start: datetime, end: datetime,
+        ) -> pl.DataFrame:
+            del symbol
+            return self.df.filter(
+                (pl.col('time') >= start) & (pl.col('time') <= end),
+            )
+
+        def _get_trades_for_venue(
+            self, symbol: str, start: datetime, end: datetime,
+            *, venue_lookahead_seconds: int,
+        ) -> pl.DataFrame:
+            del symbol, venue_lookahead_seconds
+            return self.df.filter(
+                (pl.col('time') >= start) & (pl.col('time') <= end),
+            )
+
+    # Hand-built model: ONE BUY bucket starting at qty_min=0.5.
+    # An order with qty=0.05 is BELOW that, so apply() raises
+    # ValueError on the predicted lookup. The realised mid is
+    # still computable from the pre-submit prints.
+    model = SlippageModel(
+        _buckets_by_side={
+            NexusOrderSide.BUY: (
+                SlippageBucket(
+                    side=NexusOrderSide.BUY,
+                    qty_min=Decimal('0.5'),
+                    qty_max=None,
+                    median_bps=Decimal('1.0'),
+                    n_samples=100,
+                ),
+            ),
+            NexusOrderSide.SELL: (),
+        },
+        _dt_seconds=10,
+    )
+    feed = _SyntheticFeed()
+    adapter = SimulatedVenueAdapter(
+        feed=feed,
+        filters=BinanceSpotFilters.binance_spot('BTCUSDT'),
+        fees=FeeSchedule(),
+        trade_window_seconds=60,
+        slippage_model=model,
+    )
+    adapter.register_account('a', 'k', 's')
+    adapter._now = lambda: submit_t  # type: ignore[method-assign]
+
+    res = asyncio.run(adapter.submit_order(
+        'a', 'BTCUSDT', OrderSide.BUY, OrderType.MARKET, Decimal('0.05'),
+    ))
+    assert res.immediate_fills, 'synthetic tape must produce a fill'
+
+    # Realised side succeeded — preceding mid was available.
+    assert adapter.slippage_realised_n_samples == 1, (
+        f'realised measurement should succeed (pre-submit mid '
+        f'available); got n_samples='
+        f'{adapter.slippage_realised_n_samples}'
+    )
+    assert adapter.slippage_realised_n_excluded == 0, (
+        f'realised measurement should NOT be in n_excluded; got '
+        f'n_excluded={adapter.slippage_realised_n_excluded}'
+    )
+
+    # Predicted side failed: qty=0.05 is below the only BUY
+    # bucket's qty_min=0.5. The counter increments distinct from
+    # n_excluded.
+    assert adapter.slippage_n_uncalibrated_predict == 1, (
+        f'predicted apply() must raise on qty=0.05 vs bucket '
+        f'qty_min=0.5; got n_uncalibrated_predict='
+        f'{adapter.slippage_n_uncalibrated_predict}'
+    )
+
+    # n_predicted_samples is the gap denominator. With one
+    # uncalibrated fill, no gap can be computed.
+    assert adapter.slippage_n_predicted_samples == 0, (
+        f'no successful predictions = no gap denominator; got '
+        f'n_predicted_samples={adapter.slippage_n_predicted_samples}'
+    )
+
+    # Predicted aggregate and gap return Decimal(0) here (model
+    # attached, but no successful predictions). The OUTPUT layer
+    # is responsible for distinguishing "0 because matched" from
+    # "0 because no signal" via n_predicted_samples — see
+    # `_metrics.print_run` and the sweep summary.
+    assert adapter.slippage_predicted_cost_bps == Decimal('0')
+    assert adapter.slippage_predict_vs_realised_gap_bps == Decimal('0')
+
+
 def test_slippage_cost_is_negative_when_run_captures_price_improvement() -> None:
     """Audit P1 #2: favorable fills must show as NEGATIVE cost, not positive.
 

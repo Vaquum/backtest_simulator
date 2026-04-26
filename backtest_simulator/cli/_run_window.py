@@ -153,11 +153,33 @@ def run_window_in_process(
         'slippage_realised_sell_bps': _emit(
             adapter.slippage_realised_sell_bps,
         ),
+        # Calibration-loop telemetry: predicted cost from the
+        # model's `apply()` and the realised - predicted gap.
+        # The gap is the calibration error signal; large gaps
+        # tell the operator to recalibrate.
+        'slippage_predicted_cost_bps': _emit(
+            adapter.slippage_predicted_cost_bps,
+        ),
+        'slippage_predict_vs_realised_gap_bps': _emit(
+            adapter.slippage_predict_vs_realised_gap_bps,
+        ),
         'slippage_n_samples': adapter.slippage_realised_n_samples,
         # Distinct from "measured zero" — fills excluded because
         # the rolling-mid window had no trades. Operator sees this
         # to know calibration coverage is incomplete.
         'slippage_n_excluded': adapter.slippage_realised_n_excluded,
+        # Distinct from `n_excluded`: predict failures (qty
+        # outside any calibrated bucket). A high count means
+        # the bucket thresholds are wrong for this run's qty
+        # distribution.
+        'slippage_n_uncalibrated_predict':
+            adapter.slippage_n_uncalibrated_predict,
+        # The denominator for the gap aggregate: realised
+        # samples MINUS uncalibrated predicts. A low value here
+        # against a high `n_samples` means the gap is averaged
+        # over a thin slice — the calibration coverage is poor.
+        'slippage_n_predicted_samples':
+            adapter.slippage_n_predicted_samples,
     }
 
 
@@ -167,12 +189,24 @@ def _calibrate_slippage(
 ) -> object | None:
     """Fit a SlippageModel on the 30 minutes of trades before `window_start`.
 
-    Returns None when the calibration window is empty or the model
-    rejects it (an honest "we have no data" signal — the JSON report
-    surfaces `slippage_realised_bps: None` so the operator knows the
-    feature is dark for this window). Both the empty-window and the
-    not-installed branches must short-circuit the same way; the
-    adapter's own None-handling carries the rest.
+    Return contract (narrow on purpose):
+      - SlippageModel: calibration succeeded — every per-fill
+        measurement uses this model's `dt_seconds` and the
+        adapter's aggregate properties surface real numbers.
+      - None: the trade window was *empty* and only the empty
+        window. Adapter falls back to "feature dark" for this
+        run — the JSON `slippage_realised_*` fields read None,
+        the bts-sweep line shows `slip off`, n_samples / n_excluded
+        stay at 0.
+      - Anything else (ClickHouse network failure, schema mismatch,
+        SlippageModel.calibrate raising on degenerate data,
+        LookAheadViolation against `frozen_now`) PROPAGATES as a
+        run error. The operator must know if calibration cannot
+        run; silently returning None on a tunnel-down would let
+        the rest of the run continue with no slippage reporting
+        AND no warning, which is exactly the "feature looked
+        active but actually wasn't" failure mode the audit
+        rejected.
     """
     from datetime import timedelta
 

@@ -94,8 +94,22 @@ def _run(args: argparse.Namespace) -> int:
             ),
             'slippage_realised_buy_bps': result.get('slippage_realised_buy_bps'),
             'slippage_realised_sell_bps': result.get('slippage_realised_sell_bps'),
+            # Calibration loop: model's predicted cost and the
+            # realised - predicted gap (calibration error signal).
+            'slippage_predicted_cost_bps': result.get(
+                'slippage_predicted_cost_bps',
+            ),
+            'slippage_predict_vs_realised_gap_bps': result.get(
+                'slippage_predict_vs_realised_gap_bps',
+            ),
             'slippage_n_samples': result.get('slippage_n_samples', 0),
             'slippage_n_excluded': result.get('slippage_n_excluded', 0),
+            'slippage_n_uncalibrated_predict': result.get(
+                'slippage_n_uncalibrated_predict', 0,
+            ),
+            'slippage_n_predicted_samples': result.get(
+                'slippage_n_predicted_samples', 0,
+            ),
             'market_impact_realised_bps': None,
         }
         sys.stdout.write(json.dumps(report) + '\n')

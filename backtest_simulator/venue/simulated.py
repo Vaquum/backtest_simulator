@@ -70,7 +70,19 @@ class SimulatedVenueAdapter:
         self._slippage_model = slippage_model
         self._slippage_realised_bps: list[Decimal] = []
         self._slippage_realised_sides: list[NexusOrderSide] = []
+        # Calibration-loop telemetry: for each measured taker fill,
+        # the model's `apply()` is queried for the PREDICTED bps the
+        # calibration says this (side, qty) should pay. The
+        # `predict_vs_realised_gap` aggregate exposes whether the
+        # calibration matches reality — if the gap is large, the
+        # calibration window is wrong (too short, wrong volatility
+        # regime, qty buckets miscalibrated). When `apply()` raises
+        # ValueError (qty outside any calibrated bucket) the
+        # corresponding entry is None and `n_uncalibrated_predict`
+        # increments — distinct from `n_excluded` (no preceding mid).
+        self._slippage_predicted_bps: list[Decimal | None] = []
         self._slippage_n_excluded: int = 0
+        self._slippage_n_uncalibrated_predict: int = 0
         self._accounts: dict[str, _I.Account] = {}
         self._symbol_filters: dict[str, BinanceSpotFilters] = {filters.symbol: filters}
         self._next_order_seq = 1
@@ -167,6 +179,21 @@ class SimulatedVenueAdapter:
             )
             self._slippage_realised_bps.append(bps)
             self._slippage_realised_sides.append(side)
+            # Calibration-loop step: ask the model what it would
+            # predict for this (side, qty, mid, t). Mismatch
+            # against the realised bps is the calibration error
+            # signal. ValueError = qty bucket uncalibrated; record
+            # None and bump the counter so the operator can tell
+            # "calibration off-bucket" apart from "bucket says 0".
+            try:
+                predicted_bps = self._slippage_model.apply(
+                    side=side, qty=f.fill_qty, mid=mid, t=f.fill_time,
+                )
+            except ValueError:
+                self._slippage_predicted_bps.append(None)
+                self._slippage_n_uncalibrated_predict += 1
+            else:
+                self._slippage_predicted_bps.append(predicted_bps)
 
     def _aggregate_bps_when_active(
         self,
@@ -252,6 +279,101 @@ class SimulatedVenueAdapter:
         """Mean realised bps over SELL-aggressor fills (negative = received below mid)."""
         return self._aggregate_bps_when_active(
             lambda _bps, side: side == NexusOrderSide.SELL,
+        )
+
+    @property
+    def slippage_predicted_cost_bps(self) -> Decimal | None:
+        """Side-normalized PREDICTED cost from the calibration's `apply()`.
+
+        Parallel to `slippage_realised_cost_bps` but driven by what
+        the model predicts rather than what was measured. Only
+        fills where `apply()` succeeded contribute (uncalibrated
+        buckets are tracked via `slippage_n_uncalibrated_predict`).
+        Pair with `realised` to read the calibration loop:
+        gap = realised - predicted (see `slippage_predict_vs_realised_gap_bps`).
+        """
+        if self._slippage_model is None:
+            return None
+        paired = [
+            (pred, side)
+            for pred, side in zip(
+                self._slippage_predicted_bps,
+                self._slippage_realised_sides,
+                strict=True,
+            )
+            if pred is not None
+        ]
+        if not paired:
+            return Decimal('0')
+        cost_samples = [
+            pred if side == NexusOrderSide.BUY else -pred
+            for pred, side in paired
+        ]
+        return sum(cost_samples, Decimal('0')) / Decimal(len(cost_samples))
+
+    @property
+    def slippage_predict_vs_realised_gap_bps(self) -> Decimal | None:
+        """Mean (realised_cost - predicted_cost) per fill where both available.
+
+        The calibration loop's primary signal. Zero means the
+        calibration matches reality on average; large positive
+        means the run paid more than the calibration predicted
+        (calibration is too optimistic); large negative means the
+        run paid less than predicted (calibration too
+        pessimistic). Either direction is a recalibration trigger.
+
+        Only fills with both a realised measurement AND a
+        successful `apply()` contribute. Fills excluded for either
+        reason are tracked separately (`n_excluded`,
+        `n_uncalibrated_predict`). None when no slippage model
+        attached.
+        """
+        if self._slippage_model is None:
+            return None
+        gaps: list[Decimal] = []
+        for realised, pred, side in zip(
+            self._slippage_realised_bps,
+            self._slippage_predicted_bps,
+            self._slippage_realised_sides,
+            strict=True,
+        ):
+            if pred is None:
+                continue
+            realised_cost = (
+                realised if side == NexusOrderSide.BUY else -realised
+            )
+            predicted_cost = pred if side == NexusOrderSide.BUY else -pred
+            gaps.append(realised_cost - predicted_cost)
+        if not gaps:
+            return Decimal('0')
+        return sum(gaps, Decimal('0')) / Decimal(len(gaps))
+
+    @property
+    def slippage_n_uncalibrated_predict(self) -> int:
+        """Fills where the calibration's `apply()` raised (qty out of bucket).
+
+        Distinct from `n_excluded` (which counts realised-side
+        failures: no preceding mid). A fill can be uncalibrated
+        on the predict side AND still measured on the realised
+        side — those entries contribute to realised aggregates
+        but NOT to predicted/gap aggregates.
+        """
+        return self._slippage_n_uncalibrated_predict
+
+    @property
+    def slippage_n_predicted_samples(self) -> int:
+        """Fills where the model's `apply()` succeeded — the gap denominator.
+
+        The predict-vs-realised gap aggregate is averaged ONLY
+        over these fills. `n_samples` counts realised
+        measurements; `n_predicted_samples` counts the subset
+        where prediction also succeeded. Operators reading the
+        gap need this denominator separately so a low predicted
+        count over many realised fills surfaces as "calibration
+        coverage is thin even though we measured a lot."
+        """
+        return sum(
+            1 for pred in self._slippage_predicted_bps if pred is not None
         )
 
     @property
