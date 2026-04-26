@@ -113,6 +113,10 @@ def print_run(
     n_limit_filled_zero: int = 0,
     n_limit_marketable_taker: int = 0,
     maker_fill_efficiency_p50: Decimal | None = None,
+    market_impact_realised_bps: Decimal | None = None,
+    market_impact_n_samples: int = 0,
+    market_impact_n_flagged: int = 0,
+    market_impact_n_uncalibrated: int = 0,
 ) -> None:
     """One-line headline + per-pair detail.
 
@@ -203,13 +207,33 @@ def print_run(
         )
     else:
         maker_str = ''
+    # Market impact column: only render when the model surfaced
+    # at least one calibrated sample OR an uncalibrated submit;
+    # otherwise the model wasn't attached / didn't see any
+    # orders this run. Format: `imp <bps>bp n=<N>/flagged=<F>`,
+    # plus `/uncal=<U>` when there was a calibration gap.
+    if (
+        market_impact_realised_bps is not None
+        and (market_impact_n_samples > 0
+             or market_impact_n_uncalibrated > 0)
+    ):
+        impact_core = (
+            f'  imp {fmt_dec(market_impact_realised_bps, 2)}bp '
+            f'n={market_impact_n_samples}/flagged={market_impact_n_flagged}'
+        )
+        if market_impact_n_uncalibrated > 0:
+            impact_core += f'/uncal={market_impact_n_uncalibrated}'
+        impact_str = impact_core
+    else:
+        impact_str = ''
     print(
         f'   perm {perm_id:<4}  {day_label}  '
         f'trades {n_trades:<3}  PF {pf_str:<6}  '
         f'R̄ {r_mean_str:<7}  DD {fmt_dec(-max_dd_pct, 2)}%  '
         f'total {fmt_dec(total_pct, 2)}%  '
         f'{slip_str}'
-        f'{maker_str}',
+        f'{maker_str}'
+        f'{impact_str}',
     )
     for buy, sell in pairs:
         declared = declared_stops.get(buy.client_order_id)

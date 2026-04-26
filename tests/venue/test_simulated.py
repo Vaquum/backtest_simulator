@@ -121,3 +121,182 @@ def test_validation_rejection_still_rejects() -> None:
         Decimal('0.000001'),  # below min_qty 0.00001
     ))
     assert result.status == OrderStatus.REJECTED
+
+
+# Market-impact wiring tests — pin Task 13's submit_order →
+# MarketImpactModel.evaluate → bps + flag aggregation chain.
+class _SyntheticImpactFeed:
+    """Feed with one calibration bucket spanning a known time window.
+
+    The bucket carries 10 BTC of total volume and a 5 bps price
+    range — well above the LIMIT order's qty so the impact_bps
+    falls out as `qty / 10 * 5 bps`. Used to pin the per-order
+    recording path without relying on live ClickHouse.
+    """
+
+    def __init__(self, bucket_start: datetime) -> None:
+        from datetime import timedelta
+        # 10 trades, 1 BTC each, prices ramping 70000 → 70035 over the bucket.
+        self._frame = pl.DataFrame({
+            'time': [
+                bucket_start + timedelta(seconds=i * 5)
+                for i in range(10)
+            ],
+            'price': [70000.0 + i * 5 for i in range(10)],
+            'qty': [1.0] * 10,
+            'is_buyer_maker': [i % 2 for i in range(10)],
+            'trade_id': list(range(10)),
+        }).with_columns(
+            pl.col('time').cast(pl.Datetime(time_zone='UTC')),
+        )
+
+    def get_trades(self, symbol: str, start: datetime, end: datetime) -> pl.DataFrame:
+        del symbol
+        return self._frame.filter(
+            (pl.col('time') >= start) & (pl.col('time') < end),
+        )
+
+    def _get_trades_for_venue(
+        self, symbol: str, start: datetime, end: datetime,
+        *, venue_lookahead_seconds: int,
+    ) -> pl.DataFrame:
+        del symbol, venue_lookahead_seconds
+        return self._frame.filter(
+            (pl.col('time') >= start) & (pl.col('time') < end),
+        )
+
+
+def _impact_adapter(
+    bucket_start: datetime,
+):
+    """Build an adapter pre-wired with a one-bucket impact model."""
+    from backtest_simulator.honesty.market_impact import MarketImpactModel
+    feed = _SyntheticImpactFeed(bucket_start)
+    # Model calibrated from the same synthetic frame (renamed to
+    # the `datetime`/`quantity` schema the standalone primitive
+    # expects).
+    calibration_frame = feed._frame.rename(
+        {'time': 'datetime', 'qty': 'quantity'},
+    )
+    impact_model = MarketImpactModel.calibrate(
+        trades=calibration_frame, bucket_minutes=1,
+        threshold_fraction=Decimal('0.1'),
+    )
+    return SimulatedVenueAdapter(
+        feed=cast(VenueFeed, feed),
+        filters=BinanceSpotFilters.binance_spot('BTCUSDT'),
+        fees=FeeSchedule(),
+        trade_window_seconds=60,
+        market_impact_model=impact_model,
+    )
+
+
+def test_market_impact_records_bps_per_order() -> None:
+    """A submit whose timestamp hits a calibrated bucket records bps + flag.
+
+    Mutation proof: if `_record_market_impact` regresses (early
+    return, wrong field name, etc.), `n_samples` stays at 0 and
+    the JSON `market_impact_realised_bps` reads None — the
+    audit's "feature ornamental" failure mode.
+    """
+    from datetime import UTC, timedelta
+
+    from freezegun import freeze_time
+    bucket_start = datetime(2024, 1, 3, 12, 0, tzinfo=UTC)
+    adapter = _impact_adapter(bucket_start)
+    adapter.register_account('acct-1', 'k', 's')
+    # Submit at a wall-clock time inside the bucket. Use freezegun so
+    # `_now()` returns a deterministic timestamp the bucket-finder
+    # matches.
+    with freeze_time(bucket_start + timedelta(seconds=20)):
+        asyncio.run(adapter.submit_order(
+            'acct-1', 'BTCUSDT', OrderSide.BUY,
+            OrderType.MARKET,
+            Decimal('0.001'),  # 0.001 of 10 BTC bucket = 0.01% of vol
+        ))
+    assert adapter.market_impact_n_samples == 1, (
+        f'expected 1 calibrated impact sample, got '
+        f'{adapter.market_impact_n_samples}.'
+    )
+    assert adapter.market_impact_n_uncalibrated == 0
+    assert adapter.market_impact_n_flagged == 0, (
+        f'order qty 0.001 << 10% of 10 BTC bucket vol; should not flag. '
+        f'Got n_flagged={adapter.market_impact_n_flagged}.'
+    )
+    impact_bps = adapter.market_impact_realised_bps
+    assert impact_bps is not None and impact_bps > Decimal('0'), (
+        f'impact_bps must be positive (qty * range / total_volume); '
+        f'got {impact_bps}.'
+    )
+
+
+def test_market_impact_flags_oversize_orders() -> None:
+    """An order > threshold_fraction of bucket volume sets `flag=True`."""
+    from datetime import UTC, timedelta
+
+    from freezegun import freeze_time
+    bucket_start = datetime(2024, 1, 3, 12, 0, tzinfo=UTC)
+    adapter = _impact_adapter(bucket_start)
+    adapter.register_account('acct-1', 'k', 's')
+    # 5 BTC against a 10 BTC bucket = 50% of volume → way above
+    # the 10% threshold.
+    with freeze_time(bucket_start + timedelta(seconds=20)):
+        asyncio.run(adapter.submit_order(
+            'acct-1', 'BTCUSDT', OrderSide.BUY,
+            OrderType.MARKET,
+            Decimal('5'),
+        ))
+    assert adapter.market_impact_n_flagged == 1, (
+        f'5 BTC of 10 BTC bucket exceeds 10% threshold but '
+        f'n_flagged={adapter.market_impact_n_flagged}.'
+    )
+
+
+def test_market_impact_uncalibrated_when_no_bucket_match() -> None:
+    """Submit outside the calibration window increments n_uncalibrated.
+
+    The model returns `concurrent_volume=0` when no bucket
+    contains `t`; the venue records this as uncalibrated rather
+    than as a zero-impact sample so the operator sees the
+    calibration gap distinctly.
+    """
+    from datetime import UTC, timedelta
+
+    from freezegun import freeze_time
+    bucket_start = datetime(2024, 1, 3, 12, 0, tzinfo=UTC)
+    adapter = _impact_adapter(bucket_start)
+    adapter.register_account('acct-1', 'k', 's')
+    # Submit a year later — far outside the bucket.
+    with freeze_time(bucket_start + timedelta(days=365)):
+        asyncio.run(adapter.submit_order(
+            'acct-1', 'BTCUSDT', OrderSide.BUY,
+            OrderType.MARKET,
+            Decimal('0.001'),
+        ))
+    assert adapter.market_impact_n_samples == 0
+    assert adapter.market_impact_n_uncalibrated == 1, (
+        f'submit outside calibration window should land in '
+        f'n_uncalibrated, not n_samples. Got '
+        f'n_samples={adapter.market_impact_n_samples} '
+        f'n_uncalibrated={adapter.market_impact_n_uncalibrated}.'
+    )
+
+
+def test_market_impact_off_when_model_none() -> None:
+    """`market_impact_realised_bps` is None when the model is not attached.
+
+    Distinguishes "feature off" (no model) from "feature on, no data"
+    (zero samples). The JSON consumer reads None as "model
+    disabled" and the per-run line skips the `imp` column.
+    """
+    adapter = _adapter()
+    adapter.register_account('acct-1', 'k', 's')
+    result = asyncio.run(adapter.submit_order(
+        'acct-1', 'BTCUSDT', OrderSide.BUY,
+        OrderType.MARKET, Decimal('0.001'),
+    ))
+    del result
+    assert adapter.market_impact_realised_bps is None, (
+        f'No model attached but realised_bps={adapter.market_impact_realised_bps}'
+    )
+    assert adapter.market_impact_n_samples == 0

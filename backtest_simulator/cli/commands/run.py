@@ -9,8 +9,14 @@
 # `slippage_n_samples`, `slippage_n_excluded`) report measurements taken
 # against the rolling mid; the SlippageModel does NOT adjust fill_price
 # (walk_trades returns realistic taker prices from the historical tape).
-# `book_gap_max_seconds` and `market_impact_realised_bps` are populated
-# by their own wiring tasks once they land.
+# `market_impact_realised_bps`, `market_impact_n_samples`,
+# `market_impact_n_flagged`, `market_impact_n_uncalibrated` are
+# populated by `MarketImpactModel.evaluate` per order submit. The
+# bps figure is measurement-only — `walk_trades` already prices
+# against tape so we don't double-charge the impact; the metric
+# is the operator-visible "would have moved the book this much
+# in live" signal. `book_gap_max_seconds` is populated by its
+# own wiring task once it lands.
 from __future__ import annotations
 
 import argparse
@@ -132,7 +138,27 @@ def _run(args: argparse.Namespace) -> int:
             'maker_fill_efficiency_p50': result.get(
                 'maker_fill_efficiency_p50',
             ),
-            'market_impact_realised_bps': None,
+            # Market impact telemetry. `realised_bps` is the
+            # mean of the model's per-order estimated impact
+            # (linear interpolation of order_qty against
+            # concurrent-bucket volume → bps). `n_samples` is
+            # the order count that hit a calibrated bucket;
+            # `n_flagged` counts those whose qty exceeded the
+            # threshold fraction of bucket volume; and
+            # `n_uncalibrated` counts orders whose timestamp
+            # had no matching bucket (calibration gap).
+            'market_impact_realised_bps': result.get(
+                'market_impact_realised_bps',
+            ),
+            'market_impact_n_samples': result.get(
+                'market_impact_n_samples', 0,
+            ),
+            'market_impact_n_flagged': result.get(
+                'market_impact_n_flagged', 0,
+            ),
+            'market_impact_n_uncalibrated': result.get(
+                'market_impact_n_uncalibrated', 0,
+            ),
         }
         sys.stdout.write(json.dumps(report) + '\n')
         return 0
@@ -140,12 +166,24 @@ def _run(args: argparse.Namespace) -> int:
     declared_stops = {k: Decimal(str(v)) for k, v in stops_raw.items()}
     slip_raw = result.get('slippage_realised_cost_bps')
     slip_cost = None if slip_raw is None else Decimal(str(slip_raw))
+    impact_raw = result.get('market_impact_realised_bps')
+    impact_bps = None if impact_raw is None else Decimal(str(impact_raw))
     print_run(
         display_id, window_start.date().isoformat(), trades,
         declared_stops,
         slippage_cost_bps=slip_cost,
         slippage_n_samples=int(result.get('slippage_n_samples', 0)),
         slippage_n_excluded=int(result.get('slippage_n_excluded', 0)),
+        market_impact_realised_bps=impact_bps,
+        market_impact_n_samples=int(result.get(
+            'market_impact_n_samples', 0,
+        )),
+        market_impact_n_flagged=int(result.get(
+            'market_impact_n_flagged', 0,
+        )),
+        market_impact_n_uncalibrated=int(result.get(
+            'market_impact_n_uncalibrated', 0,
+        )),
     )
     return 0
 

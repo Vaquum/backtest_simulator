@@ -26,6 +26,7 @@ from praxis.infrastructure.venue_adapter import (
 
 from backtest_simulator.feed.protocol import VenueFeed
 from backtest_simulator.honesty.maker_fill import MakerFillModel
+from backtest_simulator.honesty.market_impact import MarketImpactModel
 from backtest_simulator.honesty.slippage import SlippageModel
 from backtest_simulator.venue import _adapter_internals as _I
 from backtest_simulator.venue.fees import FeeSchedule
@@ -48,6 +49,7 @@ class SimulatedVenueAdapter:
         trade_window_seconds: int = 3600,
         slippage_model: SlippageModel | None = None,
         maker_fill_model: MakerFillModel | None = None,
+        market_impact_model: MarketImpactModel | None = None,
     ) -> None:
         self._feed = feed
         self._filters = filters
@@ -98,6 +100,22 @@ class SimulatedVenueAdapter:
         self._n_limit_filled_zero: int = 0
         self._n_limit_marketable_taker: int = 0
         self._maker_fill_efficiencies: list[Decimal] = []
+        # MarketImpactModel — measurement-only, like SlippageModel.
+        # On every order submit, the model.evaluate(qty, mid, t)
+        # returns the predicted bps the order would push the book
+        # (linear interpolation: order_qty / bucket_volume *
+        # bucket_price_range_bps) plus a `flag` for orders larger
+        # than `threshold_fraction` of concurrent volume. We do
+        # NOT mutate fill_price; walk_trades already uses real
+        # tape prices. The aggregate `market_impact_realised_bps`
+        # surfaces the average estimated impact across submitted
+        # orders, and `n_flagged` counts orders the operator
+        # should down-size before live. None when the model is
+        # not attached.
+        self._market_impact_model = market_impact_model
+        self._market_impact_bps_samples: list[Decimal] = []
+        self._market_impact_n_flagged: int = 0
+        self._market_impact_n_uncalibrated: int = 0
         self._accounts: dict[str, _I.Account] = {}
         self._symbol_filters: dict[str, BinanceSpotFilters] = {filters.symbol: filters}
         self._next_order_seq = 1
@@ -405,6 +423,104 @@ class SimulatedVenueAdapter:
         """
         return self._slippage_n_uncalibrated_predict
 
+    def _record_market_impact(
+        self,
+        order: PendingOrder,
+        fills: list[FillResult],
+        submit_time: datetime,
+    ) -> None:
+        """Measure the model's estimated impact bps for this order.
+
+        Calls `model.evaluate(qty=order.qty, mid=fill_or_limit_price,
+        t=submit_time)` and records the predicted impact bps + flag.
+        We sample at order-submit time (not per-fill) because impact
+        is a function of order size against concurrent volume — it's
+        decided at submit, not by the tape walk. Like
+        `_record_slippage`, this is measurement-only: we do not
+        mutate fill_price. The aggregate surfaces on `bts sweep` so
+        the operator can spot orders that would have moved the book
+        more than the calibration says is realistic for live.
+
+        `mid` is reserved on the model for future quote-anchored
+        calibration; today the implementation ignores it. We pass
+        the order's limit price (LIMIT) or the first fill price
+        (MARKET fills) when available, falling back to Decimal('0')
+        when neither is set — the model honours the contract
+        regardless.
+
+        No-op when `market_impact_model is None`.
+
+        `flag=True` from the model means the order exceeded
+        `threshold_fraction` of the matching bucket's volume — the
+        operator's "this would move the book more than the
+        calibration was based on" trigger. We track these
+        separately so the sweep can call them out.
+
+        When the model returns the no-bucket / empty-bucket
+        sentinel (`impact_bps=0`, `flag=True`), we count it as
+        uncalibrated rather than recording a zero impact —
+        otherwise a calibration gap would silently weight the
+        realised aggregate downward. Distinct from "real zero"
+        (impact=0, flag=False) which CAN happen when the order
+        is tiny relative to bucket volume.
+        """
+        if self._market_impact_model is None:
+            return
+        if fills:
+            mid = fills[0].fill_price
+        elif order.limit_price is not None:
+            mid = order.limit_price
+        else:
+            mid = Decimal('0')
+        decision = self._market_impact_model.evaluate(
+            qty=order.qty, mid=mid, t=submit_time,
+        )
+        if decision.concurrent_volume == Decimal('0'):
+            self._market_impact_n_uncalibrated += 1
+            return
+        self._market_impact_bps_samples.append(decision.impact_bps)
+        if decision.flag:
+            self._market_impact_n_flagged += 1
+
+    @property
+    def market_impact_realised_bps(self) -> Decimal | None:
+        """Mean estimated impact bps across recorded order submits.
+
+        None when the model is not attached. Returns Decimal('0')
+        when attached but no calibrated bucket matched any submit
+        (`n_uncalibrated > 0` exposes this case to the operator
+        separately so a `0.00bp` aggregate can't masquerade as
+        "no impact" when the calibration is missing).
+        """
+        if self._market_impact_model is None:
+            return None
+        if not self._market_impact_bps_samples:
+            return Decimal('0')
+        return sum(
+            self._market_impact_bps_samples, Decimal('0'),
+        ) / Decimal(len(self._market_impact_bps_samples))
+
+    @property
+    def market_impact_n_samples(self) -> int:
+        """Count of order submits with a matching calibrated bucket."""
+        return len(self._market_impact_bps_samples)
+
+    @property
+    def market_impact_n_flagged(self) -> int:
+        """Count of order submits flagged as too large vs concurrent volume."""
+        return self._market_impact_n_flagged
+
+    @property
+    def market_impact_n_uncalibrated(self) -> int:
+        """Count of order submits whose timestamp had no matching bucket.
+
+        Distinct from `n_samples`: an uncalibrated submit means the
+        model returned `concurrent_volume=0` (gap in calibration);
+        the impact is unknown, not zero. The sweep aggregator
+        WARNs when this rises so the operator widens calibration.
+        """
+        return self._market_impact_n_uncalibrated
+
     def _record_limit_outcome(
         self,
         order: PendingOrder,
@@ -695,6 +811,14 @@ class SimulatedVenueAdapter:
         # adjust `fills` — the audit's P1 was that adjusting on top
         # of tape-priced fills double-counts spread.
         self._record_slippage(order, fills, trades)
+        # Measure estimated market impact for THIS order
+        # (qty * mid -> predicted bps the order would push the
+        # book). Like slippage, this is measurement-only — we do
+        # not adjust fill_price. The aggregate surfaces on
+        # `bts sweep` so the operator can spot orders that would
+        # have eaten >threshold_fraction of concurrent volume
+        # (the `flag=True` case) before going live.
+        self._record_market_impact(order, fills, submit_time)
         # LIMIT order telemetry: surface fill efficiency on the
         # load-bearing `bts sweep` path. Counts are zeroed for
         # MARKET / STOP_* orders.

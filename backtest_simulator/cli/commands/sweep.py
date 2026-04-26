@@ -120,6 +120,16 @@ def _run(args: argparse.Namespace) -> int:
     sweep_n_limit_zero = 0
     sweep_n_limit_taker = 0
     sweep_efficiencies_weighted: list[tuple[Decimal, int]] = []
+    # Sweep-level market-impact accumulators. The per-run
+    # `realised_bps` is a mean across that run's calibrated
+    # samples; the cross-run aggregate is a sample-weighted
+    # mean (heavier runs vote more — same shape as the
+    # sweep-level slippage cost aggregate). `n_samples` /
+    # `n_flagged` / `n_uncalibrated` are simple totals.
+    sweep_impact_bps_weighted: list[tuple[Decimal, int]] = []
+    sweep_impact_n_samples_total = 0
+    sweep_impact_n_flagged_total = 0
+    sweep_impact_n_uncalibrated_total = 0
     for perm_id, kelly, exp_dir, display_id in picks:
         for day in days:
             window_start = datetime.combine(day.date(), hours_start, tzinfo=UTC)
@@ -177,6 +187,15 @@ def _run(args: argparse.Namespace) -> int:
             eff_mean = (
                 None if eff_mean_raw is None else Decimal(str(eff_mean_raw))
             )
+            impact_raw = result.get('market_impact_realised_bps')
+            impact_bps = (
+                None if impact_raw is None else Decimal(str(impact_raw))
+            )
+            impact_n = int(result.get('market_impact_n_samples', 0))
+            impact_flagged = int(result.get('market_impact_n_flagged', 0))
+            impact_uncal = int(result.get(
+                'market_impact_n_uncalibrated', 0,
+            ))
             print_run(
                 display_id, day_label, trades, declared_stops,
                 slippage_cost_bps=slip_cost,
@@ -191,6 +210,10 @@ def _run(args: argparse.Namespace) -> int:
                 n_limit_filled_zero=n_limit_zero,
                 n_limit_marketable_taker=n_limit_taker,
                 maker_fill_efficiency_p50=eff_p50,
+                market_impact_realised_bps=impact_bps,
+                market_impact_n_samples=impact_n,
+                market_impact_n_flagged=impact_flagged,
+                market_impact_n_uncalibrated=impact_uncal,
             )
             sweep_n_limit_total += n_limit
             sweep_n_limit_full += n_limit_full
@@ -206,6 +229,16 @@ def _run(args: argparse.Namespace) -> int:
             # 4 P2 caught the prior n_limit weighting.
             if eff_mean is not None and n_passive > 0:
                 sweep_efficiencies_weighted.append((eff_mean, n_passive))
+            # Market-impact aggregation: weight per-run mean by
+            # sample count so a 200-order run doesn't get drowned
+            # by a 2-order run. Uncalibrated submits are tracked
+            # separately so the operator can spot calibration
+            # gaps in the sweep summary.
+            if impact_bps is not None and impact_n > 0:
+                sweep_impact_bps_weighted.append((impact_bps, impact_n))
+            sweep_impact_n_samples_total += impact_n
+            sweep_impact_n_flagged_total += impact_flagged
+            sweep_impact_n_uncalibrated_total += impact_uncal
             if slip_cost is not None:
                 sweep_runs_with_slip += 1
                 sweep_n_samples_total += slip_n
@@ -241,7 +274,83 @@ def _run(args: argparse.Namespace) -> int:
         sweep_n_limit_taker,
         sweep_efficiencies_weighted,
     )
+    _print_sweep_impact_summary(
+        sweep_impact_bps_weighted,
+        sweep_impact_n_samples_total,
+        sweep_impact_n_flagged_total,
+        sweep_impact_n_uncalibrated_total,
+        total_runs,
+    )
     return 0
+
+
+def _print_sweep_impact_summary(
+    weighted_bps: list[tuple[Decimal, int]],
+    n_samples_total: int,
+    n_flagged_total: int,
+    n_uncalibrated_total: int,
+    total_runs: int,
+) -> None:
+    """Print the sweep-level market-impact summary line.
+
+    Silent when the sweep saw zero impact samples AND zero
+    uncalibrated submits (the model was either off or no
+    orders fired). Active otherwise — the operator gets:
+      - sample-weighted mean impact bps across all calibrated
+        submits (heavier runs vote more, matching the
+        slippage-cost aggregator's weighting).
+      - total samples + flagged-as-too-large counts.
+      - uncalibrated count and a WARN suffix when
+        `n_uncalibrated / (n_samples + n_uncalibrated) > 10%`
+        — the operator's "calibration window is too narrow"
+        signal, mirroring the slippage coverage gap WARN.
+      - flagged-fraction WARN when >= 5% of submitted orders
+        crossed the `threshold_fraction` of bucket volume —
+        the operator must down-size before live.
+    """
+    del total_runs  # reserved for future per-run normalisation
+    if n_samples_total == 0 and n_uncalibrated_total == 0:
+        return
+    if weighted_bps and n_samples_total > 0:
+        bps_total = sum(
+            (bps * Decimal(n) for bps, n in weighted_bps),
+            Decimal('0'),
+        )
+        bps_weight = sum(
+            (Decimal(n) for _, n in weighted_bps),
+            Decimal('0'),
+        )
+        mean_bps = bps_total / bps_weight
+        bps_str = (
+            f'+{mean_bps.quantize(Decimal("0.01"))}bp'
+            if mean_bps >= 0
+            else f'{mean_bps.quantize(Decimal("0.01"))}bp'
+        )
+    else:
+        bps_str = 'n/a'
+    line = (
+        f'sweep impact     mean={bps_str}  n={n_samples_total} '
+        f'flagged={n_flagged_total}  uncalibrated={n_uncalibrated_total}'
+    )
+    denom = n_samples_total + n_uncalibrated_total
+    if denom > 0:
+        gap_pct = Decimal(n_uncalibrated_total) * Decimal('100') / Decimal(denom)
+        if gap_pct >= Decimal('10'):
+            line += (
+                f'  WARN: {gap_pct.quantize(Decimal("0.1"))}% calibration gap '
+                f'— widen the pre-window slice or increase bucket_minutes'
+            )
+    if n_samples_total > 0:
+        flagged_pct = (
+            Decimal(n_flagged_total) * Decimal('100') / Decimal(n_samples_total)
+        )
+        if flagged_pct >= Decimal('5'):
+            line += (
+                f'  WARN: {flagged_pct.quantize(Decimal("0.1"))}% of orders '
+                f'flagged as size > threshold of concurrent volume — '
+                f'down-size before live'
+            )
+    print(line)
 
 
 def _print_sweep_maker_summary(
