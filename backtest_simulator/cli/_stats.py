@@ -38,6 +38,7 @@ from backtest_simulator.cli._metrics import (
     pair_metrics,
     pair_trades,
 )
+from backtest_simulator.honesty.cpcv import CpcvPaths
 from backtest_simulator.honesty.deflated_sharpe import (
     DeflatedSharpeResult,
     deflated_sharpe,
@@ -212,6 +213,169 @@ def _safe_spa(
         benchmark_returns=benchmark_series,
         block_size=max(1, min(5, n)),
         n_bootstrap=n_bootstrap, seed=seed,
+    )
+
+
+@dataclass(frozen=True)
+class CpcvPboResult:
+    """Day-aligned CSCV PBO via `CpcvPaths` (slice #17 Task 17 CPCV).
+
+    `pbo` is the proportion of paths where the IS-best decoder
+    underperformed median OOS — López de Prado §11. `purge_days`
+    and `embargo_days` are the day-rounded effective values
+    actually applied to the partitioning (not the raw seconds);
+    if those rounded down to zero, the report shows zero so the
+    operator sees that purge/embargo flags didn't bite.
+    """
+
+    pbo: float
+    n_paths: int
+    n_decoders: int
+    n_clean_days: int
+    purge_days: int
+    embargo_days: int
+    n_paths_skipped: int
+
+
+def cpcv_pbo(
+    *,
+    paths: CpcvPaths,
+    per_decoder_returns: dict[str, list[float]],
+    n_clean_days: int,
+) -> CpcvPboResult | None:
+    """López de Prado CSCV PBO consuming `CpcvPaths` directly.
+
+    For each path:
+      1. Map day_idx → group_idx (`group_size = n_clean_days // n_groups`,
+         last group absorbs the remainder).
+      2. Apply purge (drop training days within `purge_days` of any
+         test-group boundary, both sides) and embargo (drop training
+         days within `embargo_days` AFTER each test block — codex's
+         confirmed direction; embargo guards against label leakage
+         from train rows whose feature window overlaps a just-ended
+         test block).
+      3. Sharpe(IS) and Sharpe(OOS) per decoder.
+      4. Find best-IS decoder; compute its OOS rank.
+      5. logit = log(omega / (1 - omega)) where omega is the relative
+         OOS rank in [0, 1].
+    PBO = fraction of paths where omega > 0.5 (best-IS underperformed
+    median OOS — overfitting evidence).
+
+    Returns None when input is too thin to fit honestly: <2 decoders,
+    <2 days, no paths, or every path fails the post-purge train/test
+    minimum (need >=2 days each side).
+    """
+    n_decoders = len(per_decoder_returns)
+    if n_decoders < 2 or n_clean_days < 2 or len(paths) == 0:
+        return None
+    decoder_ids = list(per_decoder_returns.keys())
+    # Pairwise-identical guard (codex round-3 P1). When all decoder
+    # return series are byte-equal, every path picks the SAME first
+    # decoder via `max` (deterministic tie ordering), then ranks it
+    # first OOS — yielding a fake `pbo=0.000` "no overfitting" signal
+    # on degenerate input. The original `_safe_pbo` had this guard;
+    # the CPCV path-level evaluator regressed it and codex caught it.
+    series = list(per_decoder_returns.values())
+    if all(s == series[0] for s in series[1:]):
+        return None
+    # Derive n_groups from the path partitions so we don't have to
+    # plumb it as a separate arg (CpcvPaths.build already validates).
+    n_groups = max(
+        max(p.train_groups + p.test_groups) for p in paths
+    ) + 1
+    if n_clean_days < n_groups:
+        # Each group needs at least 1 day; otherwise group assignment
+        # collapses and IS/OOS are undefined.
+        return None
+    group_size = n_clean_days // n_groups
+    if group_size < 1:
+        return None
+    first_path = paths.paths()[0]
+    purge_days = math.ceil(first_path.purge_seconds / 86400)
+    embargo_days = math.ceil(first_path.embargo_seconds / 86400)
+
+    logits: list[float] = []
+    n_paths_skipped = 0
+    for path in paths:
+        train_idx = []
+        test_idx = []
+        # Identify each test group's day range so we can apply
+        # purge + embargo around it.
+        test_blocks: list[tuple[int, int]] = []
+        for tg in path.test_groups:
+            start = tg * group_size
+            end = (
+                n_clean_days - 1
+                if tg == n_groups - 1
+                else (tg + 1) * group_size - 1
+            )
+            test_blocks.append((start, end))
+        for day_idx in range(n_clean_days):
+            grp = min(day_idx // group_size, n_groups - 1)
+            if grp in path.test_groups:
+                test_idx.append(day_idx)
+                continue
+            if grp not in path.train_groups:
+                continue
+            in_zone = False
+            for start, end in test_blocks:
+                if start - purge_days <= day_idx < start:
+                    in_zone = True
+                    break
+                if end < day_idx <= end + max(purge_days, embargo_days):
+                    in_zone = True
+                    break
+            if not in_zone:
+                train_idx.append(day_idx)
+
+        if len(train_idx) < 2 or len(test_idx) < 2:
+            n_paths_skipped += 1
+            continue
+
+        is_sharpes = {
+            d: _sharpe([per_decoder_returns[d][i] for i in train_idx])
+            for d in decoder_ids
+        }
+        oos_sharpes = {
+            d: _sharpe([per_decoder_returns[d][i] for i in test_idx])
+            for d in decoder_ids
+        }
+        # Per-path tie skip (codex round-4 P1). Even with non-
+        # identical full series, individual paths can produce IS
+        # Sharpes that tie for best — common when many days are
+        # zero-return (no-trade). `max()` deterministic ordering
+        # would then fabricate a logit from an uninformative
+        # ranking. Same logic for the OOS rank: if multiple
+        # decoders share the chosen decoder's OOS Sharpe value,
+        # the rank is ambiguous and the logit is noise.
+        is_values_sorted = sorted(is_sharpes.values(), reverse=True)
+        if is_values_sorted[0] == is_values_sorted[1]:
+            n_paths_skipped += 1
+            continue
+        best_is = max(is_sharpes, key=lambda d: is_sharpes[d])
+        best_oos_value = oos_sharpes[best_is]
+        n_oos_ties = sum(
+            1 for v in oos_sharpes.values() if v == best_oos_value
+        )
+        if n_oos_ties > 1:
+            n_paths_skipped += 1
+            continue
+        sorted_oos = sorted(
+            decoder_ids, key=lambda d: oos_sharpes[d], reverse=True,
+        )
+        rank = sorted_oos.index(best_is) + 1
+        omega = (rank - 1) / (n_decoders - 1)
+        omega = max(min(omega, 1 - 1e-9), 1e-9)
+        logits.append(math.log(omega / (1 - omega)))
+
+    if not logits:
+        return None
+    pbo = sum(1 for x in logits if x > 0) / len(logits)
+    return CpcvPboResult(
+        pbo=pbo, n_paths=len(logits), n_decoders=n_decoders,
+        n_clean_days=n_clean_days,
+        purge_days=purge_days, embargo_days=embargo_days,
+        n_paths_skipped=n_paths_skipped,
     )
 
 

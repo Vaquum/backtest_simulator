@@ -132,3 +132,42 @@ def test_signals_table_lookup_rejects_negative_embargo() -> None:
             ValueError, match='embargo_seconds must be non-negative',
         ):
             table.lookup(_T0 + timedelta(minutes=5), embargo_seconds=-1)
+
+
+def test_signals_table_assert_window_covers_passes_when_in_range() -> None:
+    """Window inside the table's coverage passes — normal sweep call."""
+    table = _build_signals_table(n_signals=10)
+    # Table covers minute 0 through minute 9 (bar_seconds=60,
+    # label_horizon_bars=2 → max staleness 120s of headroom past
+    # last row).
+    table.assert_window_covers(
+        _T0 + timedelta(minutes=1), _T0 + timedelta(minutes=8),
+    )
+
+
+def test_signals_table_assert_window_covers_rejects_window_before_table() -> None:
+    """Window starting before the table's coverage raises loud.
+
+    Slice #17 Task 16: the operator pointing the sweep at a window
+    the SignalsTable wasn't built for must fail at sweep startup,
+    not silently feed `lookup(t)=None` for the entire run.
+    """
+    from backtest_simulator.exceptions import LookAheadViolation
+    table = _build_signals_table(n_signals=10)
+    with pytest.raises(LookAheadViolation, match='precedes table coverage'):
+        table.assert_window_covers(
+            _T0 - timedelta(hours=1), _T0 + timedelta(minutes=8),
+        )
+
+
+def test_signals_table_assert_window_covers_rejects_window_after_table() -> None:
+    """Window ending past coverage + max-staleness raises loud."""
+    from backtest_simulator.exceptions import LookAheadViolation
+    table = _build_signals_table(n_signals=10)
+    # Last row at minute 9, bar_seconds*label_horizon = 120s.
+    # Coverage end = minute 9 + 2 minutes = minute 11. Querying
+    # minute 12 must raise.
+    with pytest.raises(LookAheadViolation, match='exceeds table coverage'):
+        table.assert_window_covers(
+            _T0 + timedelta(minutes=1), _T0 + timedelta(minutes=12),
+        )

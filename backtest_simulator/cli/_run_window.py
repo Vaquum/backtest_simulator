@@ -23,6 +23,13 @@ from pathlib import Path
 
 from backtest_simulator.cli._pipeline import SYMBOL, WORK_DIR, seed_price_at
 
+# Tick cadence baked into every per-window manifest. Importers
+# (e.g. `_signals_builder.py` via `sweep.py`) pin to this constant
+# so SignalsTable build replays at the SAME boundaries Nexus's
+# PredictLoop fires at runtime — the byte-equivalence promise
+# under "strategy tested, strategy deployed".
+RUN_WINDOW_INTERVAL_SECONDS: int = 3600
+
 
 def _fresh_work_dir(suffix: str) -> Path:
     d = WORK_DIR / suffix
@@ -77,7 +84,7 @@ def run_window_in_process(
         sensor=SensorBinding(
             experiment_dir=experiment_dir,
             permutation_ids=(perm_id,),
-            interval_seconds=3600,
+            interval_seconds=RUN_WINDOW_INTERVAL_SECONDS,
         ),
         strategy_params=StrategyParamsSpec(
             symbol=SYMBOL,

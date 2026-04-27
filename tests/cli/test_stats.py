@@ -212,6 +212,147 @@ def test_fetch_buy_hold_benchmark_two_days() -> None:
     assert math.isclose(bench[1], -0.01, abs_tol=1e-12)
 
 
+def test_cpcv_pbo_runs_on_min_paths() -> None:
+    """CPCV PBO runs on minimal CSCV: 4 groups x 8 days x 2 decoders.
+
+    `CpcvPaths.build(n_groups=4, n_test_groups=2)` produces C(4,2)=6
+    paths. Each path: 4 train days + 4 test days. With 2 decoders
+    + non-tied returns, every path produces a logit.
+    """
+    from backtest_simulator.cli._stats import cpcv_pbo
+    from backtest_simulator.honesty.cpcv import CpcvPaths
+    paths = CpcvPaths.build(
+        n_groups=4, n_test_groups=2,
+        purge_seconds=0, embargo_seconds=0,
+    )
+    returns = {
+        'd1': [0.01, 0.02, 0.005, 0.015, -0.01, 0.03, 0.012, 0.018],
+        'd2': [-0.01, 0.005, 0.0, 0.01, 0.02, -0.005, 0.008, -0.002],
+    }
+    result = cpcv_pbo(
+        paths=paths, per_decoder_returns=returns, n_clean_days=8,
+    )
+    assert result is not None
+    assert result.n_paths == 6
+    assert result.n_decoders == 2
+    assert 0.0 <= result.pbo <= 1.0
+    assert result.purge_days == 0
+    assert result.embargo_days == 0
+
+
+def test_cpcv_pbo_skips_when_insufficient_decoders() -> None:
+    """1 decoder can't produce a CPCV PBO -- None instead of fake."""
+    from backtest_simulator.cli._stats import cpcv_pbo
+    from backtest_simulator.honesty.cpcv import CpcvPaths
+    paths = CpcvPaths.build(
+        n_groups=4, n_test_groups=2,
+        purge_seconds=0, embargo_seconds=0,
+    )
+    result = cpcv_pbo(
+        paths=paths,
+        per_decoder_returns={
+            'd1': [0.01, 0.02, 0.005, 0.015, -0.01, 0.03, 0.012, 0.018],
+        },
+        n_clean_days=8,
+    )
+    assert result is None
+
+
+def test_cpcv_pbo_skips_on_pairwise_identical_returns() -> None:
+    """All-equal decoder returns -> None (codex round 3 P1).
+
+    Without the pairwise-identical guard, every path picks the same
+    first decoder via `max` (deterministic tie ordering) and ranks it
+    first OOS too, producing a fake `pbo=0.000` "no overfitting"
+    signal on degenerate input. The guard returns None so the sweep
+    skips with reason instead of misleading the operator.
+
+    Mutation proof: removing the pairwise-identical check means
+    `result is not None` and `result.pbo == 0.0` -- this assert flips.
+    """
+    from backtest_simulator.cli._stats import cpcv_pbo
+    from backtest_simulator.honesty.cpcv import CpcvPaths
+    paths = CpcvPaths.build(
+        n_groups=4, n_test_groups=2,
+        purge_seconds=0, embargo_seconds=0,
+    )
+    returns = {
+        'd1': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        'd2': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    }
+    result = cpcv_pbo(
+        paths=paths, per_decoder_returns=returns, n_clean_days=8,
+    )
+    assert result is None
+
+
+def test_cpcv_pbo_skips_per_path_when_is_sharpes_tie() -> None:
+    """Per-path tie skip (codex round 4 P1).
+
+    Even when full series differ, individual paths can produce IS
+    Sharpes that tie for best when subsetting yields zero-return
+    days for all decoders. With this fixture, days 0-3 are zero
+    for both decoders; the path that picks days 4-7 as test
+    leaves days 0-3 as IS — IS Sharpes are 0 for both, tied. The
+    skip surfaces in `n_paths_skipped`.
+
+    Mutation proof: removing the per-path top-2-tie check makes
+    cpcv_pbo run on those tied paths and `n_paths_skipped == 0`,
+    flipping the assert below.
+    """
+    from backtest_simulator.cli._stats import cpcv_pbo
+    from backtest_simulator.honesty.cpcv import CpcvPaths
+    paths = CpcvPaths.build(
+        n_groups=4, n_test_groups=2,
+        purge_seconds=0, embargo_seconds=0,
+    )
+    # Days 0-3 zero for both; days 4-7 differ. C(4,2)=6 paths;
+    # paths whose test_groups land entirely in days 4-7 (group 2+3)
+    # leave the all-zero IS — top-2 IS tie, skip.
+    returns = {
+        'd1': [0.0, 0.0, 0.0, 0.0, 0.01, 0.02, 0.03, 0.04],
+        'd2': [0.0, 0.0, 0.0, 0.0, -0.01, -0.02, -0.03, -0.04],
+    }
+    result = cpcv_pbo(
+        paths=paths, per_decoder_returns=returns, n_clean_days=8,
+    )
+    assert result is not None
+    # At least one path's IS lies entirely in the all-zero region;
+    # the per-path tie check skips it. Without the check,
+    # n_paths_skipped is 0 and result.n_paths is 6.
+    assert result.n_paths_skipped > 0
+    assert result.n_paths < 6
+
+
+def test_cpcv_pbo_purge_drops_train_days_around_test_boundaries() -> None:
+    """`purge_seconds` larger than group_size shrinks every path's train pool.
+
+    Day = 86400s; purge_seconds=172800 -> purge_days=2. With
+    n_groups=4 + group_size=2 + purge_days=2, the purge zone around
+    every test block consumes adjacent train days; many paths lose
+    all train days and skip.
+
+    Mutation proof: removing the purge math in cpcv_pbo means
+    n_paths_skipped stays 0 (every path keeps its raw train days).
+    """
+    from backtest_simulator.cli._stats import cpcv_pbo
+    from backtest_simulator.honesty.cpcv import CpcvPaths
+    paths = CpcvPaths.build(
+        n_groups=4, n_test_groups=2,
+        purge_seconds=172800, embargo_seconds=0,
+    )
+    returns = {
+        'd1': [0.01, 0.02, 0.005, 0.015, -0.01, 0.03, 0.012, 0.018],
+        'd2': [-0.01, 0.005, 0.0, 0.01, 0.02, -0.005, 0.008, -0.002],
+    }
+    result = cpcv_pbo(
+        paths=paths, per_decoder_returns=returns, n_clean_days=8,
+    )
+    assert result is None or result.n_paths_skipped > 0
+    if result is not None:
+        assert result.purge_days == 2
+
+
 def test_compute_sweep_stats_spa_consistent_with_synthetic_signal() -> None:
     """SPA's statistic is positive when a candidate beats the benchmark.
 

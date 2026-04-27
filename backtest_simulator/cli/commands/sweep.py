@@ -13,6 +13,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from datetime import time as dtime
 from decimal import Decimal
+from pathlib import Path
 from typing import Final
 
 from backtest_simulator.cli._metrics import Trade, print_run
@@ -22,16 +23,58 @@ from backtest_simulator.cli._pipeline import (
     preflight_tunnel,
     seed_price_at,
 )
-from backtest_simulator.cli._run_window import run_window_in_subprocess
+from backtest_simulator.cli._run_window import (
+    RUN_WINDOW_INTERVAL_SECONDS,
+    run_window_in_subprocess,
+)
+from backtest_simulator.cli._signals_builder import (
+    build_signals_table_for_decoder,
+)
 from backtest_simulator.cli._stats import (
     compute_sweep_stats,
+    cpcv_pbo,
     daily_return_for_run,
     fetch_buy_hold_benchmark,
 )
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
+from backtest_simulator.honesty.cpcv import CpcvPaths
+from backtest_simulator.launcher.poller import DEFAULT_START_DATE_LIMIT
+from backtest_simulator.sensors.precompute import SignalsTable
 
 _SECOND_WEEK_APRIL_START: Final = datetime(2026, 4, 6, tzinfo=UTC).date()
 _SECOND_WEEK_APRIL_END: Final = datetime(2026, 4, 12, tzinfo=UTC).date()
+
+_EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _runtime_tick_timestamps(
+    *,
+    days: list[datetime], hours_start: dtime, hours_end: dtime,
+    interval_seconds: int,
+) -> list[datetime]:
+    """Mirror `launcher/clock.py`'s timer firing schedule per-day.
+
+    For each `day` in `days`, find every epoch-aligned
+    `interval_seconds` boundary that falls in
+    `(window_start, window_end]`. The "next boundary AFTER
+    window_start" semantics match `clock.py:99-104` —
+    `next_boundary = (elapsed_whole // interval_seconds + 1) *
+    interval_seconds`. When `window_start` itself sits exactly on
+    a boundary, the FIRST tick is one interval later (matching
+    runtime: a strategy started at exactly 08:00:00 with
+    interval_seconds=3600 fires its first signal at 09:00:00).
+    """
+    ticks: list[datetime] = []
+    for day in days:
+        window_start = datetime.combine(day.date(), hours_start, tzinfo=UTC)
+        window_end = datetime.combine(day.date(), hours_end, tzinfo=UTC)
+        elapsed = int((window_start - _EPOCH).total_seconds())
+        next_boundary = (elapsed // interval_seconds + 1) * interval_seconds
+        t = _EPOCH + timedelta(seconds=next_boundary)
+        while t <= window_end:
+            ticks.append(t)
+            t += timedelta(seconds=interval_seconds)
+    return ticks
 
 
 def register(sub: argparse._SubParsersAction) -> None:
@@ -77,6 +120,35 @@ def register(sub: argparse._SubParsersAction) -> None:
                    ))
     p.add_argument('--atr-window-seconds', type=int, default=900,
                    help='ATR window in seconds. Default: 900s.')
+    # Slice #17 Task 17 (CPCV portion). Operator-controllable
+    # CSCV partitioning. Defaults C(4,2)=6 paths so the math runs
+    # on every default sweep that has enough clean days; otherwise
+    # the line skips with reason. purge/embargo default 0 so the
+    # operator opts in to label-leakage protection — non-zero
+    # values drop train days adjacent to test-group boundaries.
+    p.add_argument('--cpcv-n-groups', type=int, default=4,
+                   help=(
+                       'CPCV (CSCV) total group count for day-aligned '
+                       'partitioning. C(n_groups, n_test_groups) paths '
+                       'are evaluated. Default: 4.'
+                   ))
+    p.add_argument('--cpcv-n-test-groups', type=int, default=2,
+                   help=(
+                       'CPCV test-group count per path. Default: 2 '
+                       '(C(4,2)=6 paths).'
+                   ))
+    p.add_argument('--cpcv-purge-seconds', type=int, default=0,
+                   help=(
+                       'CPCV purge window in seconds — drop train '
+                       'days within this many seconds of any test-'
+                       'group boundary (both sides). Default: 0.'
+                   ))
+    p.add_argument('--cpcv-embargo-seconds', type=int, default=0,
+                   help=(
+                       'CPCV embargo in seconds — drop train days '
+                       'within this many seconds AFTER each test '
+                       'block (Lopez de Prado direction). Default: 0.'
+                   ))
     add_verbosity_arg(p)
     p.set_defaults(func=_run)
 
@@ -122,6 +194,24 @@ def _run(args: argparse.Namespace) -> int:
     print(
         f'\nbts sweep   {len(picks)} decoder(s) x {len(days)} day(s) = '
         f'{total_runs} run(s)   hours {hours_label}\n',
+    )
+    # Slice #17 Task 16: build SignalsTable per picked decoder via
+    # per-tick runtime replay (Nexus's exact recipe). Tick instants
+    # match `launcher/clock.py`'s epoch-aligned next-boundary timer
+    # firing schedule (codex round-4 P0); iterating klines instead
+    # of ticks over-emits when interval_seconds < kline_size, and
+    # always over-emits across non-trading hours.
+    replay_start = datetime.combine(days[0].date(), hours_start, tzinfo=UTC)
+    replay_end = datetime.combine(days[-1].date(), hours_end, tzinfo=UTC)
+    tick_timestamps = _runtime_tick_timestamps(
+        days=days, hours_start=hours_start, hours_end=hours_end,
+        interval_seconds=RUN_WINDOW_INTERVAL_SECONDS,
+    )
+    _print_sweep_signals_summary(
+        _build_and_save_signals_tables(
+            picks, tick_timestamps=tick_timestamps,
+            replay_start=replay_start, replay_end=replay_end,
+        ),
     )
     t_total = time.perf_counter()
     # Accumulators for the sweep-level slippage summary printed
@@ -381,7 +471,163 @@ def _run(args: argparse.Namespace) -> int:
         n_search_trials=n_search_trials,
         n_runs_with_trailing_inventory=n_runs_with_trailing_inventory,
     )
+    _print_cpcv_pbo_summary(
+        per_decoder_returns,
+        n_clean_days=len(clean_days),
+        n_groups=int(args.cpcv_n_groups),
+        n_test_groups=int(args.cpcv_n_test_groups),
+        purge_seconds=int(args.cpcv_purge_seconds),
+        embargo_seconds=int(args.cpcv_embargo_seconds),
+    )
     return 0
+
+
+def _build_and_save_signals_tables(
+    picks: list[tuple[int, Decimal, Path, int]],
+    *,
+    tick_timestamps: list[datetime],
+    replay_start: datetime, replay_end: datetime,
+) -> dict[str, SignalsTable]:
+    """Build + save SignalsTable per picked decoder.
+
+    Slice #17 Task 16. Walks each picked decoder's experiment dir
+    via Limen `Trainer`, retrains the Pass-2 (1,0,0) Sensor (the
+    runtime predictor), fetches klines via the same source the
+    launcher's poller uses (`HistoricalData.get_spot_klines`), and
+    runs per-bar replay over the sweep's replay window. The
+    SignalsTable saved next to each experiment_dir is THEN gated
+    by `assert_split_alignment` (split label == manifest's split)
+    and `assert_window_covers` (the table actually covers the
+    replay window) — both load-bearing.
+
+    Trainer init is amortised per `exp_dir` so the ~20 s ClickHouse
+    fetch only happens once per experiment, not per decoder.
+    """
+    from limen import HistoricalData, Trainer
+    by_exp_dir: dict[Path, list[tuple[int, int]]] = {}
+    for perm_id, _, exp_dir, display_id in picks:
+        by_exp_dir.setdefault(exp_dir, []).append((perm_id, display_id))
+    historical = HistoricalData()
+    tables: dict[str, SignalsTable] = {}
+    for exp_dir, decoders in by_exp_dir.items():
+        trainer = Trainer(exp_dir)
+        manifest = trainer._manifest
+        cfg = manifest.data_source_config
+        if cfg is None or 'kline_size' not in cfg.params:
+            msg = (
+                f'sweep signals: manifest at {exp_dir} has no '
+                f'kline_size in data_source_config; cannot fetch '
+                f'klines for SignalsTable build.'
+            )
+            raise ValueError(msg)
+        kline_size = int(cfg.params['kline_size'])
+        # Same fetch the launcher's BacktestMarketDataPoller uses,
+        # so the precomputed predictions match runtime byte-for-byte
+        # (codex round-3 P0). The launcher passes no `start_date_limit`
+        # to the poller, so the poller's DEFAULT applies — NOT the
+        # manifest's start_date_limit.
+        klines = historical.get_spot_klines(
+            kline_size=kline_size,
+            start_date_limit=DEFAULT_START_DATE_LIMIT,
+        )
+        sensors = trainer.train([pid for pid, _ in decoders])
+        for (perm_id, display_id), sensor in zip(decoders, sensors, strict=True):
+            round_params = dict(
+                trainer._round_data[perm_id]['round_params'],
+            )
+            decoder_id = str(display_id)
+            table = build_signals_table_for_decoder(
+                manifest=manifest, sensor=sensor, klines=klines,
+                tick_timestamps=tick_timestamps,
+                round_params=round_params, decoder_id=decoder_id,
+            )
+            # Load-bearing gates — wired so neither stays decorative.
+            table.assert_split_alignment(manifest.split_config)
+            table.assert_window_covers(replay_start, replay_end)
+            table.save(exp_dir / 'signals_tables')
+            tables[decoder_id] = table
+    return tables
+
+
+def _print_sweep_signals_summary(
+    tables: dict[str, SignalsTable],
+) -> None:
+    """One-line confirmation that SignalsTables built + saved + gated."""
+    if not tables:
+        print('sweep signals    skipped: no SignalsTables built')
+        return
+    bar_counts = [
+        t._frame.height
+        for t in tables.values()
+    ]
+    avg_bars = sum(bar_counts) // max(1, len(bar_counts))
+    print(
+        f'sweep signals    n_decoders={len(tables)}  '
+        f'avg_bars_per_decoder={avg_bars}  '
+        f'min_bars={min(bar_counts)}  max_bars={max(bar_counts)}',
+    )
+
+
+def _print_cpcv_pbo_summary(
+    per_decoder_returns: dict[str, list[float]],
+    *,
+    n_clean_days: int,
+    n_groups: int,
+    n_test_groups: int,
+    purge_seconds: int,
+    embargo_seconds: int,
+) -> None:
+    """Slice #17 Task 17 — day-aligned CSCV PBO via CpcvPaths.
+
+    Lopez de Prado §11 directly: each path picks `n_test_groups`
+    of `n_groups` as OOS, the rest as IS (with purge/embargo
+    around test-group boundaries). PBO = fraction of paths where
+    the IS-best decoder underperformed median OOS.
+
+    Skips with reason when the input shape is too thin for
+    CpcvPaths to build or when every path's post-purge train
+    pool is empty.
+    """
+    if n_clean_days < n_groups:
+        print(
+            f'sweep cpcv_pbo   skipped: need >= n_groups '
+            f'({n_groups}) clean days, have {n_clean_days}',
+        )
+        return
+    if not per_decoder_returns or len(per_decoder_returns) < 2:
+        print(
+            f'sweep cpcv_pbo   skipped: need >=2 decoders, have '
+            f'{len(per_decoder_returns)}',
+        )
+        return
+    try:
+        paths = CpcvPaths.build(
+            n_groups=n_groups, n_test_groups=n_test_groups,
+            purge_seconds=purge_seconds, embargo_seconds=embargo_seconds,
+        )
+    except ValueError as exc:
+        print(f'sweep cpcv_pbo   skipped: {exc}')
+        return
+    result = cpcv_pbo(
+        paths=paths, per_decoder_returns=per_decoder_returns,
+        n_clean_days=n_clean_days,
+    )
+    if result is None:
+        print(
+            f'sweep cpcv_pbo   skipped: every path lost its train '
+            f'pool to purge/embargo or returns are degenerate '
+            f'(n_groups={n_groups} test_groups={n_test_groups} '
+            f'purge_s={purge_seconds} embargo_s={embargo_seconds})',
+        )
+        return
+    print(
+        f'sweep cpcv_pbo   prob_overfit={result.pbo:.3f}  '
+        f'n_paths={result.n_paths}  n_groups={n_groups}  '
+        f'n_test_groups={n_test_groups}  '
+        f'purge_days={result.purge_days}  '
+        f'embargo_days={result.embargo_days}  '
+        f'skipped_paths={result.n_paths_skipped}',
+    )
 
 
 def _print_sweep_stats_summary(
@@ -439,18 +685,13 @@ def _print_sweep_stats_summary(
             f'p_value={stats.spa.p_value:.3f}  '
             f'n_candidates={stats.spa.n_candidates}',
         )
-    if stats.pbo is None:
-        print(
-            f'sweep pbo        skipped: needs >=2 decoders + >=4 days + '
-            f'non-tied returns (have {stats.n_decoders} dec x '
-            f'{stats.n_observations} obs)',
-        )
-    else:
-        print(
-            f'sweep pbo        prob_overfit={stats.pbo.pbo:.3f}  '
-            f'n_splits={stats.pbo.n_splits}  '
-            f'n_strategies={stats.pbo.n_strategies}',
-        )
+    # Legacy half/half `sweep pbo` line removed (codex round 5 P1):
+    # the underlying primitive (`probability_of_backtest_overfitting`)
+    # picks the IS winner via deterministic `max()` on tied Sharpes,
+    # which fabricates `pbo=0.000` on zero-return splits even when
+    # the full per-decoder series differ. `sweep cpcv_pbo` is the
+    # honest replacement (printed below) — it skips per-path on IS
+    # and OOS rank ties and consumes `CpcvPaths` directly.
 
 
 def _print_sweep_atr_summary(

@@ -64,10 +64,19 @@ class SignalsTable:
       - the decoder's recorded split_config does not byte-equal the
         split_config the caller says the sweep is using (per-decoder
         split-alignment gate, SPEC §9.3.1).
+
+    `bar_seconds` and `label_horizon_bars` are persisted because the
+    lookup's stale-row guard (slice #17 Task 16, codex round 1 P0)
+    needs them: if the latest causal row is older than
+    `bar_seconds * label_horizon_bars`, the lookup returns None
+    rather than silently feeding the strategy a row whose label
+    horizon expired before `t`.
     """
 
     decoder_id: str
     split_config: tuple[int, int, int]
+    bar_seconds: int
+    label_horizon_bars: int
     # `_frame` holds future label rows; access through `lookup(t)` only.
     # Reaching past the underscore (`signals._frame.filter(...)`) is a
     # documented bypass — `tests/honesty/test_prescient_strategy.py`
@@ -104,7 +113,12 @@ class SignalsTable:
             schema={'timestamp': utc, 'prob': pl.Float64, 'pred': pl.Int64, 'label_t0': utc, 'label_t1': utc},
             orient='row',
         )
-        return cls(decoder_id=decoder_id, split_config=split_config, _frame=frame)
+        return cls(
+            decoder_id=decoder_id, split_config=split_config,
+            bar_seconds=int(predictions.bar_seconds),
+            label_horizon_bars=int(predictions.label_horizon_bars),
+            _frame=frame,
+        )
 
     def assert_split_alignment(self, eval_split: tuple[int, int, int]) -> None:
         if tuple(eval_split) != tuple(self.split_config):
@@ -180,7 +194,8 @@ class SignalsTable:
                 f'got {embargo_seconds}.'
             )
             raise ValueError(msg)
-        del path_id  # reserved for Task 17 (CPCV per-path filtering)
+        del path_id  # CPCV path filtering lives at sweep-aggregation
+        # level (operator-confirmed), not at per-bar lookup.
         now = frozen_now()
         if t > now:
             msg = (
@@ -201,11 +216,68 @@ class SignalsTable:
         if sliced.is_empty():
             return None
         row = sliced.row(0, named=True)
+        # Multi-year staleness drift (codex round 1 P0 — a 2020 table
+        # silently feeding a 2026 sweep) is caught at sweep startup
+        # by `assert_window_covers`, not here. A per-row staleness
+        # guard at lookup conflicts with `purge_seconds`, which
+        # intentionally returns older-than-cutoff rows; the right
+        # layer is the up-front window check.
         return SignalRow(
             timestamp=row['timestamp'], prob=float(row['prob']),
             pred=int(row['pred']),
             label_t0=row['label_t0'], label_t1=row['label_t1'],
         )
+
+    def assert_window_covers(
+        self, window_start: datetime, window_end: datetime,
+    ) -> None:
+        """Fail loud if the requested replay window falls outside coverage.
+
+        Catches the operator pointing the sweep at a window the
+        SignalsTable wasn't built for — e.g. table covers
+        2026-04-08 → 2026-04-12 but sweep replays 2026-04-15
+        → 2026-04-19. Without this check, every `lookup(t)` would
+        silently return None and the strategy would be flat for
+        the entire sweep — a no-op dressed up as honest skip.
+        """
+        if self._frame.is_empty():
+            msg = (
+                f'SignalsTable.assert_window_covers: table for '
+                f'{self.decoder_id} is empty.'
+            )
+            raise LookAheadViolation(msg)
+        first_ts = self._frame['timestamp'].min()
+        last_ts = self._frame['timestamp'].max()
+        from datetime import timedelta
+        max_staleness = timedelta(
+            seconds=self.bar_seconds * self.label_horizon_bars,
+        )
+        # Allow up to one bar of pre-window slack: runtime's
+        # PredictLoop timer fires at "next boundary AFTER
+        # window_start", so the first SignalsTable row sits one
+        # interval AFTER the operator's window_start. The check
+        # only fires when the gap is larger than a single bar —
+        # that's the multi-year-drift case codex round-1 P0
+        # flagged.
+        one_bar = timedelta(seconds=self.bar_seconds)
+        if window_start + one_bar < first_ts:
+            msg = (
+                f'SignalsTable.assert_window_covers: window_start='
+                f'{window_start} precedes table coverage start='
+                f'{first_ts} for {self.decoder_id} by more than one '
+                f'bar ({self.bar_seconds}s). Rebuild the table with '
+                f'klines that cover the replay window.'
+            )
+            raise LookAheadViolation(msg)
+        if window_end > last_ts + max_staleness:
+            msg = (
+                f'SignalsTable.assert_window_covers: window_end='
+                f'{window_end} exceeds table coverage end='
+                f'{last_ts} + max_staleness={max_staleness} for '
+                f'{self.decoder_id}. Rebuild with klines that cover '
+                f'the full replay window.'
+            )
+            raise LookAheadViolation(msg)
 
     def save(self, directory: Path) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
@@ -215,6 +287,8 @@ class SignalsTable:
         metadata_path.write_text(json.dumps({
             'decoder_id': self.decoder_id,
             'split_config': list(self.split_config),
+            'bar_seconds': int(self.bar_seconds),
+            'label_horizon_bars': int(self.label_horizon_bars),
         }), encoding='utf-8')
         return parquet_path
 
@@ -242,6 +316,14 @@ class SignalsTable:
                 f'in {metadata_path}, got {len(split_config_typed)} elements'
             )
             raise ValueError(msg)
+        if 'bar_seconds' not in metadata or 'label_horizon_bars' not in metadata:
+            msg = (
+                f'SignalsTable.load: metadata at {metadata_path} is '
+                f'missing bar_seconds or label_horizon_bars. The '
+                f'stale-row guard cannot run without them. Rebuild '
+                f'the table with the current builder.'
+            )
+            raise ValueError(msg)
         return cls(
             decoder_id=decoder_id,
             split_config=(
@@ -249,5 +331,7 @@ class SignalsTable:
                 _to_int(split_config_typed[1]),
                 _to_int(split_config_typed[2]),
             ),
+            bar_seconds=_to_int(metadata['bar_seconds']),
+            label_horizon_bars=_to_int(metadata['label_horizon_bars']),
             _frame=frame,
         )
