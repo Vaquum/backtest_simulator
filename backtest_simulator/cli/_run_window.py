@@ -41,6 +41,8 @@ def run_window_in_process(
     *,
     maker_preference: bool = False,
     strict_impact: bool = False,
+    atr_k: str = '0.5',
+    atr_window_seconds: int = 900,
 ) -> dict[str, object]:
     """In-process single-window run — picklable result for cross-process use."""
     from praxis.launcher import InstanceConfig
@@ -132,13 +134,14 @@ def run_window_in_process(
         strict_impact_policy=strict_impact,
     )
     # Slice #17 Task 29 — ATR sanity gate, R-denominator floor.
-    # 900s window matches classic 14-period ATR at 1-min buckets.
-    # k=0.5 is the gate's existing test convention: stop must be
-    # ≥ half a local ATR. The strategy template's default
-    # stop_bps=50 on $70k BTC ≈ $350 distance, well above the
-    # floor; the gate fires only on deliberately tight stops
-    # (1-bp gameability vector).
-    atr_gate, atr_provider = _build_atr_gate_and_provider(feed)
+    # Defaults: 900s window (14-period ATR convention) + k=0.5
+    # (stop must be ≥ half a local ATR). The strategy template's
+    # default stop_bps=50 on $70k BTC ≈ $350 distance, well above
+    # floor=0.5*typical-1-min-BTC-ATR; gate fires only on
+    # gameably tight stops. `--atr-k 0` disables.
+    atr_gate, atr_provider = _build_atr_gate_and_provider(
+        feed, k=Decimal(atr_k), window_seconds=atr_window_seconds,
+    )
     tc = TradingConfig(
         epoch_id=1, venue_rest_url='http://sim', venue_ws_url='ws://sim',
         account_credentials={'bts-sweep': ('k', 's')}, shutdown_timeout=5.0,
@@ -268,15 +271,16 @@ def run_window_in_process(
 
 
 def _build_atr_gate_and_provider(
-    feed: object,
+    feed: object, *, k: Decimal, window_seconds: int,
 ) -> tuple[object, object]:
     """Construct the ATR sanity gate + per-submit provider.
 
-    Provider closes over `feed`, fetches `[t - 900s, t)` of
-    strict-causal pre-decision tape for the symbol, and calls
-    `compute_atr_from_tape(period_seconds=60)`. The 900s/60s
-    pair gives 15 buckets of 1-minute ranges — classic
-    14-period ATR shape. Slice #17 Task 29.
+    Provider closes over `feed`, fetches `[t - window_seconds,
+    t)` of strict-causal pre-decision tape, and calls
+    `compute_atr_from_tape(period_seconds=60)`. With the
+    defaults (window=900s, period=60s) the result is 15 buckets
+    of 1-minute ranges — classic 14-period ATR shape. Slice #17
+    Task 29.
     """
     import polars as pl
 
@@ -284,12 +288,12 @@ def _build_atr_gate_and_provider(
         AtrSanityGate,
         compute_atr_from_tape,
     )
-    gate = AtrSanityGate(atr_window_seconds=900, k=Decimal('0.5'))
+    gate = AtrSanityGate(atr_window_seconds=window_seconds, k=k)
 
     def atr_provider(symbol: str, t: datetime) -> Decimal | None:
         from datetime import timedelta
         raw = feed._get_trades_for_venue(
-            symbol, t - timedelta(seconds=900), t,
+            symbol, t - timedelta(seconds=window_seconds), t,
             venue_lookahead_seconds=0,
         )
         pre = raw.filter(pl.col('time') < t)
@@ -415,6 +419,8 @@ def run_window_in_subprocess(
     *,
     maker_preference: bool = False,
     strict_impact: bool = False,
+    atr_k: str = '0.5',
+    atr_window_seconds: int = 900,
 ) -> dict[str, object]:
     """Run one window in a fresh Python interpreter for state isolation."""
     payload = json.dumps({
@@ -425,6 +431,8 @@ def run_window_in_subprocess(
         'experiment_dir': str(experiment_dir),
         'maker_preference': bool(maker_preference),
         'strict_impact': bool(strict_impact),
+        'atr_k': str(atr_k),
+        'atr_window_seconds': int(atr_window_seconds),
     })
     proc = subprocess.run(
         [sys.executable, '-m', 'backtest_simulator.cli._run_window'],
@@ -456,6 +464,8 @@ def _child_main() -> int:
         Path(payload['experiment_dir']),
         maker_preference=bool(payload.get('maker_preference', False)),
         strict_impact=bool(payload.get('strict_impact', False)),
+        atr_k=str(payload.get('atr_k', '0.5')),
+        atr_window_seconds=int(payload.get('atr_window_seconds', 900)),
     )
     print(json.dumps(result), flush=True)
     return 0

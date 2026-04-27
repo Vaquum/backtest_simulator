@@ -62,6 +62,15 @@ def register(sub: argparse._SubParsersAction) -> None:
                        'Default: record telemetry only (observability '
                        'mode).'
                    ))
+    # Slice #17 Task 29 — ATR R-denominator gameability gate knobs.
+    p.add_argument('--atr-k', type=str, default='0.5',
+                   help=(
+                       'ATR-floor multiplier — stop must be >= '
+                       'k * ATR(window) from entry. 0 disables. '
+                       'Default: 0.5.'
+                   ))
+    p.add_argument('--atr-window-seconds', type=int, default=900,
+                   help='ATR window in seconds. Default: 900s.')
     add_verbosity_arg(p)
     p.set_defaults(func=_run)
 
@@ -159,6 +168,8 @@ def _run(args: argparse.Namespace) -> int:
                     perm_id, kelly, window_start, window_end, exp_dir,
                     maker_preference=bool(getattr(args, 'maker', False)),
                     strict_impact=bool(getattr(args, 'strict_impact', False)),
+                    atr_k=str(getattr(args, 'atr_k', '0.5')),
+                    atr_window_seconds=int(getattr(args, 'atr_window_seconds', 900)),
                 )
             except Exception as exc:  # noqa: BLE001 - surface per-run errors
                 dt_ms = int((time.perf_counter() - t0) * 1000)

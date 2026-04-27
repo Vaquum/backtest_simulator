@@ -7,7 +7,7 @@ import logging
 import uuid
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from enum import Enum
 from types import SimpleNamespace
 from typing import cast
@@ -674,16 +674,24 @@ def _check_atr_sanity(
     """
     if gate is None or atr_provider is None:
         return None
+    # `k=0` is the standalone gate's "disabled" knob. Honor it
+    # BEFORE calling `atr_provider` so a disabled gate never
+    # rejects on ATR_UNCALIBRATED for an empty pre-decision
+    # tape. Symmetric to `AtrSanityGate.evaluate`'s own k=0
+    # short-circuit. Codex round 4 P1 caught this.
+    if gate.k == Decimal('0'):
+        return None
     if action.action_type != ActionType.ENTER or action.direction != OrderSide.BUY:
         return None
     params = action.execution_params
     stop_raw = params.get('stop_price') if isinstance(params, Mapping) else None
     if stop_raw is None or str(stop_raw).strip() in ('', 'None'):
         return None
-    try:
-        stop_price = Decimal(str(stop_raw))
-    except InvalidOperation:
-        return None
+    # Decimal coercion fails loud on malformed stop_price strings.
+    # `_check_declared_stop` already validates non-blank; a string
+    # that parses-to-blank but is otherwise non-Decimal is a
+    # strategy template bug, not something to silently bypass.
+    stop_price = Decimal(str(stop_raw))
     entry_price = _resolve_atr_entry_price(action, touch_provider)
     if entry_price is None:
         return None
@@ -729,10 +737,12 @@ def _resolve_atr_entry_price(
     if action.order_type is not None and action.order_type.name == 'LIMIT' and params is not None:
         limit_raw = params.get('price')
         if limit_raw is not None and str(limit_raw).strip() not in ('', 'None'):
-            try:
-                return Decimal(str(limit_raw))
-            except InvalidOperation:
-                pass
+            # Decimal coercion fails loud on malformed LIMIT price.
+            # `execution_params['price']` is set by
+            # `_maybe_refresh_limit_to_touch`'s own Decimal-arithmetic
+            # write or by the strategy template; either way a
+            # non-Decimal string is a template bug.
+            return Decimal(str(limit_raw))
     if touch_provider is not None and params is not None:
         symbol = params.get('symbol')
         if isinstance(symbol, str):

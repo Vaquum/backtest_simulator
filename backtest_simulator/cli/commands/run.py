@@ -74,6 +74,18 @@ def register(sub: argparse._SubParsersAction) -> None:
                        'Default: record telemetry only (observability '
                        'mode).'
                    ))
+    # Slice #17 Task 29 — ATR R-denominator gameability gate knobs.
+    p.add_argument('--atr-k', type=str, default='0.5',
+                   help=(
+                       'ATR-floor multiplier — stop must be >= '
+                       'k * ATR(window) from entry. 0 disables the '
+                       'gate. Default: 0.5 (half a local ATR).'
+                   ))
+    p.add_argument('--atr-window-seconds', type=int, default=900,
+                   help=(
+                       'ATR window in seconds (mean of per-1-min '
+                       'ranges). Default: 900s (14-period ATR).'
+                   ))
     add_verbosity_arg(p)
     p.set_defaults(func=_run)
 
@@ -93,6 +105,8 @@ def _run(args: argparse.Namespace) -> int:
         perm_id, kelly, window_start, window_end, exp_dir,
         maker_preference=bool(getattr(args, 'maker', False)),
         strict_impact=bool(getattr(args, 'strict_impact', False)),
+        atr_k=str(getattr(args, 'atr_k', '0.5')),
+        atr_window_seconds=int(getattr(args, 'atr_window_seconds', 900)),
     )
     trades_raw = result['trades']
     stops_raw = result['declared_stops']

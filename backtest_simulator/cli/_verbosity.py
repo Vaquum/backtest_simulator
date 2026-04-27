@@ -57,18 +57,15 @@ def _silence_tqdm_and_structlog() -> None:
 
     Both bypass stdlib logging — tqdm writes directly to stderr and
     structlog has its own processor chain — so configuring `logging`
-    alone leaves them noisy. Importing under guard so the CLI works
-    in environments that don't have tqdm / structlog installed.
+    alone leaves them noisy. Both are guaranteed transitive deps
+    (`tqdm` via vaquum_limen / binancial, `structlog` via
+    vaquum-nexus / vaquum-praxis), so direct imports are honest
+    here — if either is absent, the bts venv is misconfigured and
+    we want a loud ImportError, not a silent no-op.
     """
-    try:
-        import tqdm as _tqdm
-        _tqdm.tqdm = lambda iterable=None, *a, **kw: iterable if iterable is not None else iter(())
-    except ImportError:
-        pass
-    try:
-        import structlog
-        structlog.configure(
-            wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR),
-        )
-    except ImportError:
-        pass
+    import tqdm as _tqdm
+    import structlog
+    _tqdm.tqdm = lambda iterable=None, *_a, **_kw: iterable if iterable is not None else iter(())
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR),
+    )

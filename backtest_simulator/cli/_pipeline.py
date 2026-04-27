@@ -147,8 +147,7 @@ def preflight_tunnel() -> None:
     # reachable through it, the socket connect raises here — well
     # before clickhouse_connect's init can confuse the diagnosis.
     try:
-        with socket.create_connection((host, port), timeout=2.0):
-            pass
+        sock = socket.create_connection((host, port), timeout=2.0)
     except OSError as exc:
         msg = (
             f'ClickHouse tunnel unreachable at {host}:{port} ({exc!r}). '
@@ -156,6 +155,7 @@ def preflight_tunnel() -> None:
             f'ssh -fN -L {port}:127.0.0.1:8123 root@<clickhouse-host>'
         )
         raise RuntimeError(msg) from exc
+    sock.close()
 
     # Auth/query-class: get_client() may issue server queries during
     # init (autoconnect common-settings probe), and the probe query
@@ -237,21 +237,21 @@ def row_params(row: dict[str, object]) -> dict[str, object]:
     for k in _PARAM_COLS:
         v = row.get(k)
         if isinstance(v, str):
-            s = v.strip()
-            try:
-                out[k] = int(s)
-                continue
-            except (ValueError, InvalidOperation):
-                pass
-            try:
-                out[k] = float(s)
-                continue
-            except (ValueError, InvalidOperation):
-                pass
-            out[k] = s
+            out[k] = _coerce_param_string(v.strip())
         else:
             out[k] = v
     return out
+
+
+def _coerce_param_string(s: str) -> int | float | str:
+    """Coerce a CSV cell to int → float → str (cascading attempt)."""
+    try:
+        return int(s)
+    except (ValueError, InvalidOperation):
+        try:
+            return float(s)
+        except (ValueError, InvalidOperation):
+            return s
 
 
 def train_single_decoder(sub_dir: Path, params: dict[str, object]) -> None:

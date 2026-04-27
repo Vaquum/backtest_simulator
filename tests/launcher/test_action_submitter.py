@@ -548,6 +548,48 @@ def test_atr_sanity_uses_touch_provider_when_available() -> None:
     )
 
 
+def test_atr_sanity_k_zero_disables_gate_even_on_uncalibrated() -> None:
+    """`--atr-k 0` admits ENTER+BUY even when ATR provider returns None.
+
+    Slice #17 Task 29 / codex round 4 P1: the standalone
+    `AtrSanityGate` primitive treats `k=0` as the "operator
+    explicitly disabled the gate" knob. The wiring must honor that
+    BEFORE calling `atr_provider`, otherwise an empty pre-decision
+    tape (provider returns None) routes to `ATR_UNCALIBRATED`
+    rejection and a disabled gate still denies orders.
+
+    Mutation proof: removing the `gate.k == Decimal('0')` early
+    return makes the `atr_provider=lambda: None` provider trip the
+    uncalibrated path and `n_rejected/uncal` rises.
+    """
+    outbound = _OutboundStub()
+    pipeline, state = _pipeline_and_state()
+    rejected: list[ValidationDecision] = []
+    from backtest_simulator.honesty.atr import AtrSanityGate
+    gate = AtrSanityGate(atr_window_seconds=300, k=Decimal('0'))
+
+    def _atr_returns_none(_sym: str, _t: object) -> Decimal | None:
+        return None
+    bindings = SubmitterBindings(
+        nexus_config=_nexus_config(), state=state,
+        praxis_outbound=cast(PraxisOutbound, outbound),
+        validation_pipeline=pipeline,
+        strategy_budget=Decimal('100000'),
+        atr_gate=gate, atr_provider=_atr_returns_none,
+    )
+    submit = build_action_submitter(
+        bindings,
+        on_atr_reject=lambda d, _a: rejected.append(d),
+    )
+    submit([_enter_action()], 'long_on_signal')
+    assert rejected == [], (
+        f'k=0 must disable the gate completely, including the '
+        f'uncalibrated path; got {len(rejected)} rejection(s).'
+    )
+    # Order proceeds to the rest of the pipeline; whether it sends
+    # or fails downstream is not the gate's concern.
+
+
 def test_atr_sanity_skips_sell_exit() -> None:
     """SELL exits are not gated — long-only template scope.
 
