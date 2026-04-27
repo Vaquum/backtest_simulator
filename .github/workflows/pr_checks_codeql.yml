@@ -29,7 +29,10 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.11'
+        # 3.12 to match `pyproject.toml` `requires-python = ">=3.12"`
+        # (driven by vaquum-praxis's >=3.12 floor; mismatched here
+        # would fail `pip install -e .` resolution).
+        python-version: '3.12'
 
     - name: Install dependencies
       run: |

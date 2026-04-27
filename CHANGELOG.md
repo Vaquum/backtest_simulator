@@ -1,3 +1,11 @@
+# v1.10.3
+
+- Audit Finding 3 (P2) on commit fe00024 / v1.10.0: `pyproject.toml` advertised `requires-python = ">=3.11"` while `vaquum-praxis` requires `>=3.12`. A fresh `uv pip install -e .` on a clean checkout failed resolution, so the auditor could not reproduce the claimed `bts test -k market_impact` result. Bumping the floor to match the sibling constraint closes that gap.
+- `pyproject.toml` `requires-python` `>=3.11` → `>=3.12`. The runtime is already on 3.12; the codebase uses 3.10+ syntax (`X | None`, `match`, structural patterns) freely so no source code shifts. No back-compat shim added — there are no live 3.11 users of this package.
+- `.github/workflows/pr_checks_codeql.yml` Python `'3.11'` → `'3.12'`. CodeQL is the only CI gate that ran `pip install -e .` on 3.11; under the new floor it would have failed resolution. Workflows that don't install the package (`pr_checks_cc`, `pr_checks_ruleset`, `pr_checks_slice*`, `pr_checks_version`, `pr_checks_fail_loud`) are left at 3.11 — they only check git/text properties and don't depend on the project's install.
+- Verification: `python3.12 -m venv .venv && .venv/bin/pip install --dry-run -e <repo>` resolves successfully (was: failed with "Package backtest-simulator requires a different Python: 3.12 not in '>=3.11,<3.12'" or similar). `bts test -k market_impact -- --tb=short` continues to pass 20 tests.
+- `pyproject.toml` 1.10.2 → 1.10.3 (patch — environment / metadata fix; no behaviour change).
+
 # v1.10.2
 
 - Audit Finding 2 on commit fe00024 / v1.10.0 (`simulated.py:876-887`): the strict-impact gate rejected every flagged order regardless of side. The CLI/TODO contract said "Reject ENTER orders…", but `submit_order` had no action-type or open-vs-close context, so a flagged SELL exit was rejected — leaving the long-only strategy holding risk with no way out, and diverging from paper/live semantics. The audit's required shape: gate only the intended open path, OR document/test that exits are also blockable. This release takes the first path.
