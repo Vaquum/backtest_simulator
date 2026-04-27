@@ -23,7 +23,6 @@ import pytest
 
 from backtest_simulator.cli import _pipeline
 
-
 # Minimum columns `pick_decoders` reads: id + 12 _PARAM_COLS + the
 # 3 ranking/filter columns it sorts/filters by. Anything else can
 # be omitted.
@@ -145,6 +144,99 @@ def test_pick_decoders_cache_dir_stable_for_identical_input(
         f'cache sub_dir must be stable for identical input; got '
         f'{sub_a} vs {sub_b}'
     )
+
+
+def test_pick_decoders_strips_whitespace_in_numeric_columns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator-supplied CSV with leading whitespace on numeric values
+    must still cast cleanly.
+
+    Some operator-side exports format floats with a leading space
+    (e.g. ` -0.343` from `to_csv(float_format=' %.3f')`). Without
+    `str.strip_chars()` before the cast, polars returns null for
+    every padded value -> the entire pool drops on the null filter
+    -> the operator sees a confusing TypeError downstream.
+
+    Mutation proof: dropping the strip step makes the post-cast
+    nulls match the row count, the null-drop empties the pool,
+    and the test would either crash or assert n_usable=0 (the
+    behaviour observed pre-fix).
+    """
+    csv = tmp_path / 'whitespace.csv'
+    df = pl.DataFrame({
+        'id': [0, 1, 2],
+        'backtest_mean_kelly_pct': [' 11.434', ' 11.500', ' 11.600'],
+        'backtest_total_return_net_pct': [' 81.5', ' 82.0', ' 82.5'],
+        'backtest_trades_count': [' 488', ' 490', ' 492'],
+        'frac_diff_d': [' 0.0', ' 0.0', ' 0.0'],
+        'shift': [-1, -1, -1],
+        'q': [0.4, 0.4, 0.4],
+        'roc_period': [12, 12, 12],
+        'penalty': ['l2', 'l2', 'l2'],
+        'scaler_type': ['robust', 'robust', 'robust'],
+        'feature_groups': ['momentum', 'momentum', 'momentum'],
+        'class_weight': [0.55, 0.55, 0.55],
+        'C': [1.0, 1.0, 1.0],
+        'max_iter': [60, 60, 60],
+        'solver': ['lbfgs', 'lbfgs', 'lbfgs'],
+        'tol': [0.01, 0.01, 0.01],
+    })
+    df.write_csv(csv)
+    sub_dirs = _capture_sub_dirs(monkeypatch, csv)
+    # If whitespace stripping works, all 3 rows survive the cast +
+    # null-drop, and pick_decoders returns 1 pick (n=1 in
+    # _capture_sub_dirs).
+    assert len(sub_dirs) == 1, (
+        f'whitespace-stripped numeric columns must produce a pick; '
+        f'got {len(sub_dirs)} (likely all rows dropped to null cast)'
+    )
+
+
+def test_pick_decoders_fails_loudly_on_zero_usable_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All-null rank+kelly columns -> RuntimeError with named columns.
+
+    Pre-fix: the code continued into `_q(col, ...)` which called
+    `.quantile()` on an empty Series, returning None, and crashed
+    with `TypeError: float() argument must be a string or a real
+    number, not 'NoneType'`. The operator had to debug the full
+    stack trace to learn that all rows were dropped.
+
+    Post-fix: a clear RuntimeError naming the column set.
+
+    Mutation proof: removing the `if results.height == 0` block
+    re-introduces the cryptic TypeError downstream.
+    """
+    csv = tmp_path / 'all_null.csv'
+    df = pl.DataFrame({
+        'id': [0, 1, 2],
+        # The values cast to null because they are non-numeric.
+        'backtest_mean_kelly_pct': ['n/a', 'n/a', 'n/a'],
+        'backtest_total_return_net_pct': ['n/a', 'n/a', 'n/a'],
+        'backtest_trades_count': [488, 490, 492],
+        'frac_diff_d': [0.0, 0.0, 0.0],
+        'shift': [-1, -1, -1],
+        'q': [0.4, 0.4, 0.4],
+        'roc_period': [12, 12, 12],
+        'penalty': ['l2', 'l2', 'l2'],
+        'scaler_type': ['robust', 'robust', 'robust'],
+        'feature_groups': ['momentum', 'momentum', 'momentum'],
+        'class_weight': [0.55, 0.55, 0.55],
+        'C': [1.0, 1.0, 1.0],
+        'max_iter': [60, 60, 60],
+        'solver': ['lbfgs', 'lbfgs', 'lbfgs'],
+        'tol': [0.01, 0.01, 0.01],
+    })
+    df.write_csv(csv)
+
+    def _capture(sub_dir: Path, params: dict[str, object]) -> None:
+        del sub_dir, params
+
+    monkeypatch.setattr(_pipeline, 'train_single_decoder', _capture)
+    with pytest.raises(RuntimeError, match='0 usable rows'):
+        _pipeline.pick_decoders(n=1, input_from_file=str(csv))
 
 
 def test_pick_decoders_cache_uses_full_sha256(

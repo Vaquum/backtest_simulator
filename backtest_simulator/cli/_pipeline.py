@@ -312,8 +312,15 @@ def pick_decoders(
     else:
         pipe = ExperimentPipeline(experiment_dir=EXP_DIR)
         results = pipe.read_results()
+    # Strip leading/trailing whitespace before casting. Some
+    # operator-supplied CSVs (e.g. exported from notebooks with
+    # `to_csv(..., float_format=' %.3f')`) pad numeric strings
+    # with a leading space; polars' `cast(Float64, strict=False)`
+    # returns null on `' -0.343'` and the entire pool gets dropped
+    # on the null-filter below. Stripping first lets the cast
+    # succeed and the operator's filter actually run.
     casts = [
-        pl.col(c).cast(pl.Float64, strict=False).alias(c)
+        pl.col(c).str.strip_chars().cast(pl.Float64, strict=False).alias(c)
         for c in _NUMERIC_COLS
         if c in results.columns and results[c].dtype == pl.Utf8
     ]
@@ -335,6 +342,22 @@ def pick_decoders(
             f'({results.height} usable)',
             flush=True,
         )
+    if results.height == 0:
+        # Fail loud BEFORE the quantile machinery would crash with a
+        # confusing TypeError. The operator's CSV either has no
+        # numeric data in the rank+kelly columns or the cast
+        # silently dropped everything (e.g. unrecognised value
+        # format). Tell them exactly what to look at.
+        msg = (
+            f'pick_decoders: 0 usable rows in '
+            f'{input_from_file or EXP_DIR}. The cast to Float64 '
+            f'returned null for every value in {clean_cols}. '
+            f'Common causes: the column is non-numeric (string '
+            f'labels), the CSV uses an unrecognised number format, '
+            f'or the column is genuinely all-null. Inspect the '
+            f'first few rows of those columns and re-export.'
+        )
+        raise RuntimeError(msg)
     range_quantiles: dict[str, tuple[float, float]] = {}
     if trades_q_range is not None:
         range_quantiles['backtest_trades_count'] = trades_q_range

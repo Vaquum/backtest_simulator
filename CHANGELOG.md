@@ -1,3 +1,16 @@
+# v1.16.2
+
+- **Operator-reported bug fix**: `bts sweep --input-from-file mid.csv` crashed with `TypeError: float() argument must be a string or a real number, not 'NoneType'` deep in `_q` instead of giving any clue what was wrong. Cause: the operator's CSV exported numeric columns with leading whitespace (e.g. ` -0.343` from `to_csv(float_format=' %.3f')`); polars' `cast(Float64, strict=False)` returns null on whitespace-padded strings, the entire 10000-row pool dropped to null, then the quantile machinery tripped on the empty Series.
+- Fix in `cli/_pipeline.py:pick_decoders`:
+  1. **Strip whitespace before the Float64 cast.** `pl.col(c).str.strip_chars().cast(pl.Float64, strict=False)`. Operator-supplied CSVs that pad numerics with leading/trailing spaces no longer collapse to all-null on cast.
+  2. **Fail loud when 0 usable rows remain after the null-drop.** New `if results.height == 0: raise RuntimeError(...)` that names the columns and the file path. Pre-fix the operator saw a cryptic TypeError 80 lines downstream; post-fix they see `pick_decoders: 0 usable rows in mid.csv. The cast to Float64 returned null for every value in [...]. Common causes: non-numeric column, unrecognised number format, all-null column. Inspect and re-export.`
+- Live verification on `mid.csv` (10000 rows, `' -0.343'`-style values): pre-fix `dropped 10000 row(s) ... (0 usable)` + TypeError crash. Post-fix `dropped 386 row(s) ... (9614 usable)` proceeds into the filter machinery as expected.
+- 2 new tests in `tests/cli/test_pick_decoders_cache_key.py`:
+  * `_strips_whitespace_in_numeric_columns` — CSV with ` 11.434` style values produces a pick (vs pre-fix all rows dropped).
+  * `_fails_loudly_on_zero_usable_rows` — all-null rank+kelly columns raise RuntimeError matching `'0 usable rows'` (vs pre-fix cryptic TypeError).
+- Codex 5.5 xhigh approved in 1 round.
+- `pyproject.toml` 1.16.1 → 1.16.2 (patch — operator-reported bug fix scope).
+
 # v1.16.1
 
 - **Operator-reported bug fix**: `bts sweep --input-from-file max.csv` silently aliased to a cached training from a prior `bts sweep --input-from-file min.csv` run. Cause: `pick_decoders` cache key in `cli/_pipeline.py` was `trained_from_file/id_{file_id}/` — keyed on `file_id` ALONE. Two different CSVs with the same `id` column collided; the FIRST-cached training was reused on subsequent runs, regardless of source file or row content.
