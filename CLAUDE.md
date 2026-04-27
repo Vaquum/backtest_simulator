@@ -71,3 +71,11 @@ The gates check shape, scope, format, ratchets, and named test suites. They do n
 ## When in doubt, stop
 
 This is collaboration. If the requirement is unclear, if the scope is ambiguous, if a gate's meaning is unobvious, if the fix would require touching something that wasn't asked for — stop and ask the operator. Proceeding through doubt is where harm accumulates.
+
+## The Five Principles
+
+- no duck-taping or saga ornamentation
+- "bts or it didn't happen" -> everything is bts cli first
+- not building a parallel universe around praxis/nexus ->  extending them
+- honest to how market actuall works -> works just like nexus/praxis paper-trade
+- strategy tested, is strategy deployed -> limen leads to nexus leads to praxis
