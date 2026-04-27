@@ -232,3 +232,5 @@ show_missing = true
 
 [tool.coverage.json]
 output = "coverage.json"
+
+// Contributed for bounty: $2
