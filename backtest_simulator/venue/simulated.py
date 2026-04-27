@@ -26,7 +26,6 @@ from praxis.infrastructure.venue_adapter import (
 
 from backtest_simulator.feed.protocol import VenueFeed
 from backtest_simulator.honesty.maker_fill import MakerFillModel
-from backtest_simulator.honesty.market_impact import MarketImpactModel
 from backtest_simulator.honesty.slippage import SlippageModel
 from backtest_simulator.venue import _adapter_internals as _I
 from backtest_simulator.venue.fees import FeeSchedule
@@ -49,7 +48,9 @@ class SimulatedVenueAdapter:
         trade_window_seconds: int = 3600,
         slippage_model: SlippageModel | None = None,
         maker_fill_model: MakerFillModel | None = None,
-        market_impact_model: MarketImpactModel | None = None,
+        market_impact_bucket_minutes: int | None = None,
+        market_impact_threshold_fraction: Decimal = Decimal('0.1'),
+        strict_impact_policy: bool = False,
     ) -> None:
         self._feed = feed
         self._filters = filters
@@ -100,22 +101,28 @@ class SimulatedVenueAdapter:
         self._n_limit_filled_zero: int = 0
         self._n_limit_marketable_taker: int = 0
         self._maker_fill_efficiencies: list[Decimal] = []
-        # MarketImpactModel — measurement-only, like SlippageModel.
-        # On every order submit, the model.evaluate(qty, mid, t)
-        # returns the predicted bps the order would push the book
-        # (linear interpolation: order_qty / bucket_volume *
-        # bucket_price_range_bps) plus a `flag` for orders larger
-        # than `threshold_fraction` of concurrent volume. We do
-        # NOT mutate fill_price; walk_trades already uses real
-        # tape prices. The aggregate `market_impact_realised_bps`
-        # surfaces the average estimated impact across submitted
-        # orders, and `n_flagged` counts orders the operator
-        # should down-size before live. None when the model is
-        # not attached.
-        self._market_impact_model = market_impact_model
+        # MarketImpactModel — STRICT-CAUSAL per-submit calibration.
+        # Each ENTER submit fetches a fresh `[submit_time -
+        # bucket_minutes, submit_time)` slice of pre-submit tape,
+        # calibrates a single-bucket `MarketImpactModel` from it,
+        # and evaluates the order's qty against that bucket.
+        # `bucket_minutes is None` disables the feature.
+        # `threshold_fraction` controls the size-vs-volume flag
+        # threshold (default 10%). `strict_impact_policy=True`
+        # makes the venue REJECT orders the model flags as too
+        # large — the auditor's "pre-fill gate" semantic. Default
+        # `False` preserves the prior measurement-only shape.
+        # Codex round 2 caught the original wiring's lookahead
+        # (calibration spanned the run window) and absent gate.
+        self._market_impact_bucket_minutes = market_impact_bucket_minutes
+        self._market_impact_threshold_fraction = (
+            market_impact_threshold_fraction
+        )
+        self._strict_impact_policy = strict_impact_policy
         self._market_impact_bps_samples: list[Decimal] = []
         self._market_impact_n_flagged: int = 0
         self._market_impact_n_uncalibrated: int = 0
+        self._market_impact_n_rejected: int = 0
         self._accounts: dict[str, _I.Account] = {}
         self._symbol_filters: dict[str, BinanceSpotFilters] = {filters.symbol: filters}
         self._next_order_seq = 1
@@ -423,76 +430,124 @@ class SimulatedVenueAdapter:
         """
         return self._slippage_n_uncalibrated_predict
 
-    def _record_market_impact(
+    def _record_market_impact_pre_fill(
         self,
         order: PendingOrder,
-        fills: list[FillResult],
+        symbol: str,
         submit_time: datetime,
-    ) -> None:
-        """Measure the model's estimated impact bps for this order.
+    ) -> bool:
+        """STRICT-CAUSAL per-submit market-impact gate.
 
-        Calls `model.evaluate(qty=order.qty, mid=fill_or_limit_price,
-        t=submit_time)` and records the predicted impact bps + flag.
-        We sample at order-submit time (not per-fill) because impact
-        is a function of order size against concurrent volume — it's
-        decided at submit, not by the tape walk. Like
-        `_record_slippage`, this is measurement-only: we do not
-        mutate fill_price. The aggregate surfaces on `bts sweep` so
-        the operator can spot orders that would have moved the book
-        more than the calibration says is realistic for live.
+        Fetches `[submit_time - bucket_minutes, submit_time)` of
+        tape — strictly pre-submit, no future trades — and
+        computes the trailing-window impact estimate inline:
 
-        `mid` is reserved on the model for future quote-anchored
-        calibration; today the implementation ignores it. We pass
-        the order's limit price (LIMIT) or the first fill price
-        (MARKET fills) when available, falling back to Decimal('0')
-        when neither is set — the model honours the contract
-        regardless.
+          - `total_volume` = sum of `qty` in the trailing slice.
+          - `price_range_bps` = (max_price - min_price) /
+            first_price * 10000 over the slice.
+          - `impact_bps` = `order.qty / total_volume *
+            price_range_bps` (the linear-interpolation shape
+            from `MarketImpactModel`).
+          - `flag` = `order.qty >
+            threshold_fraction * total_volume`.
 
-        No-op when `market_impact_model is None`.
+        When `strict_impact_policy=True` AND the order is
+        flagged, returns True so `submit_order` can route to
+        REJECTED before `walk_trades` runs — the operator-visible
+        "pre-fill gate" the auditor's Task 31 contract calls
+        for. Returns False otherwise (measurement-only
+        observability path).
 
-        `flag=True` from the model means the order exceeded
-        `threshold_fraction` of the matching bucket's volume — the
-        operator's "this would move the book more than the
-        calibration was based on" trigger. We track these
-        separately so the sweep can call them out.
+        Why inlined instead of `MarketImpactModel.calibrate`?
+        The standalone model's `calibrate` truncates trades to
+        wall-clock minute boundaries (`dt.truncate('1m')`), so a
+        rolling `[submit_time - 1m, submit_time)` slice for a
+        non-boundary submit (e.g. `12:31:15`) gets split across
+        two buckets: 12:30 (45s of trades) and 12:31 (15s of
+        trades). The model's `evaluate` then matches the bucket
+        containing `submit_time - 1µs` and uses only that
+        partial denominator. The audit's pre-fill estimate
+        needs the FULL trailing minute as one bucket; inlining
+        the math against the rolling slice (no truncation)
+        gives that. The standalone primitive still ships for
+        direct operator use (notebook calibration / forensics)
+        — the wall-clock bucketing IS the right shape there.
+        Codex round 2 P2 caught the truncation gap.
 
-        When the model returns the no-bucket / empty-bucket
-        sentinel (`impact_bps=0`, `flag=True`), we count it as
-        uncalibrated rather than recording a zero impact —
-        otherwise a calibration gap would silently weight the
-        realised aggregate downward. Distinct from "real zero"
-        (impact=0, flag=False) which CAN happen when the order
-        is tiny relative to bucket volume.
+        Strict-causal contract: trades printed exactly at
+        `submit_time` are EXCLUDED via `pl.col('time') <
+        submit_time`. The feed's `_get_trades_for_venue` may
+        return inclusive ranges depending on backend (SQL
+        BETWEEN, Polars between(closed='both')) — filter
+        post-fetch to enforce the exclusive end. Codex round 2
+        P1 caught this.
+
+        Empty / pathological slices land in `n_uncalibrated`
+        rather than recording zero impact (would silently weight
+        the realised aggregate downward by calibration gaps).
+        Distinct from "real zero" — a tiny order against a
+        well-traded minute legitimately maps to ~0 bps with
+        flag=False.
+
+        No-op when `market_impact_bucket_minutes is None`.
         """
-        if self._market_impact_model is None:
-            return
-        if fills:
-            mid = fills[0].fill_price
-        elif order.limit_price is not None:
-            mid = order.limit_price
-        else:
-            mid = Decimal('0')
-        decision = self._market_impact_model.evaluate(
-            qty=order.qty, mid=mid, t=submit_time,
+        if self._market_impact_bucket_minutes is None:
+            return False
+        from datetime import timedelta
+        bucket = self._market_impact_bucket_minutes
+        raw = self._feed._get_trades_for_venue(
+            symbol, submit_time - timedelta(minutes=bucket),
+            submit_time,
+            venue_lookahead_seconds=0,
         )
-        if decision.concurrent_volume == Decimal('0'):
+        # Strict-causal: exclude any trade stamped exactly at
+        # submit_time. The feed's range query may be inclusive;
+        # this filter enforces the half-open contract.
+        pre = raw.filter(pl.col('time') < submit_time)
+        if pre.is_empty():
             self._market_impact_n_uncalibrated += 1
-            return
-        self._market_impact_bps_samples.append(decision.impact_bps)
-        if decision.flag:
+            return False
+        total_volume = Decimal(str(pre['qty'].sum()))
+        if total_volume <= Decimal('0'):
+            self._market_impact_n_uncalibrated += 1
+            return False
+        price_first_raw = pre.head(1)['price'].item()
+        if price_first_raw is None or price_first_raw <= 0:
+            self._market_impact_n_uncalibrated += 1
+            return False
+        price_first = Decimal(str(price_first_raw))
+        price_max = Decimal(str(pre['price'].max()))
+        price_min = Decimal(str(pre['price'].min()))
+        price_range_bps = (
+            (price_max - price_min) / price_first * Decimal('10000')
+        )
+        impact_bps = (
+            order.qty / total_volume * price_range_bps
+        )
+        flag = (
+            order.qty
+            > self._market_impact_threshold_fraction * total_volume
+        )
+        self._market_impact_bps_samples.append(impact_bps)
+        if flag:
             self._market_impact_n_flagged += 1
+            if self._strict_impact_policy:
+                self._market_impact_n_rejected += 1
+                return True
+        return False
 
     @property
     def market_impact_realised_bps(self) -> Decimal | None:
         """Mean estimated impact bps across recorded order submits.
 
-        None when the model is not attached. Returns Decimal('0')
-        when attached but no calibrated bucket matched any submit
+        None when the impact feature is off
+        (`bucket_minutes is None`). Returns Decimal('0') when
+        on but no calibrated bucket matched any submit
         (`n_uncalibrated > 0` exposes this case to the operator
         separately so a `0.00bp` aggregate can't masquerade as
         "no impact" when the calibration is missing).
         """
-        if self._market_impact_model is None:
+        if self._market_impact_bucket_minutes is None:
             return None
         if not self._market_impact_bps_samples:
             return Decimal('0')
@@ -507,19 +562,45 @@ class SimulatedVenueAdapter:
 
     @property
     def market_impact_n_flagged(self) -> int:
-        """Count of order submits flagged as too large vs concurrent volume."""
+        """Count of order submits flagged as too large vs concurrent volume.
+
+        Includes BOTH the orders that were rejected by the
+        strict-policy gate (`n_rejected`, when
+        `strict_impact_policy=True`) AND the orders that were
+        flagged but allowed through under the default observability
+        policy. Net: `n_flagged - n_rejected = orders flagged but
+        not rejected`.
+        """
         return self._market_impact_n_flagged
 
     @property
     def market_impact_n_uncalibrated(self) -> int:
-        """Count of order submits whose timestamp had no matching bucket.
+        """Count of order submits whose pre-submit slice was empty / pathological.
 
-        Distinct from `n_samples`: an uncalibrated submit means the
-        model returned `concurrent_volume=0` (gap in calibration);
-        the impact is unknown, not zero. The sweep aggregator
-        WARNs when this rises so the operator widens calibration.
+        Distinct from `n_samples`: an uncalibrated submit means
+        the per-submit `MarketImpactModel.calibrate` saw no
+        trades in `[submit_time - bucket_minutes, submit_time)`
+        OR every trade in that slice had a non-positive price.
+        The impact is unknown, not zero. The sweep aggregator
+        WARNs when this rises so the operator widens
+        `bucket_minutes` or runs against a denser-volume window.
         """
         return self._market_impact_n_uncalibrated
+
+    @property
+    def market_impact_n_rejected(self) -> int:
+        """Orders rejected by the strict-policy pre-fill gate.
+
+        Always 0 when `strict_impact_policy=False` (default
+        observability mode — flagged orders are recorded but
+        execute). Non-zero when the operator opts into the
+        gate via `--strict-impact`. Each rejection translates
+        into an `OrderStatus.REJECTED` SubmitResult so the
+        downstream lifecycle (capital reservation release,
+        strategy state) treats it the same as a venue filter
+        rejection.
+        """
+        return self._market_impact_n_rejected
 
     def _record_limit_outcome(
         self,
@@ -792,6 +873,23 @@ class SimulatedVenueAdapter:
             return SubmitResult(
                 venue_order_id=venue_order_id, status=OrderStatus.REJECTED, immediate_fills=(),
             )
+        # Pre-fill market-impact gate. Strict-causal per-submit
+        # calibration over `[submit_time - bucket_minutes,
+        # submit_time)` — no future tape. Records the predicted
+        # impact bps + flag in the running aggregates. When
+        # `strict_impact_policy=True` AND the model flags the
+        # order as too large, returns True and we route to
+        # REJECTED here, before walk_trades. Default
+        # observability mode (False) records but never blocks.
+        # Codex round 2 P1 caught the prior shape: post-fill
+        # measurement only, no gate.
+        if self._record_market_impact_pre_fill(order, symbol, submit_time):
+            _I.record_rejection(account, order, coid, side, order_type, price)
+            return SubmitResult(
+                venue_order_id=venue_order_id,
+                status=OrderStatus.REJECTED,
+                immediate_fills=(),
+            )
         # Slice the pre-submit prefix from the same widened fetch.
         # `walk_trades` itself filters `trades` by `time >= submit_time`
         # for the post-submit window; the pre-submit slice is needed
@@ -811,14 +909,9 @@ class SimulatedVenueAdapter:
         # adjust `fills` — the audit's P1 was that adjusting on top
         # of tape-priced fills double-counts spread.
         self._record_slippage(order, fills, trades)
-        # Measure estimated market impact for THIS order
-        # (qty * mid -> predicted bps the order would push the
-        # book). Like slippage, this is measurement-only — we do
-        # not adjust fill_price. The aggregate surfaces on
-        # `bts sweep` so the operator can spot orders that would
-        # have eaten >threshold_fraction of concurrent volume
-        # (the `flag=True` case) before going live.
-        self._record_market_impact(order, fills, submit_time)
+        # Market-impact recording fired BEFORE walk_trades above;
+        # it's strict-causal pre-submit and may have routed to
+        # REJECTED already if the strict-policy gate triggered.
         # LIMIT order telemetry: surface fill efficiency on the
         # load-bearing `bts sweep` path. Counts are zeroed for
         # MARKET / STOP_* orders.

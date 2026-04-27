@@ -53,6 +53,13 @@ def register(sub: argparse._SubParsersAction) -> None:
                        'MakerFillModel for realistic queue + partial '
                        'fills. Default: MARKET (taker).'
                    ))
+    p.add_argument('--strict-impact', action='store_true', default=False,
+                   help=(
+                       'Reject ENTER orders the MarketImpactModel '
+                       'flags as exceeding 10%% of concurrent-bucket '
+                       'volume. Default: record telemetry only '
+                       '(observability mode).'
+                   ))
     add_verbosity_arg(p)
     p.set_defaults(func=_run)
 
@@ -130,6 +137,7 @@ def _run(args: argparse.Namespace) -> int:
     sweep_impact_n_samples_total = 0
     sweep_impact_n_flagged_total = 0
     sweep_impact_n_uncalibrated_total = 0
+    sweep_impact_n_rejected_total = 0
     for perm_id, kelly, exp_dir, display_id in picks:
         for day in days:
             window_start = datetime.combine(day.date(), hours_start, tzinfo=UTC)
@@ -144,6 +152,7 @@ def _run(args: argparse.Namespace) -> int:
                 result = run_window_in_subprocess(
                     perm_id, kelly, window_start, window_end, exp_dir,
                     maker_preference=bool(getattr(args, 'maker', False)),
+                    strict_impact=bool(getattr(args, 'strict_impact', False)),
                 )
             except Exception as exc:  # noqa: BLE001 - surface per-run errors
                 dt_ms = int((time.perf_counter() - t0) * 1000)
@@ -196,6 +205,9 @@ def _run(args: argparse.Namespace) -> int:
             impact_uncal = int(result.get(
                 'market_impact_n_uncalibrated', 0,
             ))
+            impact_rejected = int(result.get(
+                'market_impact_n_rejected', 0,
+            ))
             print_run(
                 display_id, day_label, trades, declared_stops,
                 slippage_cost_bps=slip_cost,
@@ -239,6 +251,7 @@ def _run(args: argparse.Namespace) -> int:
             sweep_impact_n_samples_total += impact_n
             sweep_impact_n_flagged_total += impact_flagged
             sweep_impact_n_uncalibrated_total += impact_uncal
+            sweep_impact_n_rejected_total += impact_rejected
             if slip_cost is not None:
                 sweep_runs_with_slip += 1
                 sweep_n_samples_total += slip_n
@@ -279,6 +292,7 @@ def _run(args: argparse.Namespace) -> int:
         sweep_impact_n_samples_total,
         sweep_impact_n_flagged_total,
         sweep_impact_n_uncalibrated_total,
+        sweep_impact_n_rejected_total,
         total_runs,
     )
     return 0
@@ -289,6 +303,7 @@ def _print_sweep_impact_summary(
     n_samples_total: int,
     n_flagged_total: int,
     n_uncalibrated_total: int,
+    n_rejected_total: int,
     total_runs: int,
 ) -> None:
     """Print the sweep-level market-impact summary line.
@@ -330,7 +345,8 @@ def _print_sweep_impact_summary(
         bps_str = 'n/a'
     line = (
         f'sweep impact     mean={bps_str}  n={n_samples_total} '
-        f'flagged={n_flagged_total}  uncalibrated={n_uncalibrated_total}'
+        f'flagged={n_flagged_total}  rejected={n_rejected_total}  '
+        f'uncalibrated={n_uncalibrated_total}'
     )
     denom = n_samples_total + n_uncalibrated_total
     if denom > 0:

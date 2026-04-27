@@ -168,26 +168,25 @@ class _SyntheticImpactFeed:
 
 def _impact_adapter(
     bucket_start: datetime,
+    *,
+    strict: bool = False,
 ):
-    """Build an adapter pre-wired with a one-bucket impact model."""
-    from backtest_simulator.honesty.market_impact import MarketImpactModel
+    """Build an adapter wired for per-submit strict-causal impact.
+
+    `bucket_start` defines the synthetic feed's bucket window;
+    submits at `bucket_start + N seconds` (with N in `(0, 60)`)
+    will see a populated pre-submit slice and produce calibrated
+    samples. `strict=True` engages the pre-fill rejection gate.
+    """
     feed = _SyntheticImpactFeed(bucket_start)
-    # Model calibrated from the same synthetic frame (renamed to
-    # the `datetime`/`quantity` schema the standalone primitive
-    # expects).
-    calibration_frame = feed._frame.rename(
-        {'time': 'datetime', 'qty': 'quantity'},
-    )
-    impact_model = MarketImpactModel.calibrate(
-        trades=calibration_frame, bucket_minutes=1,
-        threshold_fraction=Decimal('0.1'),
-    )
     return SimulatedVenueAdapter(
         feed=cast(VenueFeed, feed),
         filters=BinanceSpotFilters.binance_spot('BTCUSDT'),
         fees=FeeSchedule(),
         trade_window_seconds=60,
-        market_impact_model=impact_model,
+        market_impact_bucket_minutes=1,
+        market_impact_threshold_fraction=Decimal('0.1'),
+        strict_impact_policy=strict,
     )
 
 
@@ -282,12 +281,83 @@ def test_market_impact_uncalibrated_when_no_bucket_match() -> None:
     )
 
 
-def test_market_impact_off_when_model_none() -> None:
-    """`market_impact_realised_bps` is None when the model is not attached.
+def test_market_impact_strict_policy_rejects_oversize_orders() -> None:
+    """`strict_impact_policy=True` routes flagged orders to REJECTED.
 
-    Distinguishes "feature off" (no model) from "feature on, no data"
-    (zero samples). The JSON consumer reads None as "model
-    disabled" and the per-run line skips the `imp` column.
+    Pre-fill gate semantics: under strict mode, an ENTER order
+    flagged as exceeding `threshold_fraction` of the per-submit
+    bucket's volume is denied BEFORE walk_trades runs. The
+    SubmitResult carries `OrderStatus.REJECTED` and zero
+    immediate_fills, and `market_impact_n_rejected` increments.
+    The default observability mode (strict=False, covered by
+    `test_market_impact_flags_oversize_orders` above) records
+    the flag without rejecting.
+
+    Mutation proof: if the gate regresses to record-only,
+    `result.status` returns FILLED/EXPIRED instead of REJECTED
+    and `n_rejected` stays at 0.
+    """
+    from datetime import UTC, timedelta
+
+    from freezegun import freeze_time
+    bucket_start = datetime(2024, 1, 3, 12, 0, tzinfo=UTC)
+    adapter = _impact_adapter(bucket_start, strict=True)
+    adapter.register_account('acct-1', 'k', 's')
+    with freeze_time(bucket_start + timedelta(seconds=20)):
+        result = asyncio.run(adapter.submit_order(
+            'acct-1', 'BTCUSDT', OrderSide.BUY,
+            OrderType.MARKET,
+            Decimal('5'),  # 50% of 10 BTC bucket -> flagged
+        ))
+    assert result.status == OrderStatus.REJECTED, (
+        f'strict policy should reject the flagged order, got '
+        f'status={result.status}.'
+    )
+    assert result.immediate_fills == ()
+    assert adapter.market_impact_n_rejected == 1
+    assert adapter.market_impact_n_flagged == 1, (
+        f'rejection counts as flagged too — got n_flagged='
+        f'{adapter.market_impact_n_flagged}.'
+    )
+
+
+def test_market_impact_strict_policy_passes_below_threshold() -> None:
+    """`strict_impact_policy=True` does NOT reject orders under threshold.
+
+    A small order (well below 10% of bucket volume) carries
+    `flag=False` from the model; the gate's `flag and strict`
+    condition is False; the order proceeds to walk_trades. This
+    pins the gate's specificity — strict mode rejects ONLY
+    flagged orders, not all submits.
+    """
+    from datetime import UTC, timedelta
+
+    from freezegun import freeze_time
+    bucket_start = datetime(2024, 1, 3, 12, 0, tzinfo=UTC)
+    adapter = _impact_adapter(bucket_start, strict=True)
+    adapter.register_account('acct-1', 'k', 's')
+    with freeze_time(bucket_start + timedelta(seconds=20)):
+        result = asyncio.run(adapter.submit_order(
+            'acct-1', 'BTCUSDT', OrderSide.BUY,
+            OrderType.MARKET,
+            Decimal('0.001'),
+        ))
+    # Not REJECTED by the impact gate.
+    assert result.status != OrderStatus.REJECTED, (
+        f'small order should clear the strict-impact gate, got '
+        f'status={result.status}.'
+    )
+    assert adapter.market_impact_n_rejected == 0
+    assert adapter.market_impact_n_samples == 1
+
+
+def test_market_impact_off_when_model_none() -> None:
+    """`market_impact_realised_bps` is None when the feature is off.
+
+    Distinguishes "feature off" (`bucket_minutes is None`) from
+    "feature on, no data" (zero samples). The JSON consumer
+    reads None as "feature disabled" and the per-run line
+    skips the `imp` column.
     """
     adapter = _adapter()
     adapter.register_account('acct-1', 'k', 's')
@@ -297,6 +367,6 @@ def test_market_impact_off_when_model_none() -> None:
     ))
     del result
     assert adapter.market_impact_realised_bps is None, (
-        f'No model attached but realised_bps={adapter.market_impact_realised_bps}'
+        f'feature off but realised_bps={adapter.market_impact_realised_bps}'
     )
     assert adapter.market_impact_n_samples == 0

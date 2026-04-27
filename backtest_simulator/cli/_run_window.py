@@ -40,6 +40,7 @@ def run_window_in_process(
     experiment_dir: Path,
     *,
     maker_preference: bool = False,
+    strict_impact: bool = False,
 ) -> dict[str, object]:
     """In-process single-window run — picklable result for cross-process use."""
     from praxis.launcher import InstanceConfig
@@ -106,29 +107,19 @@ def run_window_in_process(
         _calibrate_maker_fill(feed, window_start)
         if maker_preference else None
     )
-    # MarketImpactModel calibrates over the FULL run window so
-    # every submit timestamp during the run hits a matching
-    # bucket. Per-order `evaluate(qty, mid, t)` returns the bps
-    # the order would push the book if it walked the matching
-    # bucket's liquidity, plus a `flag` for orders >
-    # threshold_fraction of concurrent volume. Measurement-only —
-    # no fill_price mutation. Unlike maker_fill_model (gated on
-    # `maker_preference`), impact measurement is always-on so the
-    # operator gets a size-vs-volume sanity number on every sweep.
-    #
-    # Strict-causality note: the calibration "looks ahead" within
-    # the run window in the sense that buckets at minute X are
-    # built from trades that will print at minute X. The
-    # STRATEGY never sees this — the model is read by the venue
-    # adapter at order-submit time and the result lands in
-    # operator-visible JSON / sweep summary, never in the
-    # strategy's signal/state path. So a strategy cannot game
-    # the impact estimate. The output is a post-hoc measurement,
-    # the same way `cli/_metrics.print_run` reports realised PnL
-    # using sell prices the strategy didn't have at BUY time.
-    market_impact_model = _calibrate_market_impact(
-        feed, window_start, window_end,
-    )
+    # MarketImpactModel: per-submit STRICT-CAUSAL calibration
+    # at the venue. Every order submit fetches `[submit_time -
+    # bucket_minutes, submit_time)` of pre-submit tape, builds
+    # a single-bucket model, and evaluates the order's qty
+    # against that bucket. Always-on measurement (the
+    # operator gets size-vs-volume telemetry on every sweep).
+    # When `strict_impact=True`, the venue REJECTS orders the
+    # model flags as exceeding `threshold_fraction` of bucket
+    # volume — the auditor's "pre-fill gate" semantic. Codex
+    # round 2 P1 caught the prior shape: pre-calibration over
+    # `[window_start - 30m, window_end]` was hindsight-
+    # informed (each bucket included trades AFTER the matching
+    # submit). The per-submit fetch eliminates that lookahead.
     adapter = SimulatedVenueAdapter(
         feed=feed,
         filters=BinanceSpotFilters.binance_spot(SYMBOL),
@@ -136,7 +127,9 @@ def run_window_in_process(
         trade_window_seconds=60,
         slippage_model=slippage_model,
         maker_fill_model=maker_fill_model,
-        market_impact_model=market_impact_model,
+        market_impact_bucket_minutes=1,
+        market_impact_threshold_fraction=Decimal('0.1'),
+        strict_impact_policy=strict_impact,
     )
     tc = TradingConfig(
         epoch_id=1, venue_rest_url='http://sim', venue_ws_url='ws://sim',
@@ -234,13 +227,13 @@ def run_window_in_process(
             adapter.maker_fill_efficiency_mean,
         ),
         # MarketImpactModel telemetry. `realised_bps` is the mean
-        # estimated impact across every order submit that hit a
-        # calibrated bucket. `n_samples` and `n_flagged` count
-        # those submits and the subset whose qty exceeded
-        # `threshold_fraction` of concurrent volume.
-        # `n_uncalibrated` counts submits whose timestamp had no
-        # matching bucket — the operator-visible "calibration
-        # gap" signal.
+        # estimated impact across every ENTER submit that hit a
+        # calibrated bucket. `n_samples` / `n_flagged` /
+        # `n_uncalibrated` count those submits, the subset
+        # flagged as oversized, and the calibration gaps.
+        # `n_rejected` is the subset of flagged that the
+        # strict-impact gate routed to REJECTED before
+        # walk_trades (always 0 unless `--strict-impact`).
         'market_impact_realised_bps': _emit(
             adapter.market_impact_realised_bps,
         ),
@@ -248,6 +241,7 @@ def run_window_in_process(
         'market_impact_n_flagged': adapter.market_impact_n_flagged,
         'market_impact_n_uncalibrated':
             adapter.market_impact_n_uncalibrated,
+        'market_impact_n_rejected': adapter.market_impact_n_rejected,
     }
 
 
@@ -351,56 +345,11 @@ def _calibrate_maker_fill(
     return MakerFillModel.calibrate(trades=pre, lookback_minutes=30)
 
 
-def _calibrate_market_impact(
-    feed: object,
-    window_start: datetime,
-    window_end: datetime,
-) -> object | None:
-    """Build a MarketImpactModel covering `[window_start - 30m, window_end]`.
-
-    Calibration spans the FULL run window so every order
-    submitted during the run hits a matching bucket. The 30-min
-    pre-window prefix gives a quiet lead-in for runs whose first
-    submits fire seconds after window_start. Returns None when
-    the slice is empty (the model is measurement-only, not
-    load-bearing for fill mechanics — silent None lets `bts
-    sweep` continue and the JSON
-    `market_impact_realised_bps` reads null so the operator
-    sees calibration was unavailable). Other failures (tunnel,
-    schema, calibrate raising on degenerate data) propagate.
-
-    Bucket size: 1 minute. Threshold fraction: 0.1 (10% of
-    concurrent volume flags an order as "operator should down-
-    size before live"). The 1-minute bucket matches the typical
-    BTCUSDT trade-tape density: at ~50-100 trades/minute, every
-    bucket has enough qty samples to compute a meaningful
-    range.
-
-    "Lookahead" caveat: the buckets within the run window
-    summarise trades that will print AT or AFTER each submit
-    time. The strategy never sees this — the model is read by
-    the venue adapter at order-submit time and the result
-    lands in operator-visible JSON / sweep summary, not in the
-    strategy's signal/state path. Same shape as
-    `cli/_metrics.print_run`'s realised-PnL reporting using
-    sell prices the strategy didn't have at BUY time.
-    """
-    from datetime import timedelta
-
-    from backtest_simulator.honesty.market_impact import MarketImpactModel
-    full_window = feed.get_trades(
-        SYMBOL,
-        window_start - timedelta(minutes=30),
-        window_end,
-    )
-    if full_window.is_empty():
-        return None
-    full_window = full_window.rename({'time': 'datetime', 'qty': 'quantity'})
-    return MarketImpactModel.calibrate(
-        trades=full_window,
-        bucket_minutes=1,
-        threshold_fraction=Decimal('0.1'),
-    )
+# Market-impact calibration moved into the venue adapter
+# (per-submit, strict-causal). The previous run-window
+# pre-calibration ran here; codex round 2 P1 caught the
+# lookahead and the adapter now does its own bounded fetch
+# at each submit. See SimulatedVenueAdapter._record_market_impact_pre_fill.
 
 
 def run_window_in_subprocess(
@@ -411,6 +360,7 @@ def run_window_in_subprocess(
     experiment_dir: Path,
     *,
     maker_preference: bool = False,
+    strict_impact: bool = False,
 ) -> dict[str, object]:
     """Run one window in a fresh Python interpreter for state isolation."""
     payload = json.dumps({
@@ -420,6 +370,7 @@ def run_window_in_subprocess(
         'window_end': window_end.isoformat(),
         'experiment_dir': str(experiment_dir),
         'maker_preference': bool(maker_preference),
+        'strict_impact': bool(strict_impact),
     })
     proc = subprocess.run(
         [sys.executable, '-m', 'backtest_simulator.cli._run_window'],
@@ -450,6 +401,7 @@ def _child_main() -> int:
         datetime.fromisoformat(payload['window_end']),
         Path(payload['experiment_dir']),
         maker_preference=bool(payload.get('maker_preference', False)),
+        strict_impact=bool(payload.get('strict_impact', False)),
     )
     print(json.dumps(result), flush=True)
     return 0

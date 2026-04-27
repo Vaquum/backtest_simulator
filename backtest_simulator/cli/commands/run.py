@@ -65,6 +65,13 @@ def register(sub: argparse._SubParsersAction) -> None:
                        'MakerFillModel for realistic queue + partial '
                        'fills. Default: MARKET (taker).'
                    ))
+    p.add_argument('--strict-impact', action='store_true', default=False,
+                   help=(
+                       'Reject ENTER orders the MarketImpactModel '
+                       'flags as exceeding 10%% of concurrent-bucket '
+                       'volume. Default: record telemetry only '
+                       '(observability mode).'
+                   ))
     add_verbosity_arg(p)
     p.set_defaults(func=_run)
 
@@ -83,6 +90,7 @@ def _run(args: argparse.Namespace) -> int:
     result = run_window_in_subprocess(
         perm_id, kelly, window_start, window_end, exp_dir,
         maker_preference=bool(getattr(args, 'maker', False)),
+        strict_impact=bool(getattr(args, 'strict_impact', False)),
     )
     trades_raw = result['trades']
     stops_raw = result['declared_stops']
@@ -158,6 +166,9 @@ def _run(args: argparse.Namespace) -> int:
             ),
             'market_impact_n_uncalibrated': result.get(
                 'market_impact_n_uncalibrated', 0,
+            ),
+            'market_impact_n_rejected': result.get(
+                'market_impact_n_rejected', 0,
             ),
         }
         sys.stdout.write(json.dumps(report) + '\n')
