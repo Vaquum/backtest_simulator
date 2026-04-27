@@ -225,7 +225,7 @@ def _resolve_decoder(args: argparse.Namespace) -> tuple[int, Decimal, Path, int]
         return args.decoder_id, _kelly_for_decoder(exp_dir, args.decoder_id), exp_dir, args.decoder_id
     if args.input_from_file is None:
         ensure_trained(args.n_decoders)
-    picks = pick_decoders(
+    picks, _ = pick_decoders(
         args.n_decoders,
         input_from_file=args.input_from_file,
     )

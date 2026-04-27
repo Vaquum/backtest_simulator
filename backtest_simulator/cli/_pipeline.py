@@ -283,13 +283,18 @@ def pick_decoders(
     trade_count_min_q: float | None = None,
     net_return_min_q: float | None = None,
     input_from_file: str | None = None,
-) -> list[tuple[int, Decimal, Path, int]]:
+) -> tuple[list[tuple[int, Decimal, Path, int]], int]:
     """Quantile-filtered decoder pool, ranked by kelly desc / net-return desc.
 
-    Returns a list of `(perm_id, kelly_pct, exp_dir, display_id)`. In
-    file-mode (`input_from_file` given), each picked decoder is retrained
-    in its own sub-dir and `perm_id` is `0` (the single permutation in
-    that sub-experiment); `display_id` is the file's `id` column for UI.
+    Returns `(picks, candidate_pool_size)` where:
+      - `picks` is a list of `(perm_id, kelly_pct, exp_dir, display_id)`.
+        In file-mode each picked decoder is retrained in its own
+        sub-dir and `perm_id` is `0`; `display_id` is the file's `id`.
+      - `candidate_pool_size` is the raw candidate pool count (the
+        size of the search space the operator considered before any
+        filters). Used as the multiple-testing inflation factor for
+        DSR (slice #17 Task 17, codex round 2 P1: visible pick
+        count under-deflates when the search space is much larger).
     """
     import polars as pl
 
@@ -427,4 +432,4 @@ def pick_decoders(
             picks.append((0, kelly, sub_dir, file_id))
         else:
             picks.append((file_id, kelly, EXP_DIR, file_id))
-    return picks
+    return picks, before

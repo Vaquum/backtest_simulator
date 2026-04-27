@@ -1,3 +1,16 @@
+# v1.13.0
+
+- Slice #17 Task 17 — wire DSR + SPA + PBO into `bts sweep` summary. Pays down the −58% delta on commit `22ba23a` (which shipped 4 statistical-honesty primitives standalone with no wiring). CPCV is **deferred** until Task 16's path-aware `SignalsTable.lookup` is wired into the live predict path; without it CPCV math would be decorative (printed off the same per-run returns as the other stats, no real path-awareness).
+- New module `backtest_simulator/cli/_stats.py` — `daily_return_for_run`, `fetch_buy_hold_benchmark`, `compute_sweep_stats`. Plus `_safe_dsr` / `_safe_spa` / `_safe_pbo` wrappers that skip the underlying primitive cleanly when its assumptions don't hold (NaN on constant data; tied returns; insufficient obs).
+- `bts sweep` summary now emits up to 4 new lines: `sweep stats      n_runs_excluded_open_position=N` (when any), `sweep dsr        ...`, `sweep spa        ...`, `sweep pbo        ...`. Each stat line either reports the result OR `skipped: <reason>` so the operator sees WHY a stat didn't fire — silent suppression on `None` would risk the operator missing the skip.
+- **Codex round 1 P1 (DSR n_trials)**: `bts sweep --n-decoders 1 --n-permutations 1000` was reporting `n_trials=1` (only the visible pick count), under-deflating the selected winner. Fixed: `compute_sweep_stats` now takes `n_search_trials` (passed from `args.n_permutations`) — the multiple-testing inflation factor is the size of the candidate search space, not the visible pick count. Mutation-proof test pins the override flow.
+- **Codex round 1 P1 (open positions)**: `daily_return_for_run` was returning 0.0 for runs with trailing un-closed BUYs at window close, silently hiding losers and inflating apparent Sharpe. Fixed: returns `None` for trailing inventory; sweep accumulator excludes those runs from stats and surfaces `n_runs_excluded_open_position=N`. Live verification: a default 5-day sweep with the long-only template excluded 8 of 10 runs — the operator now sees this directly instead of reading flat zeros.
+- **Codex round 1 P1 (PBO degenerate ties)**: `_safe_pbo` was calling the primitive even when all decoder return series were pairwise identical; the primitive's deterministic tie ordering produces `pbo=0.000` (false "no overfitting"). Fixed: `_safe_pbo` skips with `None` when all decoder series are pairwise equal.
+- 12 stats unit tests pin the contracts: `daily_return_for_run` zero / paired / trailing-None branches, `compute_sweep_stats` skips on too-few-obs / runs DSR / runs SPA / runs PBO, DSR skips on constant returns, DSR deflates harder with more trials, PBO skips on tied returns, `n_search_trials` overrides decoder count, buy-hold benchmark math.
+- Module budget raises (markers in PR body): new file `cli/_stats.py` 220 (~206 actual), `cli/commands/sweep.py` 540 → 640 (+100; the orchestration + skip-message print blocks).
+- **Visible follow-up**: CPCV wiring depends on Task 16 (`SignalsTable.lookup` path-aware predict path). Until that lands, CPCV stays a standalone primitive without bts integration. Tracked.
+- `pyproject.toml` 1.12.1 → 1.13.0 (minor — new operator-visible bts sweep summary lines + new CLI module).
+
 # v1.12.1
 
 - Auditor round 2 on Task 29 (`9316995`) returned two P1 findings on the just-landed ATR wiring; this release closes both.

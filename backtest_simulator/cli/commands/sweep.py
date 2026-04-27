@@ -20,8 +20,14 @@ from backtest_simulator.cli._pipeline import (
     ensure_trained,
     pick_decoders,
     preflight_tunnel,
+    seed_price_at,
 )
 from backtest_simulator.cli._run_window import run_window_in_subprocess
+from backtest_simulator.cli._stats import (
+    compute_sweep_stats,
+    daily_return_for_run,
+    fetch_buy_hold_benchmark,
+)
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
 
 _SECOND_WEEK_APRIL_START: Final = datetime(2026, 4, 6, tzinfo=UTC).date()
@@ -101,7 +107,7 @@ def _run(args: argparse.Namespace) -> int:
     if args.trades_q_range is not None:
         lo_str, hi_str = args.trades_q_range.split(',')
         trades_q_range = (float(lo_str), float(hi_str))
-    picks = pick_decoders(
+    picks, candidate_pool_size = pick_decoders(
         args.n_decoders,
         trades_q_range=trades_q_range,
         tp_min_q=args.tp_min_q,
@@ -153,8 +159,21 @@ def _run(args: argparse.Namespace) -> int:
     # Task 29). Simple totals across runs.
     sweep_atr_n_rejected_total = 0
     sweep_atr_n_uncalibrated_total = 0
+    # Slice #17 Task 17 (DSR + PBO + SPA portion). Per-decoder
+    # daily-return scalars feed `compute_sweep_stats` after the
+    # sweep finishes. Stored per (decoder, day_idx) so day-aligned
+    # stats can drop only the days where ANY decoder had trailing
+    # inventory (codex round 2 P1: misaligned per-decoder lists
+    # let DSR/PBO truncate-by-position over different dates,
+    # producing clean-looking but wrong stats). CPCV is deferred
+    # until Task 16's path-aware `SignalsTable.lookup` is wired
+    # into the live predict path; without it CPCV math would be
+    # decorative.
+    decoder_day_returns: dict[str, dict[int, float]] = {}
+    n_runs_with_trailing_inventory = 0
     for perm_id, kelly, exp_dir, display_id in picks:
-        for day in days:
+        decoder_day_returns[str(display_id)] = {}
+        for day_idx, day in enumerate(days):
             window_start = datetime.combine(day.date(), hours_start, tzinfo=UTC)
             window_end = datetime.combine(day.date(), hours_end, tzinfo=UTC)
             day_label = day.date().isoformat()
@@ -250,6 +269,19 @@ def _run(args: argparse.Namespace) -> int:
             )
             sweep_atr_n_rejected_total += atr_rejected
             sweep_atr_n_uncalibrated_total += atr_uncal
+            # Accumulate per (decoder, day_idx) daily return for
+            # Task 17 post-sweep stats. None means trailing
+            # inventory at window close — don't pretend unrealised
+            # PnL is a 0 return; codex round 1 P1. Storing per
+            # day_idx keeps decoders alignable later — if ANY
+            # decoder has trailing on day X, day X is dropped from
+            # all decoders so DSR/PBO/SPA see same-date returns
+            # (codex round 2 P1).
+            day_return = daily_return_for_run(trades, declared_stops)
+            if day_return is None:
+                n_runs_with_trailing_inventory += 1
+            else:
+                decoder_day_returns[str(display_id)][day_idx] = day_return
             sweep_n_limit_total += n_limit
             sweep_n_limit_full += n_limit_full
             sweep_n_limit_partial += n_limit_partial
@@ -321,7 +353,104 @@ def _run(args: argparse.Namespace) -> int:
     _print_sweep_atr_summary(
         sweep_atr_n_rejected_total, sweep_atr_n_uncalibrated_total,
     )
+    # Align decoders by day: drop any day where ANY decoder had
+    # trailing inventory. This guarantees DSR/PBO/SPA see same-
+    # date returns for every decoder (codex round 2 P1).
+    all_decoder_ids = list(decoder_day_returns.keys())
+    clean_day_indices = [
+        day_idx for day_idx in range(len(days))
+        if all(
+            day_idx in decoder_day_returns[d] for d in all_decoder_ids
+        )
+    ]
+    per_decoder_returns: dict[str, list[float]] = {
+        d: [decoder_day_returns[d][idx] for idx in clean_day_indices]
+        for d in all_decoder_ids
+    }
+    clean_days = [days[i] for i in clean_day_indices]
+    # n_search_trials = max(operator's --n-permutations, the
+    # actual candidate pool size from `pick_decoders`). The pool
+    # size handles cached-mode + --input-from-file where
+    # `args.n_permutations` doesn't reflect the real search
+    # space (codex round 2 P1).
+    n_search_trials = max(
+        int(args.n_permutations), int(candidate_pool_size),
+    )
+    _print_sweep_stats_summary(
+        per_decoder_returns, clean_days, hours_start, hours_end,
+        n_search_trials=n_search_trials,
+        n_runs_with_trailing_inventory=n_runs_with_trailing_inventory,
+    )
     return 0
+
+
+def _print_sweep_stats_summary(
+    per_decoder_returns: dict[str, list[float]],
+    days: list[datetime], hours_start: dtime, hours_end: dtime,
+    *, n_search_trials: int, n_runs_with_trailing_inventory: int,
+) -> None:
+    """Slice #17 Task 17 — DSR + PBO + SPA summary lines.
+
+    Each line either reports the result OR a `skipped: <reason>`
+    string so the operator knows WHY a stat didn't fire. `days`
+    here is the day-aligned subset (codex round 2 P1: only days
+    where ALL decoders cleanly closed feed the stats — otherwise
+    DSR/PBO truncate-by-position over different dates).
+    `n_runs_with_trailing_inventory` is the per-(decoder, day)
+    pair count of runs with open positions at window close — the
+    primary "what's been excluded" signal.
+    """
+    n_clean_days = len(days)
+    if not per_decoder_returns or n_clean_days < 2:
+        print(
+            f'sweep stats      skipped: '
+            f'{n_runs_with_trailing_inventory} run(s) had trailing '
+            f'inventory at window close, only {n_clean_days} '
+            f'day-aligned observation(s)',
+        )
+        return
+    print(
+        f'sweep stats      n_runs_excluded_open_position='
+        f'{n_runs_with_trailing_inventory}  clean_days={n_clean_days}',
+    )
+    benchmark = fetch_buy_hold_benchmark(
+        days, hours_start, hours_end, seed_price_at=seed_price_at,
+    )
+    stats = compute_sweep_stats(
+        per_decoder_returns, benchmark, n_search_trials=n_search_trials,
+    )
+    if stats.dsr is None:
+        print(
+            f'sweep dsr        skipped: constant or pathological '
+            f'returns (sharpe_best={stats.best_sharpe})',
+        )
+    else:
+        print(
+            f'sweep dsr        sharpe_best={stats.best_sharpe:.3f}  '
+            f'decoder={stats.best_decoder}  n_trials={n_search_trials}  '
+            f'deflated={stats.dsr.deflated_sharpe:.3f}  '
+            f'p_value={stats.dsr.p_value:.3f}',
+        )
+    if stats.spa is None:
+        print('sweep spa        skipped: empty or mismatched candidate set')
+    else:
+        print(
+            f'sweep spa        statistic={stats.spa.statistic:.3f}  '
+            f'p_value={stats.spa.p_value:.3f}  '
+            f'n_candidates={stats.spa.n_candidates}',
+        )
+    if stats.pbo is None:
+        print(
+            f'sweep pbo        skipped: needs >=2 decoders + >=4 days + '
+            f'non-tied returns (have {stats.n_decoders} dec x '
+            f'{stats.n_observations} obs)',
+        )
+    else:
+        print(
+            f'sweep pbo        prob_overfit={stats.pbo.pbo:.3f}  '
+            f'n_splits={stats.pbo.n_splits}  '
+            f'n_strategies={stats.pbo.n_strategies}',
+        )
 
 
 def _print_sweep_atr_summary(
