@@ -257,3 +257,226 @@ def test_market_impact_calibration_rejects_threshold_out_of_range() -> None:
             trades=trades, bucket_minutes=1,
             threshold_fraction=Decimal('-0.1'),
         )
+
+
+# `evaluate_rolling` — the rolling-slice contract used by the bts
+# venue path. Centralising the qty-to-bps math on the model means
+# these tests protect SimulatedVenueAdapter._record_market_impact_pre_fill
+# from drift: any future change to the math fails here, not silently
+# in the venue. The audit on commit fe00024 explicitly required this.
+
+def _slice_from_bucket(
+    trades: pl.DataFrame, bucket_start: datetime, bucket_minutes: int,
+) -> pl.DataFrame:
+    """Extract a per-minute slice in the convention `evaluate_rolling` expects."""
+    from datetime import timedelta
+    end = bucket_start + timedelta(minutes=bucket_minutes)
+    return trades.filter(
+        (pl.col('datetime') >= bucket_start)
+        & (pl.col('datetime') < end),
+    )
+
+
+def test_market_impact_rolling_empty_slice_is_uncalibrated() -> None:
+    """Empty slice returns None — distinct from a zero-impact decision."""
+    empty = pl.DataFrame({
+        'datetime': pl.Series('datetime', [], dtype=pl.Datetime('us', 'UTC')),
+        'price': pl.Series('price', [], dtype=pl.Float64),
+        'quantity': pl.Series('quantity', [], dtype=pl.Float64),
+    })
+    decision = MarketImpactModel.evaluate_rolling(
+        qty=Decimal('1'), trades_pre_submit=empty,
+        threshold_fraction=Decimal('0.1'),
+    )
+    assert decision is None, (
+        f'empty slice must return None (uncalibrated signal); got {decision}'
+    )
+
+
+def test_market_impact_rolling_zero_volume_is_uncalibrated() -> None:
+    """Slice with zero summed volume returns None."""
+    zero_vol = pl.DataFrame({
+        'datetime': [datetime(2024, 1, 1, 12, 0, tzinfo=UTC)],
+        'price': [70000.0],
+        'quantity': [0.0],
+    })
+    decision = MarketImpactModel.evaluate_rolling(
+        qty=Decimal('1'), trades_pre_submit=zero_vol,
+        threshold_fraction=Decimal('0.1'),
+    )
+    assert decision is None
+
+
+def test_market_impact_rolling_non_positive_first_price_is_uncalibrated() -> None:
+    """First-row non-positive price returns None — guards divide-by-zero."""
+    bad_price = pl.DataFrame({
+        'datetime': [datetime(2024, 1, 1, 12, 0, tzinfo=UTC)],
+        'price': [0.0],
+        'quantity': [1.0],
+    })
+    decision = MarketImpactModel.evaluate_rolling(
+        qty=Decimal('1'), trades_pre_submit=bad_price,
+        threshold_fraction=Decimal('0.1'),
+    )
+    assert decision is None
+
+
+def test_market_impact_rolling_small_qty_below_threshold() -> None:
+    """qty=1% of slice volume → impact > 0, flag=False."""
+    trades = _load_trades()
+    model = MarketImpactModel.calibrate(
+        trades=trades, bucket_minutes=1,
+        threshold_fraction=Decimal('0.1'),
+    )
+    middle_buckets = [
+        b for b in model.buckets
+        if b.total_volume > Decimal('0.5') and b.price_range_bps > Decimal('0')
+    ]
+    assert middle_buckets
+    bucket = middle_buckets[len(middle_buckets) // 2]
+    sl = _slice_from_bucket(trades, bucket.bucket_start, 1)
+    qty = bucket.total_volume * Decimal('0.01')
+    decision = MarketImpactModel.evaluate_rolling(
+        qty=qty, trades_pre_submit=sl,
+        threshold_fraction=Decimal('0.1'),
+    )
+    assert decision is not None
+    assert decision.flag is False
+    assert decision.impact_bps > Decimal('0')
+
+
+def test_market_impact_rolling_oversize_qty_flags() -> None:
+    """qty > threshold_fraction * volume → flag=True."""
+    trades = _load_trades()
+    model = MarketImpactModel.calibrate(
+        trades=trades, bucket_minutes=1,
+        threshold_fraction=Decimal('0.1'),
+    )
+    middle_buckets = [
+        b for b in model.buckets
+        if b.total_volume > Decimal('0.5') and b.price_range_bps > Decimal('0')
+    ]
+    assert middle_buckets
+    bucket = middle_buckets[len(middle_buckets) // 2]
+    sl = _slice_from_bucket(trades, bucket.bucket_start, 1)
+    qty = bucket.total_volume * Decimal('0.5')
+    decision = MarketImpactModel.evaluate_rolling(
+        qty=qty, trades_pre_submit=sl,
+        threshold_fraction=Decimal('0.1'),
+    )
+    assert decision is not None
+    assert decision.flag is True
+
+
+def test_market_impact_rolling_doubling_qty_doubles_impact() -> None:
+    """Linear interpolation: 2x qty → 2x impact_bps within one slice."""
+    trades = _load_trades()
+    model = MarketImpactModel.calibrate(
+        trades=trades, bucket_minutes=1,
+        threshold_fraction=Decimal('0.1'),
+    )
+    middle_buckets = [
+        b for b in model.buckets
+        if b.total_volume > Decimal('0.5') and b.price_range_bps > Decimal('0')
+    ]
+    assert middle_buckets
+    bucket = middle_buckets[len(middle_buckets) // 2]
+    sl = _slice_from_bucket(trades, bucket.bucket_start, 1)
+    qty1 = bucket.total_volume * Decimal('0.01')
+    qty2 = qty1 * Decimal('2')
+    d1 = MarketImpactModel.evaluate_rolling(
+        qty=qty1, trades_pre_submit=sl, threshold_fraction=Decimal('0.1'),
+    )
+    d2 = MarketImpactModel.evaluate_rolling(
+        qty=qty2, trades_pre_submit=sl, threshold_fraction=Decimal('0.1'),
+    )
+    assert d1 is not None and d2 is not None
+    ratio = d2.impact_bps / d1.impact_bps
+    assert Decimal('1.99') < ratio < Decimal('2.01'), (
+        f'doubling qty must double impact_bps; ratio={ratio}'
+    )
+
+
+def test_market_impact_rolling_volume_denominator() -> None:
+    """Same qty across two slices with different volumes → impact ∝ 1/volume.
+
+    A volume-blind implementation that uses `qty * range_bps`
+    would scale with the slice's range but not with volume,
+    failing this. The honest formula is
+    `impact_bps = qty / total_volume * price_range_bps`.
+    """
+    trades = _load_trades()
+    model = MarketImpactModel.calibrate(
+        trades=trades, bucket_minutes=1,
+        threshold_fraction=Decimal('0.1'),
+    )
+    middle_buckets = [
+        b for b in model.buckets
+        if b.total_volume > Decimal('0.5') and b.price_range_bps > Decimal('0')
+    ]
+    assert len(middle_buckets) >= 2
+    b1 = middle_buckets[len(middle_buckets) // 2]
+    b2 = next(
+        (b for b in middle_buckets if b is not b1
+         and b.total_volume != b1.total_volume),
+        None,
+    )
+    assert b2 is not None
+    sl1 = _slice_from_bucket(trades, b1.bucket_start, 1)
+    sl2 = _slice_from_bucket(trades, b2.bucket_start, 1)
+    qty = min(b1.total_volume, b2.total_volume) * Decimal('0.01')
+    d1 = MarketImpactModel.evaluate_rolling(
+        qty=qty, trades_pre_submit=sl1, threshold_fraction=Decimal('0.1'),
+    )
+    d2 = MarketImpactModel.evaluate_rolling(
+        qty=qty, trades_pre_submit=sl2, threshold_fraction=Decimal('0.1'),
+    )
+    assert d1 is not None and d2 is not None
+    expected1 = qty / b1.total_volume * b1.price_range_bps
+    expected2 = qty / b2.total_volume * b2.price_range_bps
+    tol1 = abs(expected1) * Decimal('0.01') + Decimal('1e-12')
+    tol2 = abs(expected2) * Decimal('0.01') + Decimal('1e-12')
+    assert abs(d1.impact_bps - expected1) <= tol1
+    assert abs(d2.impact_bps - expected2) <= tol2
+    # concurrent_volume must surface the slice's actual volume,
+    # not a cached or class-level value.
+    assert d1.concurrent_volume == b1.total_volume
+    assert d2.concurrent_volume == b2.total_volume
+
+
+def test_market_impact_rolling_matches_evaluate_when_slice_equals_bucket() -> None:
+    """Rolling on a slice equal to one calibrated bucket equals `evaluate(t)`.
+
+    Bridge contract: a slice that spans exactly one bucket-minute
+    aligned at the bucket boundary must produce the same
+    decision as the wall-clock `evaluate(t)` at that bucket.
+    Anchors `evaluate_rolling` against the existing `evaluate`
+    behaviour the bts venue path used to call.
+    """
+    trades = _load_trades()
+    bucket_minutes = 1
+    model = MarketImpactModel.calibrate(
+        trades=trades, bucket_minutes=bucket_minutes,
+        threshold_fraction=Decimal('0.1'),
+    )
+    middle_buckets = [
+        b for b in model.buckets
+        if b.total_volume > Decimal('0.5') and b.price_range_bps > Decimal('0')
+    ]
+    assert middle_buckets
+    bucket = middle_buckets[len(middle_buckets) // 2]
+    sl = _slice_from_bucket(trades, bucket.bucket_start, bucket_minutes)
+    qty = bucket.total_volume * Decimal('0.05')
+    rolling = MarketImpactModel.evaluate_rolling(
+        qty=qty, trades_pre_submit=sl,
+        threshold_fraction=Decimal('0.1'),
+    )
+    via_evaluate = model.evaluate(
+        qty=qty, mid=Decimal('42700'), t=bucket.bucket_start,
+    )
+    assert rolling is not None
+    # Both paths share `_impact_from_bucket`, so the
+    # impact_bps / flag / concurrent_volume must match exactly.
+    assert rolling.impact_bps == via_evaluate.impact_bps
+    assert rolling.concurrent_volume == via_evaluate.concurrent_volume
+    assert rolling.flag == via_evaluate.flag

@@ -1,3 +1,13 @@
+# v1.10.1
+
+- Audit Finding 1 on commit fe00024 / v1.10.0: the venue had stopped wiring `MarketImpactModel` and was reimplementing the rolling strict-causal math inline. Two sources of truth — standalone model tests no longer protected the bts sweep path. The audit's required shape: put the rolling path on the model API itself, and call it from the venue. This release does that.
+- New `MarketImpactModel.evaluate_rolling(qty, trades_pre_submit, threshold_fraction)` classmethod. Treats `trades_pre_submit` as a single bucket (no wall-clock truncation — that was the v1.9.0 truncation gap that motivated rolling in the first place). Returns `MarketImpactDecision | None`; `None` is the explicit "uncalibrated" signal — empty / zero-volume / non-positive-first-price slice. Distinct from a zero-impact decision; never recorded as a sample.
+- New module-level `_impact_from_bucket(qty, total_volume, price_range_bps, threshold_fraction)` helper holds the linear-interpolation math (`qty / total_volume * price_range_bps`, flag = qty > threshold * total_volume). Both `evaluate` and `evaluate_rolling` end at this helper. **Single source of truth.** Future drift fails the model's tests, not the venue's.
+- `SimulatedVenueAdapter._record_market_impact_pre_fill` refactored to call the model. The venue now owns only what it alone can know: tape fetch, strict-causal `time < submit_time` post-fetch filter, column rename `time`/`qty` → `datetime`/`quantity`, and the decision-to-telemetry mapping. Zero math left in the venue. Method shrinks from ~95 lines to ~30.
+- 8 new tests in `tests/honesty/test_market_impact.py` for `evaluate_rolling`: empty / zero-volume / non-positive-first-price → None; small-qty flag=False; oversize-qty flag=True; doubling-qty doubles impact (linearity); same-qty across two slices with different volumes → impact ∝ 1/volume (rules out volume-blind impl); bridge — slice spanning exactly one calibrated bucket produces the same decision as `evaluate(t)`. 19 market_impact tests total (was 11).
+- Numerical equivalence with v1.10.0 verified by codex (same strict-pre-submit slice, same `sum(quantity)`, same first price, same range, same `qty / volume * range_bps`, same flag rule). The `imp` field, sweep summary, and JSON schema are unchanged byte-for-byte; the mover is the contract surface.
+- `pyproject.toml` 1.10.0 → 1.10.1 (patch — internal architectural fix, no operator-visible behaviour change).
+
 # v1.10.0
 
 - Audit follow-ups on Task 31 (MarketImpactModel wiring v1.9.0). Codex round 2 caught two P1 issues + one P2 stale doc; this release closes all three.

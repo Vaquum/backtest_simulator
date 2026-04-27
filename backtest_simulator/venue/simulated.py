@@ -439,97 +439,75 @@ class SimulatedVenueAdapter:
         """STRICT-CAUSAL per-submit market-impact gate.
 
         Fetches `[submit_time - bucket_minutes, submit_time)` of
-        tape — strictly pre-submit, no future trades — and
-        computes the trailing-window impact estimate inline:
+        tape — strictly pre-submit — and delegates the qty-to-bps
+        math to `MarketImpactModel.evaluate_rolling`. The venue
+        owns:
 
-          - `total_volume` = sum of `qty` in the trailing slice.
-          - `price_range_bps` = (max_price - min_price) /
-            first_price * 10000 over the slice.
-          - `impact_bps` = `order.qty / total_volume *
-            price_range_bps` (the linear-interpolation shape
-            from `MarketImpactModel`).
-          - `flag` = `order.qty >
-            threshold_fraction * total_volume`.
+          1. The tape fetch.
+          2. The strict-causal `time < submit_time` filter (the
+             feed's `_get_trades_for_venue` may return an
+             inclusive range depending on backend; this filter
+             enforces the half-open contract).
+          3. The column rename to the model's convention
+             (`time`/`qty` → `datetime`/`quantity`).
+          4. The decision-to-telemetry mapping (record bps,
+             increment `n_flagged` / `n_rejected`, return True
+             when `strict_impact_policy` rejects).
+
+        The model owns the linear-interpolation math
+        (`total_volume`, `price_range_bps`, `impact_bps`,
+        `flag`). A `None` return from the model is the
+        "uncalibrated" signal — empty slice, zero-volume, or
+        non-positive first price. Distinct from a zero-impact
+        decision (which only arises against a well-formed
+        bucket); never recorded as a sample.
 
         When `strict_impact_policy=True` AND the order is
-        flagged, returns True so `submit_order` can route to
+        flagged, returns True so `submit_order` routes to
         REJECTED before `walk_trades` runs — the operator-visible
         "pre-fill gate" the auditor's Task 31 contract calls
         for. Returns False otherwise (measurement-only
         observability path).
 
-        Why inlined instead of `MarketImpactModel.calibrate`?
-        The standalone model's `calibrate` truncates trades to
-        wall-clock minute boundaries (`dt.truncate('1m')`), so a
-        rolling `[submit_time - 1m, submit_time)` slice for a
-        non-boundary submit (e.g. `12:31:15`) gets split across
-        two buckets: 12:30 (45s of trades) and 12:31 (15s of
-        trades). The model's `evaluate` then matches the bucket
-        containing `submit_time - 1µs` and uses only that
-        partial denominator. The audit's pre-fill estimate
-        needs the FULL trailing minute as one bucket; inlining
-        the math against the rolling slice (no truncation)
-        gives that. The standalone primitive still ships for
-        direct operator use (notebook calibration / forensics)
-        — the wall-clock bucketing IS the right shape there.
-        Codex round 2 P2 caught the truncation gap.
-
-        Strict-causal contract: trades printed exactly at
-        `submit_time` are EXCLUDED via `pl.col('time') <
-        submit_time`. The feed's `_get_trades_for_venue` may
-        return inclusive ranges depending on backend (SQL
-        BETWEEN, Polars between(closed='both')) — filter
-        post-fetch to enforce the exclusive end. Codex round 2
-        P1 caught this.
-
-        Empty / pathological slices land in `n_uncalibrated`
-        rather than recording zero impact (would silently weight
-        the realised aggregate downward by calibration gaps).
-        Distinct from "real zero" — a tiny order against a
-        well-traded minute legitimately maps to ~0 bps with
-        flag=False.
+        Why a rolling slice rather than the model's
+        wall-clock-bucket `evaluate(t)`? The standalone
+        `calibrate` truncates trades to wall-clock minute
+        boundaries; a non-boundary submit (e.g. `12:31:15`)
+        with a 1-minute window would have its `[submit - 1m,
+        submit)` slice split across the 12:30 and 12:31
+        buckets, and `evaluate` would match only the partial
+        bucket containing `submit_time - 1µs`. The pre-fill
+        estimate needs the FULL trailing minute as one bucket
+        — exactly what `evaluate_rolling` provides.
 
         No-op when `market_impact_bucket_minutes is None`.
         """
         if self._market_impact_bucket_minutes is None:
             return False
         from datetime import timedelta
+
+        from backtest_simulator.honesty.market_impact import (
+            MarketImpactModel,
+        )
         bucket = self._market_impact_bucket_minutes
         raw = self._feed._get_trades_for_venue(
             symbol, submit_time - timedelta(minutes=bucket),
             submit_time,
             venue_lookahead_seconds=0,
         )
-        # Strict-causal: exclude any trade stamped exactly at
-        # submit_time. The feed's range query may be inclusive;
-        # this filter enforces the half-open contract.
-        pre = raw.filter(pl.col('time') < submit_time)
-        if pre.is_empty():
+        pre = raw.filter(pl.col('time') < submit_time).rename({
+            'time': 'datetime', 'qty': 'quantity',
+        })
+        decision = MarketImpactModel.evaluate_rolling(
+            qty=order.qty,
+            trades_pre_submit=pre,
+            threshold_fraction=self._market_impact_threshold_fraction,
+        )
+        if decision is None:
             self._market_impact_n_uncalibrated += 1
             return False
-        total_volume = Decimal(str(pre['qty'].sum()))
-        if total_volume <= Decimal('0'):
-            self._market_impact_n_uncalibrated += 1
-            return False
-        price_first_raw = pre.head(1)['price'].item()
-        if price_first_raw is None or price_first_raw <= 0:
-            self._market_impact_n_uncalibrated += 1
-            return False
-        price_first = Decimal(str(price_first_raw))
-        price_max = Decimal(str(pre['price'].max()))
-        price_min = Decimal(str(pre['price'].min()))
-        price_range_bps = (
-            (price_max - price_min) / price_first * Decimal('10000')
-        )
-        impact_bps = (
-            order.qty / total_volume * price_range_bps
-        )
-        flag = (
-            order.qty
-            > self._market_impact_threshold_fraction * total_volume
-        )
-        self._market_impact_bps_samples.append(impact_bps)
-        if flag:
+        self._market_impact_bps_samples.append(decision.impact_bps)
+        if decision.flag:
             self._market_impact_n_flagged += 1
             if self._strict_impact_policy:
                 self._market_impact_n_rejected += 1
