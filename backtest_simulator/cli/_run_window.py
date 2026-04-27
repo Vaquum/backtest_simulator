@@ -180,6 +180,7 @@ def run_window_in_process(
         sqlite_path=work / 'event_spine.sqlite',
         jsonl_path=spine_jsonl,
     )
+    book_gap = adapter.book_gap_snapshot()
     account = adapter.history('bts-sweep')
     trade_tuples = [
         (
@@ -289,6 +290,17 @@ def run_window_in_process(
         'n_atr_uncalibrated': launcher.n_atr_uncalibrated,
         'event_spine_jsonl': str(spine_jsonl),
         'event_spine_n_events': spine_n_events,
+        # Slice #17 Task 11 — book-gap instrumentation. The venue's
+        # BookGapInstrument records the time between the last sub-
+        # stop tape tick and the trigger tick on every STOP/TP fill.
+        # n_observed=0 means no stop fired in this run (e.g.
+        # long_on_signal emits MARKET entries / exits, so default
+        # bts runs show zero). Non-zero values surface a separate
+        # line on `bts run` text mode and fields on
+        # `--output-format json`.
+        'book_gap_max_seconds': float(book_gap.max_stop_cross_to_trade_seconds),
+        'book_gap_n_observed': int(book_gap.n_stops_observed),
+        'book_gap_p95_seconds': float(book_gap.p95_stop_cross_to_trade_seconds),
     }
 
 

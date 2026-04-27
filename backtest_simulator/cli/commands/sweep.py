@@ -250,6 +250,13 @@ def _run(args: argparse.Namespace) -> int:
     # Task 29). Simple totals across runs.
     sweep_atr_n_rejected_total = 0
     sweep_atr_n_uncalibrated_total = 0
+    # Slice #17 Task 11 — book-gap aggregates. max-of-max across
+    # runs (the worst stop-cross latency the sweep observed) plus
+    # total stops (denominator). p95 is intentionally NOT
+    # aggregated from per-run p95s — that would require carrying
+    # raw samples or a mergeable histogram (codex round 1).
+    sweep_book_gap_max_seconds = 0.0
+    sweep_book_gap_total_stops = 0
     # Slice #17 Task 17 (DSR + PBO + SPA portion). Per-decoder
     # daily-return scalars feed `compute_sweep_stats` after the
     # sweep finishes. Stored per (decoder, day_idx) so day-aligned
@@ -360,6 +367,12 @@ def _run(args: argparse.Namespace) -> int:
             )
             sweep_atr_n_rejected_total += atr_rejected
             sweep_atr_n_uncalibrated_total += atr_uncal
+            # Book-gap aggregation: max-of-max + total stops.
+            run_book_gap_max = float(result.get('book_gap_max_seconds', 0.0))
+            run_book_gap_n = int(result.get('book_gap_n_observed', 0))
+            if run_book_gap_max > sweep_book_gap_max_seconds:
+                sweep_book_gap_max_seconds = run_book_gap_max
+            sweep_book_gap_total_stops += run_book_gap_n
             # Accumulate per (decoder, day_idx) daily return for
             # Task 17 post-sweep stats. None means trailing
             # inventory at window close — don't pretend unrealised
@@ -443,6 +456,10 @@ def _run(args: argparse.Namespace) -> int:
     )
     _print_sweep_atr_summary(
         sweep_atr_n_rejected_total, sweep_atr_n_uncalibrated_total,
+    )
+    _print_sweep_book_gap_summary(
+        max_seconds=sweep_book_gap_max_seconds,
+        total_stops=sweep_book_gap_total_stops,
     )
     # Align decoders by day: drop any day where ANY decoder had
     # trailing inventory. This guarantees DSR/PBO/SPA see same-
@@ -718,6 +735,33 @@ def _print_sweep_stats_summary(
     # the full per-decoder series differ. `sweep cpcv_pbo` is the
     # honest replacement (printed below) — it skips per-path on IS
     # and OOS rank ties and consumes `CpcvPaths` directly.
+
+
+def _print_sweep_book_gap_summary(
+    *, max_seconds: float, total_stops: int,
+) -> None:
+    """Slice #17 Task 11 — book-gap one-line sweep summary.
+
+    Surfaces the worst stop-cross-to-trade latency observed across
+    all (decoder, day) runs in the sweep. `total_stops` is the
+    denominator. When 0, no STOP/TP order fired anywhere in this
+    sweep — print a skip line so the operator knows the metric
+    didn't have data, not that it observed zero gap (codex round 1
+    P1 wording: phrase as "no STOP/TP trigger fills observed",
+    not "no risk events").
+    """
+    if total_stops <= 0:
+        print(
+            'sweep book_gap   skipped: no STOP/TP trigger fills '
+            'observed (default long_on_signal template uses MARKET '
+            'orders; this metric activates when strategies emit '
+            'STOP/TP orders)',
+        )
+        return
+    print(
+        f'sweep book_gap   max_seconds={max_seconds:.3f}  '
+        f'total_stops={total_stops}',
+    )
 
 
 def _print_sweep_atr_summary(

@@ -14,13 +14,16 @@ with a wide max gap is the smoke signal for a venue regression.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
+import polars as pl
 import pytest
 
 from backtest_simulator.honesty.book_gap import (
     BookGapInstrument,
     BookGapMetric,
 )
+from backtest_simulator.venue.types import PendingOrder
 
 _T0 = datetime(2026, 4, 20, 0, 0, tzinfo=UTC)
 
@@ -153,3 +156,101 @@ def test_book_gap_zero_gap_is_recorded() -> None:
     assert snap.n_stops_observed == 1
     assert snap.max_stop_cross_to_trade_seconds == 0.0
     assert snap.p95_stop_cross_to_trade_seconds == 0.0
+
+
+def _stop_walk_window(
+    times_seconds: list[float], prices: list[str],
+) -> pl.DataFrame:
+    """Build a tiny polars DataFrame for `_walk_stop` testing."""
+    rows = list(zip(times_seconds, prices, strict=True))
+    return pl.DataFrame({
+        'time': [_T0 + timedelta(seconds=t) for t, _ in rows],
+        'price': [p for _, p in rows],
+        'qty': ['1.0'] * len(rows),
+    }).with_columns(pl.col('time').dt.replace_time_zone('UTC'))
+
+
+def _make_stop_order(*, side: str, stop_price: str) -> PendingOrder:
+    return PendingOrder(
+        order_id='test-id',
+        side=side, order_type='STOP_LOSS',
+        qty=Decimal('1.0'),
+        limit_price=None, stop_price=Decimal(stop_price),
+        time_in_force='GTC',
+        submit_time=_T0, symbol='BTCUSDT',
+    )
+
+
+def test_walk_stop_records_gap_first_row_trigger() -> None:
+    """First-row trigger -> gap=0 but n_observed counts (codex round 1 P1).
+
+    When the very first post-submit tape tick already crosses the
+    stop, there is no prior sub-stop tick — `t_cross = t_first_trade`
+    by convention, and the recorded gap is 0. The primitive's
+    `n_stops_observed` MUST still increment to 1 so downstream
+    aggregates (sweep total_stops) reflect the trigger.
+
+    Mutation proof: dropping the zero-gap record would leave
+    n_observed=0 and the assert below fires.
+    """
+    from backtest_simulator.venue.fills import _walk_stop
+    from backtest_simulator.venue.filters import BinanceSpotFilters
+    instrument = BookGapInstrument()
+    # Single row at exactly stop price -> SELL stop triggers immediately.
+    window = _stop_walk_window([0.0], ['100.0'])
+    filters = BinanceSpotFilters.binance_spot('BTCUSDT')
+    fills = _walk_stop(
+        _make_stop_order(side='SELL', stop_price='100.0'),
+        window, filters, instrument,
+    )
+    assert len(fills) == 1, 'SELL stop at 100 should trigger on row at 100'
+    snap = instrument.snapshot()
+    assert snap.n_stops_observed == 1
+    assert snap.max_stop_cross_to_trade_seconds == 0.0
+
+
+def test_walk_stop_records_gap_multi_row_trigger() -> None:
+    """Gap = trigger_row.time - last_sub_stop_row.time (codex round 1 design).
+
+    With a SELL stop at 100, a tape sequence (101, 99) triggers on
+    the second row. The recorded gap equals (row[1].time - row[0].time)
+    in seconds — the time during which price could have crossed the
+    stop but no trade landed yet.
+
+    Mutation proof: if `_walk_stop` records `t_cross = row[1].time`
+    (instead of `row[0].time`), the gap would be 0 and this assert
+    fires. If `_walk_stop` skips the record entirely, n_observed
+    would be 0.
+    """
+    from backtest_simulator.venue.fills import _walk_stop
+    from backtest_simulator.venue.filters import BinanceSpotFilters
+    instrument = BookGapInstrument()
+    # row 0 at t=0 price 101 (above 100, no trigger);
+    # row 1 at t=5 price 99 (crosses 100 SELL stop).
+    window = _stop_walk_window([0.0, 5.0], ['101.0', '99.0'])
+    filters = BinanceSpotFilters.binance_spot('BTCUSDT')
+    fills = _walk_stop(
+        _make_stop_order(side='SELL', stop_price='100.0'),
+        window, filters, instrument,
+    )
+    assert len(fills) == 1
+    snap = instrument.snapshot()
+    assert snap.n_stops_observed == 1
+    assert snap.max_stop_cross_to_trade_seconds == 5.0, (
+        f'gap should be 5s (row[1]-row[0]); got '
+        f'{snap.max_stop_cross_to_trade_seconds}'
+    )
+
+
+def test_walk_stop_records_nothing_when_instrument_none() -> None:
+    """`book_gap_instrument=None` skips recording — backward compat."""
+    from backtest_simulator.venue.fills import _walk_stop
+    from backtest_simulator.venue.filters import BinanceSpotFilters
+    window = _stop_walk_window([0.0], ['100.0'])
+    filters = BinanceSpotFilters.binance_spot('BTCUSDT')
+    fills = _walk_stop(
+        _make_stop_order(side='SELL', stop_price='100.0'),
+        window, filters, None,
+    )
+    assert len(fills) == 1
+    # No instrument -> no record, no aggregate observable.

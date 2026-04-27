@@ -1,3 +1,29 @@
+# v1.16.0
+
+- Slice #17 Task 11 — wire `BookGapInstrument` into `bts run --output-format json` and `bts sweep` summary. Pays down the −62% delta on `4d2d36a` (`honesty/book_gap.py` shipped at 0 non-test callers; the slice spec promised "max stop-cross-to-trade gap reported per-run; surfaced via `bts run --output-format json`"). The metric activates when strategies emit STOP/TP orders — current default `long_on_signal` template uses MARKET orders, so default sweeps print an honest skip line.
+- New `WalkContext` dataclass in `venue/fills.py`: bundles `maker_model` + `trades_pre_submit` + `book_gap_instrument` so `walk_trades` keeps a 5-arg surface (ruff PLR0913 cap). Backward-compat for existing callers — defaults all to None; tests calling `walk_trades(order, trades, config, filters)` with 4 args stay unchanged.
+- `_walk_stop` in `venue/fills.py` records `record_stop_cross(t_cross=prev_time or row_time, t_first_trade=row_time)` on every STOP/TP trigger. `prev_time` is the LAST sub-stop tape tick; `row_time` is the trigger tick. First-row trigger → `t_cross = t_first_trade`, gap = 0, but the sample IS counted (codex round 1 P1: dropping zero-gap samples would let `n_stops_observed` lie about what happened).
+- `SimulatedVenueAdapter` holds one `BookGapInstrument` per adapter; `submit_order` passes it via `WalkContext`. New accessor `adapter.book_gap_snapshot() -> BookGapMetric` (max + n_observed + p95).
+- `bts run --output-format json`: replaces the old `'book_gap_max_seconds': None` placeholder with three real fields: `book_gap_max_seconds`, `book_gap_n_observed`, `book_gap_p95_seconds`.
+- `bts run` text mode: prints `   book_gap   max=Xs  p95=Ys  n_stops=N` line ONLY when `n_observed > 0`. Quiet runs aren't noised up — stays a single line on the existing per-run output for the typical MARKET-only case.
+- `bts sweep` summary: new `sweep book_gap   max_seconds=X.XXX  total_stops=N` line. Aggregates max-of-max across runs + sum of `n_observed` (codex round 1: do NOT aggregate p95 from per-run p95s — would require carrying raw samples or a mergeable histogram). When `total_stops == 0`: `sweep book_gap   skipped: no STOP/TP trigger fills observed (default long_on_signal template uses MARKET orders; this metric activates when strategies emit STOP/TP orders)`. The skip wording (codex round 1 P1) names the exact condition rather than the prior "no risk events" hand-wave.
+- 3 new tests in `tests/honesty/test_book_gap_instrumentation.py` (existing 6 unchanged):
+  * `test_walk_stop_records_gap_first_row_trigger` — gap=0, n=1 (mutation-proof for codex round 1 P1).
+  * `test_walk_stop_records_gap_multi_row_trigger` — gap = `row[1].time - row[0].time` exactly. Mutation-proof: if `t_cross = row[1].time` instead of `row[0].time`, gap drops to 0 and assert fires.
+  * `test_walk_stop_records_nothing_when_instrument_none` — `book_gap_instrument=None` skips recording cleanly (backward-compat for existing test callers).
+- **Codex round 1 P1s** (all addressed in the design before implementation):
+  1. Don't oversell default-sweep impact. The `long_on_signal` template emits MARKET orders so default sweeps print the skip line. The slice makes the STOP/TP path observable for strategies that use it; current default sweep economics are unchanged.
+  2. First-row trigger semantics. `gap=0` is COUNTED as one observation (`n_stops_observed += 1`) — dropping zero-gap samples would change the meaning of the counter.
+  3. Sweep skip wording. "no STOP/TP trigger fills observed" + the "default template uses MARKET orders" suffix names the exact reason rather than the prior generic "no risk events" framing.
+- **Codex round 2 P1**: removed `# noqa: PLC0415` directives from the new test helpers (AGENTS law 3 bans noqa). Hoisted local imports (`polars as pl`, `decimal.Decimal`, `PendingOrder`) to module-level.
+- Module budget raises (markers in PR body):
+  * `venue/fills.py` 220 → 240 (+20; `WalkContext` dataclass + `_walk_stop` instrumentation)
+  * `venue/simulated.py` 840 → 1100 (+260; clearing accumulated drift since the budget was last revisited; this slice's contribution is ~16 lines for `_book_gap_instrument` + `book_gap_snapshot()` accessor)
+  * `cli/commands/run.py` 380 → 420 (+40; book_gap text-mode line + JSON fields)
+  * `cli/commands/sweep.py` 1020 → 1080 (+60; `_print_sweep_book_gap_summary` + per-run accumulation)
+- Codex 5.5 xhigh approved across 3 audit rounds (1 design, 2 implementation, 3 final). 1 P1 found and fixed in each iteration.
+- `pyproject.toml` 1.15.0 → 1.16.0 (minor — 3 new fields on `bts run --output-format json`, new `sweep book_gap` line, new conditional text-mode line on `bts run`).
+
 # v1.15.0
 
 - Slice #17 Task 18 — wire `assert_ledger_parity` into `bts run`. Pays down the −62% delta on `4d2d36a` (`ledger_parity.py` shipped at zero non-test callers, slice spec promised "byte-identical event-spine assertion between backtest and paper-Praxis replay").

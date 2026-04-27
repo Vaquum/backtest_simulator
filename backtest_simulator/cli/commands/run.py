@@ -154,7 +154,14 @@ def _run(args: argparse.Namespace) -> int:
             'orders': result['orders'],
             'trades': trades_raw,
             'declared_stops': stops_raw,
-            'book_gap_max_seconds': None,
+            # Slice #17 Task 11 — book-gap instrumentation.
+            # `_walk_stop` records `(t_first_trade - t_cross)` for
+            # every STOP/TP trigger; the venue's BookGapInstrument
+            # aggregates per run. `n_observed=0` is the honest
+            # signal for a run that emitted only MARKET orders.
+            'book_gap_max_seconds': result.get('book_gap_max_seconds'),
+            'book_gap_n_observed': result.get('book_gap_n_observed', 0),
+            'book_gap_p95_seconds': result.get('book_gap_p95_seconds'),
             # Signed mean (directional). Operator should NOT cite
             # this as cost — see `slippage_realised_cost_bps`.
             'slippage_realised_bps': result.get('slippage_realised_bps'),
@@ -256,6 +263,17 @@ def _run(args: argparse.Namespace) -> int:
             'market_impact_n_uncalibrated', 0,
         )),
     )
+    # Slice #17 Task 11 — book-gap one-liner. Surface ONLY when at
+    # least one STOP/TP fired (codex round 1: skip noise on quiet
+    # runs). The line lives after print_run's cost-metric line so
+    # operators don't have to grep for it.
+    book_gap_n = int(result.get('book_gap_n_observed', 0))
+    if book_gap_n > 0:
+        print(
+            f'   book_gap   max={result.get("book_gap_max_seconds", 0.0):.3f}s  '
+            f'p95={result.get("book_gap_p95_seconds", 0.0):.3f}s  '
+            f'n_stops={book_gap_n}',
+        )
     return _maybe_assert_parity(args, result)
 
 

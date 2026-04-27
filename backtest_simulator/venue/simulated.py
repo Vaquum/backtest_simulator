@@ -25,11 +25,12 @@ from praxis.infrastructure.venue_adapter import (
 )
 
 from backtest_simulator.feed.protocol import VenueFeed
+from backtest_simulator.honesty.book_gap import BookGapInstrument, BookGapMetric
 from backtest_simulator.honesty.maker_fill import MakerFillModel
 from backtest_simulator.honesty.slippage import SlippageModel
 from backtest_simulator.venue import _adapter_internals as _I
 from backtest_simulator.venue.fees import FeeSchedule
-from backtest_simulator.venue.fills import walk_trades
+from backtest_simulator.venue.fills import WalkContext, walk_trades
 from backtest_simulator.venue.filters import BinanceSpotFilters
 from backtest_simulator.venue.types import FillModelConfig, FillResult, PendingOrder
 
@@ -129,6 +130,12 @@ class SimulatedVenueAdapter:
         self._market_impact_n_flagged: int = 0
         self._market_impact_n_uncalibrated: int = 0
         self._market_impact_n_rejected: int = 0
+        # Slice #17 Task 11 — book-gap instrumentation. One per
+        # adapter / per run; the venue passes this into walk_trades
+        # which threads it to `_walk_stop` for record_stop_cross
+        # calls on every STOP/TP trigger fill. Snapshot is read
+        # post-run via `book_gap_snapshot()`.
+        self._book_gap_instrument = BookGapInstrument()
         self._accounts: dict[str, _I.Account] = {}
         self._symbol_filters: dict[str, BinanceSpotFilters] = {filters.symbol: filters}
         self._next_order_seq = 1
@@ -735,6 +742,20 @@ class SimulatedVenueAdapter:
         """
         return self._slippage_n_excluded
 
+    def book_gap_snapshot(self) -> BookGapMetric:
+        """Slice #17 Task 11 — stop-cross-to-trade gap summary.
+
+        Returns the per-run aggregate of all `_walk_stop` triggers
+        seen during this adapter's lifetime: max gap (seconds), p95
+        gap, and the count of stops observed. n_observed=0 means
+        no STOP/TP order fired in this run (e.g. the long-only
+        template emits MARKET entries / exits, so the default
+        `bts run` shows zero observed). Non-zero values surface as
+        a separate line on `bts run` text output and as fields on
+        the `--output-format json` report.
+        """
+        return self._book_gap_instrument.snapshot()
+
     def history(self, account_id: str) -> _I.Account:
         """Return the Account (orders + trades) whether currently registered or not."""
         if account_id in self._accounts:
@@ -883,8 +904,11 @@ class SimulatedVenueAdapter:
             trades_pre_submit = None
         fills = walk_trades(
             order, trades, self._fill_config, symbol_filters,
-            maker_model=self._maker_fill_model,
-            trades_pre_submit=trades_pre_submit,
+            WalkContext(
+                maker_model=self._maker_fill_model,
+                trades_pre_submit=trades_pre_submit,
+                book_gap_instrument=self._book_gap_instrument,
+            ),
         )
         # Measure realised slippage against rolling mid; do NOT
         # adjust `fills` — the audit's P1 was that adjusting on top

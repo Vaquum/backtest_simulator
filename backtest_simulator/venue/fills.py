@@ -1,6 +1,7 @@
 """FillModel — strict-live-reality tape matching; fills at actual tape price, never at declared stop."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
@@ -11,7 +12,24 @@ from backtest_simulator.venue.filters import BinanceSpotFilters
 from backtest_simulator.venue.types import FillModelConfig, FillResult, PendingOrder
 
 if TYPE_CHECKING:
+    from backtest_simulator.honesty.book_gap import BookGapInstrument
     from backtest_simulator.honesty.maker_fill import MakerFillModel
+
+
+@dataclass(frozen=True)
+class WalkContext:
+    """Optional auxiliary inputs for `walk_trades`.
+
+    Bundles the three optional kw-only parameters (maker model,
+    pre-submit trades for queue calibration, book-gap instrument)
+    so `walk_trades` keeps a 5-argument surface — ruff's PLR0913
+    cap. Every field defaults to None so callers that don't need
+    a specific feature can omit it cleanly.
+    """
+
+    maker_model: MakerFillModel | None = None
+    trades_pre_submit: pl.DataFrame | None = None
+    book_gap_instrument: BookGapInstrument | None = None
 
 # Governing principle (from PR #15 body): backtest ≡ paper ≡ live. One
 # methodology. When the three environments disagree, the one that matches
@@ -40,9 +58,7 @@ def walk_trades(
     trades: pl.DataFrame,
     config: FillModelConfig,
     filters: BinanceSpotFilters,
-    *,
-    maker_model: MakerFillModel | None = None,
-    trades_pre_submit: pl.DataFrame | None = None,
+    context: WalkContext | None = None,
 ) -> list[FillResult]:
     """Match `order` against the historical `trades` stream — strict-live-reality.
 
@@ -70,16 +86,17 @@ def walk_trades(
     window = trades.filter(pl.col('time') >= submit_ts).sort('time')
     if window.is_empty():
         return []
+    ctx = context if context is not None else WalkContext()
     if order.order_type == 'MARKET':
         return _walk_market(order, window, filters)
     if order.order_type == 'LIMIT':
         return _walk_limit(
             order, window, filters,
-            maker_model=maker_model,
-            trades_pre_submit=trades_pre_submit,
+            maker_model=ctx.maker_model,
+            trades_pre_submit=ctx.trades_pre_submit,
         )
     if order.order_type in {'STOP_LOSS', 'STOP_LOSS_LIMIT', 'TAKE_PROFIT'}:
-        return _walk_stop(order, window, filters)
+        return _walk_stop(order, window, filters, ctx.book_gap_instrument)
     return []
 
 
@@ -264,7 +281,12 @@ def _walk_limit_legacy(
     return []
 
 
-def _walk_stop(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFilters) -> list[FillResult]:
+def _walk_stop(
+    order: PendingOrder,
+    window: pl.DataFrame,
+    filters: BinanceSpotFilters,
+    book_gap_instrument: BookGapInstrument | None = None,
+) -> list[FillResult]:
     # STOP_LOSS / STOP_LOSS_LIMIT / TAKE_PROFIT: the tape triggers the
     # stop on the first tick at or past `stop_price`. The fill lands
     # at THAT TICK'S ACTUAL PRICE — not at `stop_price` — because
@@ -279,18 +301,36 @@ def _walk_stop(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFi
     # the same as STOP_LOSS (fill at first-tick price) — strict LIMIT
     # semantics after trigger are a follow-up refinement. Conservative
     # choice: same fill path, same realism.
+    #
+    # Slice #17 Task 11 — book-gap instrumentation. When a
+    # `book_gap_instrument` is supplied, record the gap between the
+    # last sub-stop tape tick (`prev_time`) and the trigger tick
+    # (`row_time`). On a first-row trigger (no prior sub-stop tick),
+    # `t_cross = t_first_trade` and the recorded gap is 0 — the
+    # primitive's `n_stops_observed` still counts that as one
+    # observation (codex round 1 P1: dropping zero-gap samples
+    # would make `n_stops_observed` mean something other than
+    # "number of stop triggers observed").
     if order.stop_price is None:
         return []
     stop = order.stop_price
+    prev_time: datetime | None = None
     for row in window.iter_rows(named=True):
         px = Decimal(str(row['price']))
         triggered = (order.side == 'SELL' and px <= stop) or (order.side == 'BUY' and px >= stop)
         if triggered:
+            row_time = _ts(row['time'])
+            if book_gap_instrument is not None:
+                book_gap_instrument.record_stop_cross(
+                    t_cross=prev_time if prev_time is not None else row_time,
+                    t_first_trade=row_time,
+                )
             return [FillResult(
-                fill_time=_ts(row['time']),
+                fill_time=row_time,
                 fill_price=filters.round_price(px),
                 fill_qty=filters.round_qty(order.qty), is_maker=False, reason='stop_trigger',
             )]
+        prev_time = _ts(row['time'])
     return []
 
 
