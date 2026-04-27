@@ -11,6 +11,8 @@
 # between the two subcommands.
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -424,10 +426,40 @@ def pick_decoders(
         file_id = int(ranked['id'][i])
         kelly = Decimal(str(ranked['backtest_mean_kelly_pct'][i]))
         if input_from_file is not None:
-            sub_dir = WORK_DIR / f'trained_from_file/id_{file_id}'
             row = {k: ranked[k][i] for k in _PARAM_COLS}
             params = row_params(row)
-            print(f'  training file-id {file_id}  kelly={kelly}  ...', flush=True)
+            # Cache key includes source filename stem AND a content
+            # hash of the picked row's params. Without this, two
+            # different input files (e.g. `min.csv` vs `max.csv`)
+            # with the same `id` column silently aliased to the
+            # FIRST-cached training, even when the rows had
+            # completely different hyperparameters. The hash widens
+            # the key so different content produces a different
+            # sub_dir; the stem keeps the directory name human-
+            # readable. file_path is in scope from the
+            # input_from_file resolution above.
+            params_hash = hashlib.sha256(
+                json.dumps(
+                    {k: str(v) for k, v in sorted(params.items())},
+                    sort_keys=True,
+                ).encode('utf-8'),
+            ).hexdigest()
+            # Full 64-char SHA-256, NOT truncated to 8 (codex round-1
+            # P1: 32-bit truncation = ~65k birthday-paradox collision
+            # window; the saving in directory-name length is not
+            # worth the silent-alias risk).
+            sub_dir = (
+                WORK_DIR / 'trained_from_file'
+                / f'{file_path.stem}_id_{file_id}_{params_hash}'
+            )
+            # Surface a short prefix in the operator log so two
+            # nearby cache hits / misses are visually distinguishable
+            # without making the line unreadable.
+            print(
+                f'  training file-id {file_id} from {file_path.name} '
+                f'(params_hash={params_hash[:8]}...)  kelly={kelly}  ...',
+                flush=True,
+            )
             train_single_decoder(sub_dir, params)
             picks.append((0, kelly, sub_dir, file_id))
         else:

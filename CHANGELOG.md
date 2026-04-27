@@ -1,3 +1,13 @@
+# v1.16.1
+
+- **Operator-reported bug fix**: `bts sweep --input-from-file max.csv` silently aliased to a cached training from a prior `bts sweep --input-from-file min.csv` run. Cause: `pick_decoders` cache key in `cli/_pipeline.py` was `trained_from_file/id_{file_id}/` — keyed on `file_id` ALONE. Two different CSVs with the same `id` column collided; the FIRST-cached training was reused on subsequent runs, regardless of source file or row content.
+- Fix: cache key now includes `(a)` source file stem AND `(b)` full SHA-256 hash of the picked row's `_PARAM_COLS`. New shape: `trained_from_file/{file_path.stem}_id_{file_id}_{params_sha256_full}/`. Operator log surfaces the file + 8-char hash prefix: `training file-id 0 from max.csv (params_hash=0996319a...)  kelly=11.434  ...`.
+- Live verification: `min_for_test.csv` (id=0, q=0.5) and `max.csv` (id=0, q=0.4) now produce two separate sub_dirs (`min_for_test_id_0_5fab81fc...` and `max_id_0_0996319a...`) — two trainings, no aliasing.
+- 4 new tests in `tests/cli/test_pick_decoders_cache_key.py`. Tests exercise `pick_decoders(input_from_file=...)` directly with `train_single_decoder` monkeypatched to capture the production sub_dir (codex round-1 P1: in-test path-string reconstruction would let production drift back to the buggy `id_{file_id}` shape without the tests catching it). Mutation-proof for the original bug + for the codex round-1 P1 fix (re-truncating to `[:8]` flips the suffix-length assert).
+- **Codex round 1 P1**: original fix used `params_hash[:8]` (8 hex chars = 32-bit). Birthday paradox makes collisions likely around ~65k entries — same class of silent-alias risk. Round 2 uses the full 64-char digest.
+- **Codex round 1 P1**: original tests reconstructed expected path strings in-test rather than calling `pick_decoders` and capturing what production produced. Round 2 monkeypatches `train_single_decoder` and exercises the production path; tests no longer pass under a regression that drops the file_stem or params_hash.
+- `pyproject.toml` 1.16.0 → 1.16.1 (patch — operator-reported bug fix scope; no new operator-visible CLI surface).
+
 # v1.16.0
 
 - Slice #17 Task 11 — wire `BookGapInstrument` into `bts run --output-format json` and `bts sweep` summary. Pays down the −62% delta on `4d2d36a` (`honesty/book_gap.py` shipped at 0 non-test callers; the slice spec promised "max stop-cross-to-trade gap reported per-run; surfaced via `bts run --output-format json`"). The metric activates when strategies emit STOP/TP orders — current default `long_on_signal` template uses MARKET orders, so default sweeps print an honest skip line.
