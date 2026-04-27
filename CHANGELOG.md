@@ -1,3 +1,20 @@
+# v1.14.1
+
+- Auditor returned 2 P1s on `acaf299` (Task 16 + Task 17 CPCV claim "wired into the live predict path"): (1) `cpcv_pbo` consumed `per_decoder_returns` from finished sweep runs, never `SignalsTable` — the SignalsTable build was ornamental for the analytics; (2) `SignalsTable.lookup(path_id=...)` discarded `path_id` with `del`, so per-path filtering didn't exist at lookup time. Both addressed.
+- `SignalsTable.lookup` signature: `path_id: int | None` removed, `allowed_groups: tuple[int, ...] | None` + `n_groups: int = 1` added. When `allowed_groups` is supplied: `group_id = clamp(int((t - first_ts) / span * n_groups), 0, n_groups - 1)`; the lookup returns the row only if `group_id ∈ allowed_groups`. CSCV callers pass `path.test_groups` to get OOS bars and `path.train_groups` to get IS bars (Lopez de Prado §11). The lookup is now the load-bearing CSCV partition gate. Validation + group-mapping logic extracted to `_lookup_validate_args` + `_t_in_allowed_groups` to keep `lookup`'s cyclomatic complexity within ruff's C901 budget.
+- `cpcv_pbo` signature: drops `per_decoder_returns: dict[str, list[float]]` + `n_clean_days: int`, gains `signals_per_decoder: dict[str, SignalsTable]` + `tick_timestamps: list[datetime]` + `klines: pl.DataFrame`. Per path × per decoder × per tick, `signals.lookup(allowed_groups=path.train_groups, ...)` and `signals.lookup(allowed_groups=path.test_groups, ...)` produce IS / OOS predictions; multiplied by `bar_return = (close[next] - close[t]) / close[t]` (signal-return proxy on the long-flat template — assumes immediate fills, no stop / maker / pending effects). Sharpes per partition, logit, PBO. SignalsTable + CpcvPaths are now BOTH load-bearing.
+- `_print_cpcv_pbo_summary` accepts `signals_per_decoder + klines + tick_timestamps` instead of daily aggregates. `_build_and_save_signals_tables` returns `(tables, klines)` so the same klines fed to SignalsTable build power the CPCV bar-return computation — no second fetch.
+- `CpcvPboResult` schema change: `n_clean_days`, `purge_days`, `embargo_days` removed; `purge_seconds`, `embargo_seconds` added (raw values from CpcvPath, not day-rounded). Day-rounding was a leak from the previous day-aligned algorithm.
+- `bts sweep` summary now actually emits a computed `sweep cpcv_pbo` line on the default 5-day verification window (was: skipped because the day-level CSCV had 0 clean days). Live verification: `prob_overfit=0.000  n_paths=6  n_groups=4  n_test_groups=2  purge_seconds=0  embargo_seconds=0  skipped_paths=0`. With `n_decoders=2` the PBO is structurally binary (0.0 or 1.0); a `WARN` suffix surfaces the constraint to the operator (codex round-7 follow-up).
+- 5 new / refactored cpcv_pbo tests:
+  * `test_cpcv_pbo_runs_on_min_paths` — 8-tick × 2-decoder fixture, 6 paths produced from C(4,2).
+  * `test_cpcv_pbo_skips_when_insufficient_decoders` — 1 decoder → None.
+  * `test_cpcv_pbo_skips_on_pairwise_identical_predictions` — degenerate prediction sequences → None.
+  * `test_cpcv_pbo_uses_signals_table_lookup_for_path_filtering` — mutation-proof: patches `SignalsTable.lookup` to return None on path-filtered calls; verifies cpcv_pbo returns None, proving the lookup IS the load-bearing accessor.
+  * `test_cpcv_pbo_purge_seconds_passed_through_to_lookup` — pins purge/embargo seconds round-trip from `CpcvPath` into `CpcvPboResult`.
+- 2 new SignalsTable.lookup path-filter tests: `_filters_by_allowed_groups` (in test group → row; in train group → None) and `_rejects_allowed_groups_with_too_few_groups` (n_groups<2 raises).
+- `pyproject.toml` 1.14.0 → 1.14.1 (patch — auditor-fix scope).
+
 # v1.14.0
 
 - Slice #17 Task 16 (`SignalsTable.lookup` wired into the live predict path) AND Task 17 CPCV portion (CPCV / purge / embargo wired into `bts sweep`). Pays down the −51% delta on `4d2d36a` (SignalsTable shipped as a decorative primitive with zero callers) AND the deferred CPCV portion of v1.13.0 Task 17.

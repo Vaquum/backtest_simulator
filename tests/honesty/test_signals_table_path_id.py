@@ -49,7 +49,7 @@ def _build_signals_table(*, n_signals: int = 10) -> SignalsTable:
     )
 
 
-def test_signals_table_lookup_accepts_path_id_and_purge_embargo() -> None:
+def test_signals_table_lookup_accepts_kwargs_and_preserves_defaults() -> None:
     """The new kwargs are accepted; defaults preserve existing behavior.
 
     A baseline lookup with no kwargs returns the same row as a
@@ -60,12 +60,57 @@ def test_signals_table_lookup_accepts_path_id_and_purge_embargo() -> None:
     with freeze_time(_T0 + timedelta(minutes=10)):
         baseline = table.lookup(query_t)
         with_kwargs = table.lookup(
-            query_t, path_id=None, purge_seconds=0, embargo_seconds=0,
+            query_t, allowed_groups=None,
+            purge_seconds=0, embargo_seconds=0,
         )
     assert baseline is not None and with_kwargs is not None
     assert baseline.timestamp == with_kwargs.timestamp
     assert baseline.pred == with_kwargs.pred
     assert baseline.prob == with_kwargs.prob
+
+
+def test_signals_table_lookup_filters_by_allowed_groups() -> None:
+    """`allowed_groups` filtering returns the row only if t falls in allowed_groups.
+
+    Slice #17 Task 16 (auditor round 7). The table covers
+    minutes 0-9 (10 bars); partition into n_groups=4. Span is 9
+    minutes (540s). Group_id of t = int((t - first) / span * 4):
+      - minute 1: 1/9 * 4 = 0.44 -> group 0
+      - minute 6: 6/9 * 4 = 2.67 -> group 2
+
+    With allowed_groups=(2,) (OOS = group 2 only), lookup at
+    minute 6 returns the row; lookup at minute 1 returns None.
+    The caller maps `path.test_groups` to allowed_groups for OOS
+    and `path.train_groups` for IS.
+
+    Mutation proof: removing the group filter makes the
+    not-in-allowed lookup return a row, flipping the assert.
+    """
+    table = _build_signals_table()
+    with freeze_time(_T0 + timedelta(minutes=10)):
+        # Minute 6 -> group 2 (allowed). Lookup returns row.
+        in_allowed = table.lookup(
+            _T0 + timedelta(minutes=6),
+            allowed_groups=(2,), n_groups=4,
+        )
+        # Minute 1 -> group 0 (not allowed). Lookup returns None.
+        not_allowed = table.lookup(
+            _T0 + timedelta(minutes=1),
+            allowed_groups=(2,), n_groups=4,
+        )
+    assert in_allowed is not None
+    assert not_allowed is None
+
+
+def test_signals_table_lookup_rejects_allowed_groups_with_too_few_groups() -> None:
+    """`allowed_groups` with `n_groups < 2` is ill-defined; raise loud."""
+    table = _build_signals_table()
+    with freeze_time(_T0 + timedelta(minutes=10)):
+        with pytest.raises(ValueError, match='n_groups >= 2'):
+            table.lookup(
+                _T0 + timedelta(minutes=5),
+                allowed_groups=(0,), n_groups=1,
+            )
 
 
 def test_signals_table_lookup_embargo_shifts_cutoff_back() -> None:

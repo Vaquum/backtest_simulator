@@ -16,6 +16,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Final
 
+import polars as pl
+
 from backtest_simulator.cli._metrics import Trade, print_run
 from backtest_simulator.cli._pipeline import (
     ensure_trained,
@@ -207,12 +209,11 @@ def _run(args: argparse.Namespace) -> int:
         days=days, hours_start=hours_start, hours_end=hours_end,
         interval_seconds=RUN_WINDOW_INTERVAL_SECONDS,
     )
-    _print_sweep_signals_summary(
-        _build_and_save_signals_tables(
-            picks, tick_timestamps=tick_timestamps,
-            replay_start=replay_start, replay_end=replay_end,
-        ),
+    signals_per_decoder, signals_klines = _build_and_save_signals_tables(
+        picks, tick_timestamps=tick_timestamps,
+        replay_start=replay_start, replay_end=replay_end,
     )
+    _print_sweep_signals_summary(signals_per_decoder)
     t_total = time.perf_counter()
     # Accumulators for the sweep-level slippage summary printed
     # after all runs finish. The per-run cost_bps is the
@@ -472,8 +473,9 @@ def _run(args: argparse.Namespace) -> int:
         n_runs_with_trailing_inventory=n_runs_with_trailing_inventory,
     )
     _print_cpcv_pbo_summary(
-        per_decoder_returns,
-        n_clean_days=len(clean_days),
+        signals_per_decoder=signals_per_decoder,
+        klines=signals_klines,
+        tick_timestamps=tick_timestamps,
         n_groups=int(args.cpcv_n_groups),
         n_test_groups=int(args.cpcv_n_test_groups),
         purge_seconds=int(args.cpcv_purge_seconds),
@@ -487,7 +489,7 @@ def _build_and_save_signals_tables(
     *,
     tick_timestamps: list[datetime],
     replay_start: datetime, replay_end: datetime,
-) -> dict[str, SignalsTable]:
+) -> tuple[dict[str, SignalsTable], pl.DataFrame]:
     """Build + save SignalsTable per picked decoder.
 
     Slice #17 Task 16. Walks each picked decoder's experiment dir
@@ -502,6 +504,12 @@ def _build_and_save_signals_tables(
 
     Trainer init is amortised per `exp_dir` so the ~20 s ClickHouse
     fetch only happens once per experiment, not per decoder.
+
+    Returns (tables, klines). The klines are the SAME slice fed to
+    SignalsTable build — bar-level CSCV PBO downstream can reuse
+    them for `(close[next] - close[t]) / close[t]` per-bar returns
+    without a second fetch (auditor round-7 fix making the
+    SignalsTable load-bearing for the CPCV statistic).
     """
     from limen import HistoricalData, Trainer
     by_exp_dir: dict[Path, list[tuple[int, int]]] = {}
@@ -509,6 +517,7 @@ def _build_and_save_signals_tables(
         by_exp_dir.setdefault(exp_dir, []).append((perm_id, display_id))
     historical = HistoricalData()
     tables: dict[str, SignalsTable] = {}
+    last_klines: pl.DataFrame | None = None
     for exp_dir, decoders in by_exp_dir.items():
         trainer = Trainer(exp_dir)
         manifest = trainer._manifest
@@ -530,6 +539,7 @@ def _build_and_save_signals_tables(
             kline_size=kline_size,
             start_date_limit=DEFAULT_START_DATE_LIMIT,
         )
+        last_klines = klines
         sensors = trainer.train([pid for pid, _ in decoders])
         for (perm_id, display_id), sensor in zip(decoders, sensors, strict=True):
             round_params = dict(
@@ -546,7 +556,13 @@ def _build_and_save_signals_tables(
             table.assert_window_covers(replay_start, replay_end)
             table.save(exp_dir / 'signals_tables')
             tables[decoder_id] = table
-    return tables
+    if last_klines is None:
+        msg = (
+            'sweep signals: no klines were fetched (picks is empty?). '
+            'Cannot proceed to CPCV PBO without bar-return data.'
+        )
+        raise ValueError(msg)
+    return tables, last_klines
 
 
 def _print_sweep_signals_summary(
@@ -569,35 +585,34 @@ def _print_sweep_signals_summary(
 
 
 def _print_cpcv_pbo_summary(
-    per_decoder_returns: dict[str, list[float]],
     *,
-    n_clean_days: int,
+    signals_per_decoder: dict[str, SignalsTable],
+    klines: pl.DataFrame,
+    tick_timestamps: list[datetime],
     n_groups: int,
     n_test_groups: int,
     purge_seconds: int,
     embargo_seconds: int,
 ) -> None:
-    """Slice #17 Task 17 — day-aligned CSCV PBO via CpcvPaths.
+    """Slice #17 Task 17 — bar-level CSCV PBO via CpcvPaths + SignalsTable.
 
     Lopez de Prado §11 directly: each path picks `n_test_groups`
-    of `n_groups` as OOS, the rest as IS (with purge/embargo
-    around test-group boundaries). PBO = fraction of paths where
-    the IS-best decoder underperformed median OOS.
+    of `n_groups` as OOS, the rest as IS. cpcv_pbo walks each
+    runtime tick, calling `signals.lookup(allowed_groups=path.
+    test_groups)` for OOS bars and `signals.lookup(allowed_groups
+    =path.train_groups)` for IS bars; multiplies pred * bar_return
+    (close-to-next-close from `klines`) to get strategy returns;
+    Sharpe per partition, logit, PBO. SignalsTable + CpcvPaths
+    are both load-bearing — this is what auditor round 7 P1
+    addressed (previously cpcv_pbo took daily returns, leaving
+    SignalsTable build ornamental).
 
-    Skips with reason when the input shape is too thin for
-    CpcvPaths to build or when every path's post-purge train
-    pool is empty.
+    Skips with reason when the input shape is too thin.
     """
-    if n_clean_days < n_groups:
-        print(
-            f'sweep cpcv_pbo   skipped: need >= n_groups '
-            f'({n_groups}) clean days, have {n_clean_days}',
-        )
-        return
-    if not per_decoder_returns or len(per_decoder_returns) < 2:
+    if not signals_per_decoder or len(signals_per_decoder) < 2:
         print(
             f'sweep cpcv_pbo   skipped: need >=2 decoders, have '
-            f'{len(per_decoder_returns)}',
+            f'{len(signals_per_decoder)}',
         )
         return
     try:
@@ -609,24 +624,35 @@ def _print_cpcv_pbo_summary(
         print(f'sweep cpcv_pbo   skipped: {exc}')
         return
     result = cpcv_pbo(
-        paths=paths, per_decoder_returns=per_decoder_returns,
-        n_clean_days=n_clean_days,
+        paths=paths, signals_per_decoder=signals_per_decoder,
+        tick_timestamps=tick_timestamps, klines=klines,
     )
     if result is None:
         print(
-            f'sweep cpcv_pbo   skipped: every path lost its train '
-            f'pool to purge/embargo or returns are degenerate '
+            f'sweep cpcv_pbo   skipped: every path lost its IS or OOS '
+            f'pool to purge/embargo or predictions are degenerate '
             f'(n_groups={n_groups} test_groups={n_test_groups} '
             f'purge_s={purge_seconds} embargo_s={embargo_seconds})',
         )
         return
+    # Codex round-7 follow-up: with n_decoders=2 the OOS rank is
+    # binary (1 or 2), so PBO collapses to 0.0 or 1.0. The number
+    # is still computed honestly — but the precision shown can
+    # mislead. Surface the constraint so the operator knows to
+    # widen --n-decoders for a continuous PBO.
+    binary_warning = (
+        '  WARN: n_decoders=2 -> PBO is structurally binary (0.0 or '
+        '1.0); widen --n-decoders for finer resolution'
+        if result.n_decoders == 2 else ''
+    )
     print(
         f'sweep cpcv_pbo   prob_overfit={result.pbo:.3f}  '
         f'n_paths={result.n_paths}  n_groups={n_groups}  '
         f'n_test_groups={n_test_groups}  '
-        f'purge_days={result.purge_days}  '
-        f'embargo_days={result.embargo_days}  '
-        f'skipped_paths={result.n_paths_skipped}',
+        f'purge_seconds={result.purge_seconds}  '
+        f'embargo_seconds={result.embargo_seconds}  '
+        f'skipped_paths={result.n_paths_skipped}'
+        f'{binary_warning}',
     )
 
 

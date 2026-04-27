@@ -129,50 +129,11 @@ class SignalsTable:
             )
             raise LookAheadViolation(msg)
 
-    def lookup(
-        self,
-        t: datetime,
-        *,
-        path_id: int | None = None,
-        purge_seconds: int = 0,
-        embargo_seconds: int = 0,
-    ) -> SignalRow | None:
-        """Return the greatest row with `timestamp <= t`, or None if none.
-
-        The single causal accessor for strategies. Naive datetimes are
-        rejected loudly — a tz-naive `t` would slip past the
-        `t > frozen_now()` guard (frozen_now is tz-aware, so `<` between
-        the two is implementation-defined) and then crash the Polars
-        filter against the UTC frame schema. Both failure modes hide
-        a real lookahead leak from the operator's eye.
-
-        Optional kwargs (slice #17 Task 16) implement CPCV-style
-        purge + embargo filtering; their full per-path semantics
-        live in Task 17 (CPCV implementation):
-
-        Args:
-          t: query timestamp (tz-aware, UTC offset concrete).
-          path_id: CPCV path identifier (for future per-path test-
-            group exclusion). `None` = no path-aware filtering;
-            the lookup returns the latest causal row regardless.
-            Stored as a free-form integer here so per-path
-            calibration in Task 17 can key on it.
-          purge_seconds: exclude any row whose label horizon
-            `[label_t0, label_t1]` extends past `t - purge_seconds`.
-            A signal whose label resolves inside the embargo zone
-            leaks the test boundary forward. Default 0 (off).
-          embargo_seconds: shift the causal cutoff back by this
-            many seconds. The returned row satisfies
-            `timestamp <= t - embargo_seconds`. Default 0 (off).
-
-        Raises:
-          ValueError: if `t.tzinfo is None`, or if
-            `purge_seconds < 0`, or if `embargo_seconds < 0`.
-          LookAheadViolation: if `t > frozen_now()`. A cheating
-            strategy passing `t = current_bar + 1bar` would
-            otherwise read a label the live system has not yet
-            computed.
-        """
+    @staticmethod
+    def _lookup_validate_args(
+        t: datetime, purge_seconds: int, embargo_seconds: int,
+    ) -> None:
+        """Reject non-UTC `t` and negative purge/embargo values."""
         if t.tzinfo is None or t.utcoffset() is None:
             msg = (
                 f'SignalsTable.lookup requires a tz-aware datetime with '
@@ -194,8 +155,84 @@ class SignalsTable:
                 f'got {embargo_seconds}.'
             )
             raise ValueError(msg)
-        del path_id  # CPCV path filtering lives at sweep-aggregation
-        # level (operator-confirmed), not at per-bar lookup.
+
+    def _t_in_allowed_groups(
+        self, t: datetime,
+        allowed_groups: tuple[int, ...], n_groups: int,
+    ) -> bool:
+        """Map t -> group_id (Lopez de Prado §11 CSCV) and check membership."""
+        if self._frame.is_empty():
+            return False
+        first_ts = self._frame['timestamp'].min()
+        last_ts = self._frame['timestamp'].max()
+        span_seconds = (last_ts - first_ts).total_seconds()
+        if span_seconds <= 0:
+            # Single-row table: every bar is in group 0.
+            return 0 in allowed_groups
+        position = (t - first_ts).total_seconds() / span_seconds
+        # Clamp to [0, n_groups-1]: bars at exactly last_ts otherwise
+        # compute group_id == n_groups (out of range).
+        group_id = min(max(int(position * n_groups), 0), n_groups - 1)
+        return group_id in allowed_groups
+
+    def lookup(
+        self,
+        t: datetime,
+        *,
+        allowed_groups: tuple[int, ...] | None = None,
+        n_groups: int = 1,
+        purge_seconds: int = 0,
+        embargo_seconds: int = 0,
+    ) -> SignalRow | None:
+        """Return the greatest row with `timestamp <= t`, or None if none.
+
+        The single causal accessor for strategies. Naive datetimes are
+        rejected loudly — a tz-naive `t` would slip past the
+        `t > frozen_now()` guard (frozen_now is tz-aware, so `<` between
+        the two is implementation-defined) and then crash the Polars
+        filter against the UTC frame schema. Both failure modes hide
+        a real lookahead leak from the operator's eye.
+
+        Args:
+          t: query timestamp (tz-aware, UTC offset concrete).
+          allowed_groups: CPCV group filter. When supplied, `t`'s
+            group_id is computed from the table's coverage span
+            partitioned into `n_groups` equal-time blocks; the
+            lookup returns the row ONLY if `group_id ∈
+            allowed_groups`. Bars in any other group return None.
+            CSCV callers pass `path.test_groups` to get OOS bars,
+            `path.train_groups` to get IS bars (Lopez de Prado §11).
+            When `None`, no group filtering — the lookup returns
+            the latest causal row regardless.
+          n_groups: total partition count for group filtering.
+            Required >= 2 when `allowed_groups` is supplied.
+            Ignored otherwise.
+          purge_seconds: exclude any row whose label horizon
+            `[label_t0, label_t1]` extends past `t - purge_seconds`.
+            A signal whose label resolves inside the embargo zone
+            leaks the test boundary forward. Default 0 (off).
+          embargo_seconds: shift the causal cutoff back by this
+            many seconds. The returned row satisfies
+            `timestamp <= t - embargo_seconds`. Default 0 (off).
+
+        Raises:
+          ValueError: if `t.tzinfo is None`, if `purge_seconds < 0`,
+            if `embargo_seconds < 0`, or if `allowed_groups` is
+            supplied with `n_groups < 2` (single-block partitioning
+            has no train/test separation).
+          LookAheadViolation: if `t > frozen_now()`. A cheating
+            strategy passing `t = current_bar + 1bar` would
+            otherwise read a label the live system has not yet
+            computed.
+        """
+        self._lookup_validate_args(t, purge_seconds, embargo_seconds)
+        if allowed_groups is not None and n_groups < 2:
+            msg = (
+                f'SignalsTable.lookup: group filtering requires '
+                f'n_groups >= 2, got {n_groups}. Single-block '
+                f'partitioning has no train/test separation.'
+            )
+            raise ValueError(msg)
         now = frozen_now()
         if t > now:
             msg = (
@@ -203,6 +240,10 @@ class SignalsTable:
                 f'frozen_now()={now} for decoder {self.decoder_id}'
             )
             raise LookAheadViolation(msg)
+        if allowed_groups is not None and not self._t_in_allowed_groups(
+            t, allowed_groups, n_groups,
+        ):
+            return None
         from datetime import timedelta
         cutoff = t - timedelta(seconds=embargo_seconds)
         sliced = self._frame.filter(pl.col('timestamp') <= cutoff)
