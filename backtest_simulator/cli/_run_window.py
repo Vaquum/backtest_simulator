@@ -277,10 +277,11 @@ def _build_atr_gate_and_provider(
 
     Provider closes over `feed`, fetches `[t - window_seconds,
     t)` of strict-causal pre-decision tape, and calls
-    `compute_atr_from_tape(period_seconds=60)`. With the
-    defaults (window=900s, period=60s) the result is 15 buckets
-    of 1-minute ranges — classic 14-period ATR shape. Slice #17
-    Task 29.
+    `compute_atr_from_tape(period_seconds=60)` — Wilder's true-
+    range ATR (per-bucket H-L plus gap-vs-prev-close arms,
+    averaged across buckets). With the defaults (window=900s,
+    period=60s) the result is 15 buckets — classic 14-period
+    ATR shape. Slice #17 Task 29.
     """
     import polars as pl
 

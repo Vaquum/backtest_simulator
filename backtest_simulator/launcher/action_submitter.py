@@ -656,13 +656,30 @@ def _check_atr_sanity(
     strategy can dial by tightening stops. Returns `None` when
     the gate is disabled, when not ENTER+BUY, when stop is
     missing (caller already handled), or when ATR allows. Else
-    returns a denial with reason_code prefixed `ATR_` so telemetry
-    can distinguish ATR rejections from declared-stop rejections.
+    returns a denial with reason_code prefixed `ATR_`.
+
+    BTS-ONLY contract — accepted divergence vs paper/live. Audit
+    round 2 P1 flagged this: the gate runs in action_submitter
+    BEFORE `validation_pipeline.validate()` and BEFORE any
+    command reaches Praxis, so a backtest can deny an entry that
+    paper/live would still take. The asymmetry is accepted because
+    the gate is bts-measurement-protection, not paper/live
+    behavior modeling — paper/live measures realized PnL, bts
+    measures R-multiples on R̄, and only the latter is
+    gameable by tightening stops. The same shape applies to
+    `_check_declared_stop` (which also runs as a bts-side
+    INTAKE shim, since Nexus's `ValidationRequestContext` does
+    not expose `execution_params['stop_price']` to a
+    `StageValidator`). Upstreaming this floor to paper/live
+    requires either (a) extending `ValidationRequestContext` so
+    Nexus's pipeline can read `stop_price` (Nexus PR), or (b)
+    moving the floor into the strategy template itself so it
+    runs upstream of any deployment. Either is out of slice
+    scope; tracked as a follow-up.
 
     Entry-price proxy priority (codex round 1 P1: must match the
-    R-denominator's actual entry as closely as possible — a stale
-    seed price drifts vs the declared stop and lets gameability
-    leak through):
+    R-denominator's actual entry — a stale seed price drifts vs
+    the declared stop and lets gameability leak through):
       1. LIMIT `execution_params['price']` when set
          (`_maybe_refresh_limit_to_touch` may have rewritten this
          to `touch ± tick` for maker posts).

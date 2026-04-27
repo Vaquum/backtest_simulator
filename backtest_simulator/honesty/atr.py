@@ -24,35 +24,60 @@ import polars as pl
 def compute_atr_from_tape(
     *, trades_pre_decision: pl.DataFrame, period_seconds: int = 60,
 ) -> Decimal | None:
-    """ATR = mean of per-period (max_price - min_price) over the supplied tape.
+    """ATR = mean of true range per period over the supplied tape.
 
     `trades_pre_decision` must carry `time` (Datetime) and `price`
-    columns. Caller is responsible for the strict-causal contract
-    (slice ends BEFORE decision time). `period_seconds` controls
-    the bucket width — 60 = 1-minute periods, the classic ATR
-    convention.
+    columns. Caller owns the strict-causal contract (slice ends
+    BEFORE decision time). `period_seconds` controls the bucket
+    width — 60 = 1-minute periods, the classic ATR convention.
 
-    Returns `None` for empty / single-bucket-zero-range / no-data
-    cases — the "uncalibrated" signal that maps to the gate's
-    `ATR_UNCALIBRATED` rejection. Returning `Decimal('0')` when
-    the tape is flat-but-present is honest: the gate's own
-    `atr_zero` reason rejects on it, so a flat tape correctly
-    blocks all entries.
+    True range per bucket (Wilder's ATR):
+      TR_i = max(H_i - L_i, |H_i - C_{i-1}|, |L_i - C_{i-1}|)
+
+    where `C_{i-1}` is the previous bucket's last (close) price.
+    The first bucket has no `prev_close`; TR_0 = H_0 - L_0. ATR
+    = mean(TR_i). Without the `|H - prev_close|` / `|L -
+    prev_close|` arms, a tape that gaps BETWEEN buckets but
+    stays tight WITHIN each bucket would understate volatility,
+    which directly weakens the R-denominator floor — auditor
+    round 2 P1 caught this on the first ship. Mutation proof:
+    `test_compute_atr_from_tape_gap_between_buckets` exercises a
+    tape with intra-bucket range=1 and bucket-to-bucket gap=10;
+    the old (range-only) impl returned 1, true range returns
+    >=5 for an honest floor.
+
+    Returns `None` for empty / no-bucket cases — the
+    "uncalibrated" signal. `Decimal('0')` for a flat tape with
+    no movement (gate's own `atr_zero` path rejects).
     """
     if trades_pre_decision.is_empty():
         return None
-    bucketed = trades_pre_decision.with_columns(
+    sorted_trades = trades_pre_decision.sort('time')
+    bucketed = sorted_trades.with_columns(
         pl.col('time').dt.truncate(f'{period_seconds}s').alias('_bucket'),
     )
-    agg = bucketed.group_by('_bucket').agg(
-        (pl.col('price').max() - pl.col('price').min()).alias('_range'),
-    )
+    agg = bucketed.group_by('_bucket', maintain_order=True).agg(
+        pl.col('price').max().alias('_high'),
+        pl.col('price').min().alias('_low'),
+        pl.col('price').last().alias('_close'),
+    ).sort('_bucket')
     if agg.is_empty():
         return None
-    mean_range = agg['_range'].mean()
-    if mean_range is None:
+    true_ranges: list[Decimal] = []
+    prev_close: Decimal | None = None
+    for row in agg.iter_rows(named=True):
+        h = Decimal(str(row['_high']))
+        l = Decimal(str(row['_low']))
+        c = Decimal(str(row['_close']))
+        if prev_close is None:
+            tr = h - l
+        else:
+            tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        true_ranges.append(tr)
+        prev_close = c
+    if not true_ranges:
         return None
-    return Decimal(str(mean_range))
+    return sum(true_ranges, Decimal('0')) / Decimal(str(len(true_ranges)))
 
 
 @dataclass(frozen=True)

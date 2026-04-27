@@ -319,11 +319,13 @@ def test_atr_sanity_gate_exposes_constructor_args() -> None:
 
 # `compute_atr_from_tape` — the data-source helper that the bts
 # venue/launcher path uses to build the `atr_provider` callable
-# threaded into action_submitter. ATR is mean(per-period range) over
-# the supplied strict-causal tape. Tests pin the formula so the gate
-# rejection counter `n_atr_rejected` you read in `bts run --output-
-# format json` reflects a real volatility floor, not a hard-coded
-# one.
+# threaded into action_submitter. ATR is mean of true range per
+# period over the supplied strict-causal tape — TR_i = max(H_i -
+# L_i, |H_i - C_{i-1}|, |L_i - C_{i-1}|), Wilder's formula. Tests
+# pin the formula so the gate rejection counter `n_atr_rejected`
+# you read in `bts run --output-format json` reflects a real
+# volatility floor, not a hard-coded one or a range-only
+# understatement.
 
 def _trades(rows: list[tuple[datetime, float]]) -> pl.DataFrame:
     return pl.DataFrame({
@@ -333,7 +335,17 @@ def _trades(rows: list[tuple[datetime, float]]) -> pl.DataFrame:
 
 
 def test_compute_atr_from_tape_basic() -> None:
-    """Two 1-min periods → ATR = mean(range_1, range_2)."""
+    """Two 1-min periods → ATR = mean of true-range per bucket.
+
+    True range includes gap-vs-previous-close (Wilder's ATR).
+    Bucket 1 (12:00-12:01): high=70_100 low=70_000 → TR_1 = H-L = 100
+    (no prev_close).
+    Bucket 2 (12:01-12:02): high=70_080 low=70_050 close=70_080.
+    Last trade in bucket 1 is 70_100 (the higher of the two), so
+    prev_close=70_100. TR_2 = max(80-50, |80-100|, |50-100|) =
+    max(30, 20, 50) = 50.
+    Mean(TR) = (100 + 50) / 2 = 75.
+    """
     t0 = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
     rows = [
         (t0 + timedelta(seconds=10), 70_000.0),
@@ -344,11 +356,50 @@ def test_compute_atr_from_tape_basic() -> None:
     atr = compute_atr_from_tape(
         trades_pre_decision=_trades(rows), period_seconds=60,
     )
-    # Bucket 1 (12:00-12:01): max=70_100 min=70_000 → range=100.
-    # Bucket 2 (12:01-12:02): max=70_080 min=70_050 → range= 30.
-    # Mean = 65.
     assert atr is not None
-    assert atr == Decimal('65')
+    assert atr == Decimal('75')
+
+
+def test_compute_atr_from_tape_gap_between_buckets() -> None:
+    """Bucket gaps materially increase ATR vs intra-bucket range alone.
+
+    Auditor round 2 P1: range-only ATR understates volatility on
+    tapes that gap BETWEEN buckets but stay tight WITHIN each
+    bucket. True range catches the gap via |H - prev_close| /
+    |L - prev_close|.
+
+    Setup:
+      Bucket 1 (12:00-12:01): prices 100, 101 → H=101 L=100 close=101
+      Bucket 2 (12:01-12:02): prices 110, 111 → H=111 L=110 close=111
+
+    Range-only impl:
+      TR_1 = 101 - 100 = 1
+      TR_2 = 111 - 110 = 1
+      mean = 1   ← would let very tight stops through
+
+    True-range impl:
+      TR_1 = 1 (no prev_close)
+      TR_2 = max(1, |111-101|, |110-101|) = max(1, 10, 9) = 10
+      mean = 5.5   ← honest floor
+
+    Mutation proof: a regression to range-only would compute
+    Decimal('1') here and the assertion fails.
+    """
+    t0 = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
+    rows = [
+        (t0 + timedelta(seconds=10), 100.0),
+        (t0 + timedelta(seconds=30), 101.0),
+        (t0 + timedelta(seconds=70), 110.0),
+        (t0 + timedelta(seconds=90), 111.0),
+    ]
+    atr = compute_atr_from_tape(
+        trades_pre_decision=_trades(rows), period_seconds=60,
+    )
+    assert atr is not None
+    assert atr == Decimal('5.5'), (
+        f'expected true-range ATR=5.5 (TR_1=1, TR_2=10, mean=5.5); '
+        f'got {atr}. A range-only impl would return 1.'
+    )
 
 
 def test_compute_atr_from_tape_empty_returns_none() -> None:
