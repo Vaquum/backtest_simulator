@@ -351,6 +351,52 @@ def test_market_impact_strict_policy_passes_below_threshold() -> None:
     assert adapter.market_impact_n_samples == 1
 
 
+def test_market_impact_strict_policy_does_not_reject_sell_exit() -> None:
+    """Strict-impact gate must NOT reject SELL exits, even when flagged.
+
+    Audit Finding 2 on commit fe00024: the gate previously rejected
+    every flagged order regardless of side, so an oversized SELL
+    exit would be denied — leaving the long-only strategy holding
+    risk with no way out. The fix scopes rejection to BUY (entry)
+    only; SELL exits are recorded in `n_flagged` but never in
+    `n_rejected`.
+
+    Same synthetic feed (10 BTC bucket, 5 BTC order = 50% of vol →
+    flagged) as `..._rejects_oversize_orders` above; the
+    side-flipped twin pinned here. Mutation proof: if the scope
+    regresses to "reject any flagged order", `n_rejected` would
+    increment on this SELL and the assertion below fails.
+    """
+    from datetime import UTC, timedelta
+
+    from freezegun import freeze_time
+    bucket_start = datetime(2024, 1, 3, 12, 0, tzinfo=UTC)
+    adapter = _impact_adapter(bucket_start, strict=True)
+    adapter.register_account('acct-1', 'k', 's')
+    with freeze_time(bucket_start + timedelta(seconds=20)):
+        asyncio.run(adapter.submit_order(
+            'acct-1', 'BTCUSDT', OrderSide.SELL,
+            OrderType.MARKET,
+            Decimal('5'),  # 50% of 10 BTC bucket -> flagged
+        ))
+    # The impact gate measured the order and flagged it…
+    assert adapter.market_impact_n_flagged == 1, (
+        f'SELL should still be measured and flagged when it '
+        f'exceeds threshold; got n_flagged='
+        f'{adapter.market_impact_n_flagged}.'
+    )
+    # …but did NOT reject it (audit Finding 2). Final
+    # SubmitResult status may still be FILLED / EXPIRED / etc.
+    # depending on downstream balance + tape; the gate's
+    # contribution is what matters here.
+    assert adapter.market_impact_n_rejected == 0, (
+        f'strict-impact gate must scope rejection to BUY '
+        f'(entry) for the long-only template; SELL exits must '
+        f'never be rejected. Got n_rejected='
+        f'{adapter.market_impact_n_rejected}.'
+    )
+
+
 def test_market_impact_off_when_model_none() -> None:
     """`market_impact_realised_bps` is None when the feature is off.
 

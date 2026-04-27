@@ -67,10 +67,12 @@ def register(sub: argparse._SubParsersAction) -> None:
                    ))
     p.add_argument('--strict-impact', action='store_true', default=False,
                    help=(
-                       'Reject ENTER orders the MarketImpactModel '
-                       'flags as exceeding 10%% of concurrent-bucket '
-                       'volume. Default: record telemetry only '
-                       '(observability mode).'
+                       'Reject ENTER orders (BUY for the long-only '
+                       'template) the MarketImpactModel flags as '
+                       'exceeding 10%% of concurrent-bucket volume. '
+                       'SELL exits are measured but never rejected. '
+                       'Default: record telemetry only (observability '
+                       'mode).'
                    ))
     add_verbosity_arg(p)
     p.set_defaults(func=_run)

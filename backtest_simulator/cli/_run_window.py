@@ -227,13 +227,14 @@ def run_window_in_process(
             adapter.maker_fill_efficiency_mean,
         ),
         # MarketImpactModel telemetry. `realised_bps` is the mean
-        # estimated impact across every ENTER submit that hit a
-        # calibrated bucket. `n_samples` / `n_flagged` /
-        # `n_uncalibrated` count those submits, the subset
-        # flagged as oversized, and the calibration gaps.
-        # `n_rejected` is the subset of flagged that the
-        # strict-impact gate routed to REJECTED before
-        # walk_trades (always 0 unless `--strict-impact`).
+        # estimated impact across every submit (BUY + SELL) that
+        # hit a calibrated rolling slice. `n_samples` /
+        # `n_flagged` / `n_uncalibrated` count those submits,
+        # the subset flagged as oversized, and the calibration
+        # gaps. `n_rejected` is the strict-impact gate's
+        # rejection count — scoped to BUY (entry leg, long-only
+        # template) only, so it is always ≤ `n_flagged` and is
+        # 0 unless `--strict-impact` is set.
         'market_impact_realised_bps': _emit(
             adapter.market_impact_realised_bps,
         ),

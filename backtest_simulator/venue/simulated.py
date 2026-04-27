@@ -101,19 +101,25 @@ class SimulatedVenueAdapter:
         self._n_limit_filled_zero: int = 0
         self._n_limit_marketable_taker: int = 0
         self._maker_fill_efficiencies: list[Decimal] = []
-        # MarketImpactModel — STRICT-CAUSAL per-submit calibration.
-        # Each ENTER submit fetches a fresh `[submit_time -
-        # bucket_minutes, submit_time)` slice of pre-submit tape,
-        # calibrates a single-bucket `MarketImpactModel` from it,
-        # and evaluates the order's qty against that bucket.
+        # MarketImpactModel — STRICT-CAUSAL per-submit estimate.
+        # Each submit fetches a fresh `[submit_time -
+        # bucket_minutes, submit_time)` slice of pre-submit
+        # tape and delegates the qty-to-bps math to
+        # `MarketImpactModel.evaluate_rolling`. Measurement
+        # runs on every submit (BUY + SELL); the strict-policy
+        # rejection scopes to BUY only (entry leg for the
+        # long-only template — audit Finding 2 on fe00024).
         # `bucket_minutes is None` disables the feature.
         # `threshold_fraction` controls the size-vs-volume flag
         # threshold (default 10%). `strict_impact_policy=True`
-        # makes the venue REJECT orders the model flags as too
-        # large — the auditor's "pre-fill gate" semantic. Default
-        # `False` preserves the prior measurement-only shape.
-        # Codex round 2 caught the original wiring's lookahead
-        # (calibration spanned the run window) and absent gate.
+        # makes the venue REJECT flagged BUY orders before
+        # `walk_trades` runs — the auditor's "pre-fill gate"
+        # semantic. Default `False` preserves the prior
+        # measurement-only shape. Codex round 2 caught the
+        # original wiring's lookahead (calibration spanned the
+        # run window) and absent gate; the audit on fe00024
+        # caught the gate's over-broad scope (would have
+        # rejected SELL exits too).
         self._market_impact_bucket_minutes = market_impact_bucket_minutes
         self._market_impact_threshold_fraction = (
             market_impact_threshold_fraction
@@ -462,12 +468,35 @@ class SimulatedVenueAdapter:
         decision (which only arises against a well-formed
         bucket); never recorded as a sample.
 
-        When `strict_impact_policy=True` AND the order is
-        flagged, returns True so `submit_order` routes to
-        REJECTED before `walk_trades` runs — the operator-visible
-        "pre-fill gate" the auditor's Task 31 contract calls
-        for. Returns False otherwise (measurement-only
-        observability path).
+        Strict-policy gate scoping: the gate REJECTS only the
+        ENTRY leg, where "entry" is `order.side == 'BUY'` for
+        the long-only `long_on_signal` template that ships in
+        this slice. SELL orders represent EXIT (closing the
+        long position) and are NEVER rejected — rejecting an
+        oversized exit would leave the strategy holding risk
+        with no way out, and would diverge from paper/live
+        semantics where the operator wants the exit to land.
+        Measurement (impact_bps + flag aggregates) runs on
+        BOTH sides — the operator still sees flagged SELL
+        exits in `n_flagged`, just not in `n_rejected`. So
+        `n_flagged - n_rejected` includes (a) flagged BUYs
+        when `strict_impact_policy=False` and (b) flagged SELLs
+        regardless of policy.
+
+        Audit Finding 2 on commit fe00024 caught the prior
+        shape: the gate rejected ANY flagged order. A flagged
+        SELL exit was rejected, leaving the strategy long the
+        position. Short-side strategies (BUY = exit, SELL =
+        entry) are out of scope for this slice — when they are
+        added, the entry-side identity must be plumbed through
+        explicitly (action intent on the order or in the
+        strategy template configuration); using `side` as a
+        proxy for `entry` only holds for long-only.
+
+        When the order is flagged AND the side is BUY AND
+        `strict_impact_policy=True`, returns True so
+        `submit_order` routes to REJECTED before `walk_trades`
+        runs. Returns False otherwise.
 
         Why a rolling slice rather than the model's
         wall-clock-bucket `evaluate(t)`? The standalone
@@ -509,7 +538,7 @@ class SimulatedVenueAdapter:
         self._market_impact_bps_samples.append(decision.impact_bps)
         if decision.flag:
             self._market_impact_n_flagged += 1
-            if self._strict_impact_policy:
+            if self._strict_impact_policy and order.side == 'BUY':
                 self._market_impact_n_rejected += 1
                 return True
         return False
@@ -542,12 +571,18 @@ class SimulatedVenueAdapter:
     def market_impact_n_flagged(self) -> int:
         """Count of order submits flagged as too large vs concurrent volume.
 
-        Includes BOTH the orders that were rejected by the
-        strict-policy gate (`n_rejected`, when
-        `strict_impact_policy=True`) AND the orders that were
-        flagged but allowed through under the default observability
-        policy. Net: `n_flagged - n_rejected = orders flagged but
-        not rejected`.
+        Counts EVERY flagged submit, regardless of side or
+        policy. The strict-policy gate (`n_rejected`) is a
+        subset: only flagged BUY orders under
+        `strict_impact_policy=True` are rejected. Flagged
+        SELL exits and flagged BUYs under default
+        observability policy are recorded here but pass through
+        to `walk_trades`. Net:
+        `n_flagged - n_rejected = orders flagged but not
+        rejected` — includes (a) flagged BUYs under default
+        policy, and (b) flagged SELL exits regardless of
+        policy (the strict-policy gate does not reject exits
+        — see `_record_market_impact_pre_fill` for why).
         """
         return self._market_impact_n_flagged
 
@@ -572,10 +607,15 @@ class SimulatedVenueAdapter:
         Always 0 when `strict_impact_policy=False` (default
         observability mode — flagged orders are recorded but
         execute). Non-zero when the operator opts into the
-        gate via `--strict-impact`. Each rejection translates
-        into an `OrderStatus.REJECTED` SubmitResult so the
-        downstream lifecycle (capital reservation release,
-        strategy state) treats it the same as a venue filter
+        gate via `--strict-impact` AND a flagged ENTRY order
+        (BUY for the long-only template) is submitted. SELL
+        orders represent EXITs in the long-only template and
+        are NEVER rejected — see
+        `_record_market_impact_pre_fill` (audit Finding 2 on
+        commit fe00024). Each rejection translates into an
+        `OrderStatus.REJECTED` SubmitResult so the downstream
+        lifecycle (capital reservation release, strategy
+        state) treats it the same as a venue filter
         rejection.
         """
         return self._market_impact_n_rejected
