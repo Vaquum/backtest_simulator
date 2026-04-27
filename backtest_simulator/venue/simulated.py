@@ -444,72 +444,35 @@ class SimulatedVenueAdapter:
     ) -> bool:
         """STRICT-CAUSAL per-submit market-impact gate.
 
-        Fetches `[submit_time - bucket_minutes, submit_time)` of
-        tape — strictly pre-submit — and delegates the qty-to-bps
-        math to `MarketImpactModel.evaluate_rolling`. The venue
-        owns:
+        Fetches `[submit_time - bucket_minutes, submit_time)`
+        of tape, applies a `time < submit_time` post-fetch
+        filter (the feed may return an inclusive range), renames
+        columns to model convention, and delegates the qty-to-
+        bps math to `MarketImpactModel.evaluate_rolling`.
+        Decision → telemetry: append impact_bps, increment
+        `n_flagged` / `n_rejected`. A `None` model return is
+        the "uncalibrated" signal (empty slice / zero volume /
+        non-positive first price) and increments
+        `n_uncalibrated` instead — never recorded as a zero
+        sample.
 
-          1. The tape fetch.
-          2. The strict-causal `time < submit_time` filter (the
-             feed's `_get_trades_for_venue` may return an
-             inclusive range depending on backend; this filter
-             enforces the half-open contract).
-          3. The column rename to the model's convention
-             (`time`/`qty` → `datetime`/`quantity`).
-          4. The decision-to-telemetry mapping (record bps,
-             increment `n_flagged` / `n_rejected`, return True
-             when `strict_impact_policy` rejects).
+        Strict-policy gate scopes rejection to the ENTRY leg
+        (`order.side == 'BUY'` for the long-only template in
+        this slice). SELL exits are still measured — the
+        operator sees flagged SELLs in `n_flagged` — but never
+        rejected, since rejecting an oversized exit would
+        leave the strategy holding risk with no way out and
+        would diverge from paper/live semantics. Audit Finding
+        2 on commit fe00024 caught the prior over-broad shape.
+        Short-side strategies (BUY=exit, SELL=entry) are out
+        of scope; when they are added, action intent must be
+        plumbed through explicitly — `side` as proxy for
+        `entry` only holds for long-only.
 
-        The model owns the linear-interpolation math
-        (`total_volume`, `price_range_bps`, `impact_bps`,
-        `flag`). A `None` return from the model is the
-        "uncalibrated" signal — empty slice, zero-volume, or
-        non-positive first price. Distinct from a zero-impact
-        decision (which only arises against a well-formed
-        bucket); never recorded as a sample.
-
-        Strict-policy gate scoping: the gate REJECTS only the
-        ENTRY leg, where "entry" is `order.side == 'BUY'` for
-        the long-only `long_on_signal` template that ships in
-        this slice. SELL orders represent EXIT (closing the
-        long position) and are NEVER rejected — rejecting an
-        oversized exit would leave the strategy holding risk
-        with no way out, and would diverge from paper/live
-        semantics where the operator wants the exit to land.
-        Measurement (impact_bps + flag aggregates) runs on
-        BOTH sides — the operator still sees flagged SELL
-        exits in `n_flagged`, just not in `n_rejected`. So
-        `n_flagged - n_rejected` includes (a) flagged BUYs
-        when `strict_impact_policy=False` and (b) flagged SELLs
-        regardless of policy.
-
-        Audit Finding 2 on commit fe00024 caught the prior
-        shape: the gate rejected ANY flagged order. A flagged
-        SELL exit was rejected, leaving the strategy long the
-        position. Short-side strategies (BUY = exit, SELL =
-        entry) are out of scope for this slice — when they are
-        added, the entry-side identity must be plumbed through
-        explicitly (action intent on the order or in the
-        strategy template configuration); using `side` as a
-        proxy for `entry` only holds for long-only.
-
-        When the order is flagged AND the side is BUY AND
-        `strict_impact_policy=True`, returns True so
-        `submit_order` routes to REJECTED before `walk_trades`
-        runs. Returns False otherwise.
-
-        Why a rolling slice rather than the model's
-        wall-clock-bucket `evaluate(t)`? The standalone
-        `calibrate` truncates trades to wall-clock minute
-        boundaries; a non-boundary submit (e.g. `12:31:15`)
-        with a 1-minute window would have its `[submit - 1m,
-        submit)` slice split across the 12:30 and 12:31
-        buckets, and `evaluate` would match only the partial
-        bucket containing `submit_time - 1µs`. The pre-fill
-        estimate needs the FULL trailing minute as one bucket
-        — exactly what `evaluate_rolling` provides.
-
-        No-op when `market_impact_bucket_minutes is None`.
+        Returns True (→ submit_order routes to REJECTED before
+        `walk_trades`) when flag AND BUY AND strict policy.
+        Returns False otherwise. No-op when
+        `market_impact_bucket_minutes is None`.
         """
         if self._market_impact_bucket_minutes is None:
             return False

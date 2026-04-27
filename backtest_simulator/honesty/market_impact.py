@@ -192,59 +192,32 @@ class MarketImpactModel:
 
     @classmethod
     def evaluate_rolling(
-        cls,
-        *,
-        qty: Decimal,
-        trades_pre_submit: pl.DataFrame,
+        cls, *, qty: Decimal, trades_pre_submit: pl.DataFrame,
         threshold_fraction: Decimal = Decimal('0.1'),
     ) -> MarketImpactDecision | None:
         """Strict-causal evaluation against a pre-fetched rolling slice.
 
-        Treats `trades_pre_submit` as a single bucket — no
-        wall-clock truncation. The caller (the bts venue path
-        in `SimulatedVenueAdapter._record_market_impact_pre_fill`)
-        fetches `[submit_time - bucket_minutes, submit_time)` of
-        tape, applies a strict `time < submit_time` post-fetch
-        filter (the feed's range query may be inclusive at one
-        end), renames columns to the model's convention
-        (`datetime`, `quantity`, `price`), and passes the result
-        here. The model owns the qty-to-bps math; the venue owns
-        the slice's strict-causal contract.
-
-        Returns `None` when the slice is empty, zero-volume, or
-        has a non-positive first price. `None` is the
-        "uncalibrated" signal — distinct from a zero-impact
-        decision (which only arises when `qty == 0` against a
-        well-formed bucket). Callers translate `None` into their
-        own uncalibrated counter; they MUST NOT treat it as a
-        zero-impact sample, otherwise the realised aggregate is
-        silently weighted down by calibration gaps.
-
-        `evaluate_rolling` shares the linear-interpolation core
-        with `evaluate`: an order consuming the entire slice's
-        volume would move price by the slice's full range; a
-        smaller order moves proportionally. `flag=True` when
-        `qty > threshold_fraction * total_volume`.
-
-        Required columns on `trades_pre_submit`: `quantity`,
-        `price`. The `datetime` column is not read here — the
-        slice's time-bounding is the caller's contract.
+        Caller (bts venue path) applies the `time <
+        submit_time` filter and renames columns to model
+        convention (`quantity`, `price`). Returns `None` for
+        empty / zero-volume / non-positive-first-price slices
+        — the "uncalibrated" signal; callers MUST NOT treat
+        `None` as a zero-impact sample. Shares
+        `_impact_from_bucket` with `evaluate`.
         """
         if trades_pre_submit.is_empty():
             return None
         total_volume = Decimal(str(trades_pre_submit['quantity'].sum()))
-        if total_volume <= Decimal('0'):
-            return None
         price_first_raw = trades_pre_submit.head(1)['price'].item()
-        if price_first_raw is None or price_first_raw <= 0:
+        if total_volume <= Decimal('0') or price_first_raw is None or price_first_raw <= 0:
             return None
         price_first = Decimal(str(price_first_raw))
-        price_max = Decimal(str(trades_pre_submit['price'].max()))
-        price_min = Decimal(str(trades_pre_submit['price'].min()))
-        price_range_bps = (price_max - price_min) / price_first * _BPS
+        price_range_bps = (
+            Decimal(str(trades_pre_submit['price'].max()))
+            - Decimal(str(trades_pre_submit['price'].min()))
+        ) / price_first * _BPS
         return _impact_from_bucket(
-            qty=qty,
-            total_volume=total_volume,
+            qty=qty, total_volume=total_volume,
             price_range_bps=price_range_bps,
             threshold_fraction=threshold_fraction,
         )
@@ -261,26 +234,15 @@ class MarketImpactModel:
 
 
 def _impact_from_bucket(
-    *,
-    qty: Decimal,
-    total_volume: Decimal,
-    price_range_bps: Decimal,
-    threshold_fraction: Decimal,
+    *, qty: Decimal, total_volume: Decimal,
+    price_range_bps: Decimal, threshold_fraction: Decimal,
 ) -> MarketImpactDecision:
     """Linear-interpolation impact + flag from a one-bucket summary.
 
-    Single source of truth for the qty-to-bps math, shared by
-    `MarketImpactModel.evaluate` (wall-clock bucket lookup) and
-    `MarketImpactModel.evaluate_rolling` (rolling pre-submit
-    slice). Centralising here is what the audit's "no two sources
-    of truth" requirement demands — both paths now diverge only
-    in HOW the `(total_volume, price_range_bps)` pair is built,
-    not in what they do with it.
+    Single source of truth shared by `evaluate` and `evaluate_rolling`.
     """
-    impact_bps = qty / total_volume * price_range_bps
-    flag = qty > threshold_fraction * total_volume
     return MarketImpactDecision(
-        impact_bps=impact_bps,
+        impact_bps=qty / total_volume * price_range_bps,
         concurrent_volume=total_volume,
-        flag=flag,
+        flag=qty > threshold_fraction * total_volume,
     )

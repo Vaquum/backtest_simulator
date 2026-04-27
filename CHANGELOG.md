@@ -1,3 +1,13 @@
+# v1.10.4
+
+- Audit Findings 4 + 5 (P1) on commits 3c9604a / 9eec7f5: the module budget gate (`scripts/check_module_budgets.py`) reported overage on `backtest_simulator/honesty/market_impact.py` (233 / budget 200, +33) and `backtest_simulator/venue/simulated.py` (846 / budget 840, +6). The repo's own line-count discipline blocked the PR; the auditor flagged the work as "not yet in a mergeable state by the repo's own contract."
+- Tightened the docstrings I added in 3c9604a (Finding 1 fix) and 9eec7f5 (Finding 2 fix). Load-bearing facts retained: strict-causal contract / caller-owns-time-filter / `None`-as-uncalibrated semantics / strict-policy gate scoped to BUY for long-only / SELL exits measured but never rejected / short-side intent-plumbing caveat.
+- One small refactor in `MarketImpactModel.evaluate_rolling`: three sequential `if/return None` blocks merged into one combined check (`is_empty()` stays separate; `total_volume <= 0` and `price_first_raw is None or <= 0` merged). Identical semantics — same set of inputs trigger the early return.
+- Final counts: `market_impact.py` 200/200 (at cap), `simulated.py` 814/840 (well under). Module budget gate PASSES.
+- 20 market_impact tests continue to pass. `bts sweep` per-run line and JSON schema unchanged byte-for-byte. The mover is the gate moving from FAIL → PASS, not any operator-visible behaviour.
+- Codex 5.5 xhigh round 1 approved; auditor verdict: Findings 4+5 RESOLVED.
+- `pyproject.toml` 1.10.3 → 1.10.4 (patch — line-count tighten, no behaviour change).
+
 # v1.10.3
 
 - Audit Finding 3 (P2) on commit fe00024 / v1.10.0: `pyproject.toml` advertised `requires-python = ">=3.11"` while `vaquum-praxis` requires `>=3.12`. A fresh `uv pip install -e .` on a clean checkout failed resolution, so the auditor could not reproduce the claimed `bts test -k market_impact` result. Bumping the floor to match the sibling constraint closes that gap.
