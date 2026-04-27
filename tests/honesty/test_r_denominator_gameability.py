@@ -17,9 +17,16 @@ and hands it in.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from backtest_simulator.honesty.atr import AtrSanityDecision, AtrSanityGate
+import polars as pl
+
+from backtest_simulator.honesty.atr import (
+    AtrSanityDecision,
+    AtrSanityGate,
+    compute_atr_from_tape,
+)
 
 
 def test_r_denominator_gameability() -> None:
@@ -308,3 +315,91 @@ def test_atr_sanity_gate_exposes_constructor_args() -> None:
     gate = AtrSanityGate(atr_window_seconds=300, k=Decimal('0.5'))
     assert gate.atr_window_seconds == 300
     assert gate.k == Decimal('0.5')
+
+
+# `compute_atr_from_tape` — the data-source helper that the bts
+# venue/launcher path uses to build the `atr_provider` callable
+# threaded into action_submitter. ATR is mean(per-period range) over
+# the supplied strict-causal tape. Tests pin the formula so the gate
+# rejection counter `n_atr_rejected` you read in `bts run --output-
+# format json` reflects a real volatility floor, not a hard-coded
+# one.
+
+def _trades(rows: list[tuple[datetime, float]]) -> pl.DataFrame:
+    return pl.DataFrame({
+        'time': [r[0] for r in rows],
+        'price': [r[1] for r in rows],
+    }).with_columns(pl.col('time').cast(pl.Datetime('us', 'UTC')))
+
+
+def test_compute_atr_from_tape_basic() -> None:
+    """Two 1-min periods → ATR = mean(range_1, range_2)."""
+    t0 = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
+    rows = [
+        (t0 + timedelta(seconds=10), 70_000.0),
+        (t0 + timedelta(seconds=30), 70_100.0),
+        (t0 + timedelta(seconds=70), 70_050.0),
+        (t0 + timedelta(seconds=90), 70_080.0),
+    ]
+    atr = compute_atr_from_tape(
+        trades_pre_decision=_trades(rows), period_seconds=60,
+    )
+    # Bucket 1 (12:00-12:01): max=70_100 min=70_000 → range=100.
+    # Bucket 2 (12:01-12:02): max=70_080 min=70_050 → range= 30.
+    # Mean = 65.
+    assert atr is not None
+    assert atr == Decimal('65')
+
+
+def test_compute_atr_from_tape_empty_returns_none() -> None:
+    """Empty tape → None (the gate's `ATR_UNCALIBRATED` rejection signal)."""
+    empty = pl.DataFrame({
+        'time': pl.Series('time', [], dtype=pl.Datetime('us', 'UTC')),
+        'price': pl.Series('price', [], dtype=pl.Float64),
+    })
+    assert compute_atr_from_tape(
+        trades_pre_decision=empty, period_seconds=60,
+    ) is None
+
+
+def test_compute_atr_from_tape_flat_returns_zero() -> None:
+    """All same price → ATR=0 (the gate's `atr_zero` reject path).
+
+    The honest answer is "no volatility", which the gate itself
+    reads as a flat tape and rejects loudly. Don't return None
+    here — that would conflate "no data" with "data shows zero
+    movement" and an operator could not tell which case fired.
+    """
+    t0 = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
+    rows = [(t0 + timedelta(seconds=i * 10), 70_000.0) for i in range(6)]
+    atr = compute_atr_from_tape(
+        trades_pre_decision=_trades(rows), period_seconds=60,
+    )
+    assert atr == Decimal('0')
+
+
+def test_compute_atr_from_tape_period_changes_bucket_count() -> None:
+    """Halving period_seconds doubles the bucket count → different mean.
+
+    Pins that period_seconds is actually applied. A volume-blind
+    impl that ignored the parameter would produce identical ATR
+    for both calls.
+    """
+    t0 = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
+    rows = [
+        (t0 + timedelta(seconds=15), 70_000.0),
+        (t0 + timedelta(seconds=45), 70_100.0),
+        (t0 + timedelta(seconds=75), 70_050.0),
+        (t0 + timedelta(seconds=105), 70_080.0),
+    ]
+    df = _trades(rows)
+    atr_60 = compute_atr_from_tape(
+        trades_pre_decision=df, period_seconds=60,
+    )
+    atr_30 = compute_atr_from_tape(
+        trades_pre_decision=df, period_seconds=30,
+    )
+    assert atr_60 != atr_30, (
+        f'period_seconds must change the bucket boundaries; '
+        f'period=60 gave {atr_60}, period=30 gave {atr_30}'
+    )

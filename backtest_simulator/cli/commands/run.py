@@ -172,6 +172,9 @@ def _run(args: argparse.Namespace) -> int:
             'market_impact_n_rejected': result.get(
                 'market_impact_n_rejected', 0,
             ),
+            # ATR R-denominator gameability gate (slice #17 Task 29).
+            'n_atr_rejected': result.get('n_atr_rejected', 0),
+            'n_atr_uncalibrated': result.get('n_atr_uncalibrated', 0),
         }
         sys.stdout.write(json.dumps(report) + '\n')
         return 0

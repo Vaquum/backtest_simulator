@@ -131,3 +131,97 @@ def test_launcher_rejects_both_event_spine_and_db_path() -> None:
             event_spine=cast(EventSpine, object.__new__(EventSpine)),
             db_path=Path('/tmp/x.sqlite'),
         )
+
+
+def _atr_test_launcher(tmp_path: Path) -> 'BacktestLauncher':
+    """Minimal BacktestLauncher for direct counter-method testing.
+
+    No instance / strategy / poller is started — the launcher is
+    constructed and immediately used. Only the constructor and
+    counter methods are exercised.
+    """
+    from praxis.trading_config import TradingConfig
+
+    from backtest_simulator.venue.fees import FeeSchedule
+    from backtest_simulator.venue.filters import BinanceSpotFilters
+    from backtest_simulator.venue.simulated import SimulatedVenueAdapter
+
+    class _Stub:
+        def get_trades(self, *_a: object, **_k: object) -> object:
+            import polars as pl
+            return pl.DataFrame()
+        def _get_trades_for_venue(self, *_a: object, **_k: object) -> object:
+            import polars as pl
+            return pl.DataFrame()
+        def get_window(self, *_a: object, **_k: object) -> object:
+            import polars as pl
+            return pl.DataFrame()
+
+    adapter = SimulatedVenueAdapter(
+        feed=cast(VenueFeed, _Stub()),
+        filters=BinanceSpotFilters.binance_spot('BTCUSDT'),
+        fees=FeeSchedule(),
+    )
+    tc = TradingConfig(
+        epoch_id=1, venue_rest_url='http://sim', venue_ws_url='ws://sim',
+        account_credentials={'x': ('k', 's')}, shutdown_timeout=1.0,
+    )
+    return BacktestLauncher(
+        trading_config=tc, instances=[], venue_adapter=adapter,
+        db_path=tmp_path / 'event_spine.sqlite',
+    )
+
+
+def test_record_atr_rejection_dispatches_by_reason_code(tmp_path: Path) -> None:
+    """`_record_atr_rejection` increments the right counter per reason.
+
+    Slice #17 Task 29 / codex round 1 coverage gap: the action_submitter
+    tests verify the hook fires with the correct reason_code, but
+    don't directly exercise the launcher's dispatch table. This
+    test pins both branches:
+      - `ATR_UNCALIBRATED` → `n_atr_uncalibrated += 1`
+      - any other ATR_* reason → `n_atr_rejected += 1`
+
+    Mutation proof: swapping the two branches would flip both
+    counter values here.
+    """
+    from nexus.core.validator.pipeline_models import (
+        ValidationDecision,
+        ValidationStage,
+    )
+    from nexus.core.domain.enums import OrderSide
+    from nexus.core.domain.order_types import ExecutionMode, OrderType
+    from nexus.strategy.action import Action, ActionType
+
+    launcher = _atr_test_launcher(tmp_path)
+    # Construct a minimal Action — value content doesn't matter
+    # since `_record_atr_rejection` ignores `action`. The signature
+    # requires it for hook compatibility.
+    from decimal import Decimal as _D
+    action = Action(
+        action_type=ActionType.ENTER, direction=OrderSide.BUY,
+        size=_D('0.001'), execution_mode=ExecutionMode.SINGLE_SHOT,
+        order_type=OrderType.MARKET,
+        execution_params={'symbol': 'BTCUSDT'},
+        deadline=60, trade_id=None, command_id=None,
+        maker_preference=None, reference_price=_D('50000'),
+    )
+    assert launcher.n_atr_rejected == 0
+    assert launcher.n_atr_uncalibrated == 0
+    launcher._record_atr_rejection(
+        ValidationDecision(
+            allowed=False, failed_stage=ValidationStage.INTAKE,
+            reason_code='ATR_UNCALIBRATED', message='m',
+        ), action,
+    )
+    assert launcher.n_atr_uncalibrated == 1
+    assert launcher.n_atr_rejected == 0
+    launcher._record_atr_rejection(
+        ValidationDecision(
+            allowed=False, failed_stage=ValidationStage.INTAKE,
+            reason_code='ATR_STOP_TIGHTER_THAN_MIN_ATR_FRACTION',
+            message='m',
+        ), action,
+    )
+    assert launcher.n_atr_uncalibrated == 1
+    assert launcher.n_atr_rejected == 1

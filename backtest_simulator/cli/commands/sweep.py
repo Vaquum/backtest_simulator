@@ -140,6 +140,10 @@ def _run(args: argparse.Namespace) -> int:
     sweep_impact_n_flagged_total = 0
     sweep_impact_n_uncalibrated_total = 0
     sweep_impact_n_rejected_total = 0
+    # ATR R-denominator gameability gate aggregates (slice #17
+    # Task 29). Simple totals across runs.
+    sweep_atr_n_rejected_total = 0
+    sweep_atr_n_uncalibrated_total = 0
     for perm_id, kelly, exp_dir, display_id in picks:
         for day in days:
             window_start = datetime.combine(day.date(), hours_start, tzinfo=UTC)
@@ -210,6 +214,8 @@ def _run(args: argparse.Namespace) -> int:
             impact_rejected = int(result.get(
                 'market_impact_n_rejected', 0,
             ))
+            atr_rejected = int(result.get('n_atr_rejected', 0))
+            atr_uncal = int(result.get('n_atr_uncalibrated', 0))
             print_run(
                 display_id, day_label, trades, declared_stops,
                 slippage_cost_bps=slip_cost,
@@ -228,7 +234,11 @@ def _run(args: argparse.Namespace) -> int:
                 market_impact_n_samples=impact_n,
                 market_impact_n_flagged=impact_flagged,
                 market_impact_n_uncalibrated=impact_uncal,
+                n_atr_rejected=atr_rejected,
+                n_atr_uncalibrated=atr_uncal,
             )
+            sweep_atr_n_rejected_total += atr_rejected
+            sweep_atr_n_uncalibrated_total += atr_uncal
             sweep_n_limit_total += n_limit
             sweep_n_limit_full += n_limit_full
             sweep_n_limit_partial += n_limit_partial
@@ -297,7 +307,28 @@ def _run(args: argparse.Namespace) -> int:
         sweep_impact_n_rejected_total,
         total_runs,
     )
+    _print_sweep_atr_summary(
+        sweep_atr_n_rejected_total, sweep_atr_n_uncalibrated_total,
+    )
     return 0
+
+
+def _print_sweep_atr_summary(
+    n_rejected_total: int, n_uncalibrated_total: int,
+) -> None:
+    """Sweep-level ATR R-denominator gate summary (slice #17 Task 29).
+
+    Surfaces only when at least one rejection or uncalibrated
+    submit fired across the sweep. Healthy runs where the
+    strategy's stops sit comfortably above `k*ATR(window)` see
+    no line at all — same shape as the per-run `atr_*` segment.
+    """
+    if n_rejected_total == 0 and n_uncalibrated_total == 0:
+        return
+    print(
+        f'sweep atr        rejected={n_rejected_total}  '
+        f'uncalibrated={n_uncalibrated_total}',
+    )
 
 
 def _print_sweep_impact_summary(

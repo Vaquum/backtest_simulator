@@ -7,10 +7,12 @@ import logging
 import uuid
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from types import SimpleNamespace
 from typing import cast
+
+from backtest_simulator.honesty.atr import AtrSanityGate
 
 from nexus.core.domain.enums import OrderSide
 from nexus.core.domain.instance_state import InstanceState
@@ -292,10 +294,19 @@ class SubmitterBindings:
     strategy_budget: Decimal
     touch_provider: Callable[[str], Decimal | None] | None = None
     tick_provider: Callable[[str], Decimal] | None = None
+    # Slice #17 Task 29 — ATR R-denominator gameability gate.
+    # When BOTH non-None, ENTER+BUY whose declared stop is closer
+    # than `gate.k * ATR(window)` from entry is denied at INTAKE
+    # before `validation_pipeline.validate`. Provider closes over
+    # the feed; `compute_atr_from_tape` does the math. Either
+    # being None disables the gate.
+    atr_gate: AtrSanityGate | None = None
+    atr_provider: Callable[[str, datetime], Decimal | None] | None = None
 
 
 ReservationHook = Callable[[str, ValidationDecision, ValidationRequestContext, Action], None]
 SubmitHook = Callable[[str], None]
+AtrRejectHook = Callable[[ValidationDecision, Action], None]
 
 
 def build_action_submitter(
@@ -303,6 +314,7 @@ def build_action_submitter(
     *,
     on_reservation: ReservationHook | None = None,
     on_submit: SubmitHook | None = None,
+    on_atr_reject: AtrRejectHook | None = None,
 ) -> Callable[[list[Action], str], None]:
     """Return a callback for `PredictLoop(action_submit=...)`.
 
@@ -347,7 +359,10 @@ def build_action_submitter(
                     strategy_id, action,
                 )
                 continue
-            result = _submit_translated(bindings, strategy_id, action)
+            result = _submit_translated(
+                bindings, strategy_id, action,
+                on_atr_reject=on_atr_reject,
+            )
             if result is None:
                 continue
             command_id, decision, context = result
@@ -407,6 +422,8 @@ def _submit_translated(
     bindings: SubmitterBindings,
     strategy_id: str,
     action: Action,
+    *,
+    on_atr_reject: AtrRejectHook | None = None,
 ) -> tuple[str, ValidationDecision, ValidationRequestContext] | None:
     context = _build_context(
         config=bindings.nexus_config, state=bindings.state,
@@ -419,10 +436,17 @@ def _submit_translated(
     # BEFORE `validation_pipeline.validate` because the pipeline's
     # INTAKE stage is `_allow` in Part 2 and the stop is carried on
     # `action.execution_params`, which isn't accessible from within a
-    # `StageValidator`. A denial here short-circuits the whole path;
-    # the caller sees the usual "validation denied" log plus the
-    # concrete stop-missing reason.
+    # `StageValidator`. Slice #17 Task 29 layers the ATR sanity check
+    # on top: stop must be ≥ `gate.k * ATR(window)` from entry.
     intake_decision = _check_declared_stop(action, context)
+    if intake_decision is None:
+        intake_decision = _check_atr_sanity(
+            action, context,
+            gate=bindings.atr_gate, atr_provider=bindings.atr_provider,
+            touch_provider=bindings.touch_provider,
+        )
+        if intake_decision is not None and on_atr_reject is not None:
+            on_atr_reject(intake_decision, action)
     if intake_decision is not None:
         _log.warning(
             'validation denied: stage=%s reason_code=%s message=%s command_id=%s',
@@ -616,6 +640,106 @@ def _check_declared_stop(
             f'can enforce it and r_per_trade can be computed honestly.'
         ),
     )
+
+
+def _check_atr_sanity(
+    action: Action, context: ValidationRequestContext, *,
+    gate: AtrSanityGate | None,
+    atr_provider: Callable[[str, datetime], Decimal | None] | None,
+    touch_provider: Callable[[str], Decimal | None] | None = None,
+) -> ValidationDecision | None:
+    """Reject ENTER+BUY whose declared stop is closer than `k * ATR(window)`.
+
+    Slice #17 Task 29 closes the R-denominator gameability vector
+    `_check_declared_stop` only half-blocks: a 1 bp stop reaches
+    Praxis untouched and the R̄ in `bts sweep` becomes a knob the
+    strategy can dial by tightening stops. Returns `None` when
+    the gate is disabled, when not ENTER+BUY, when stop is
+    missing (caller already handled), or when ATR allows. Else
+    returns a denial with reason_code prefixed `ATR_` so telemetry
+    can distinguish ATR rejections from declared-stop rejections.
+
+    Entry-price proxy priority (codex round 1 P1: must match the
+    R-denominator's actual entry as closely as possible — a stale
+    seed price drifts vs the declared stop and lets gameability
+    leak through):
+      1. LIMIT `execution_params['price']` when set
+         (`_maybe_refresh_limit_to_touch` may have rewritten this
+         to `touch ± tick` for maker posts).
+      2. `touch_provider(symbol)` — most recent pre-submit trade.
+      3. `action.reference_price` — the baked window-start seed.
+
+    Long-only: only BUY entries are gated; short-side requires
+    intent plumbing (same constraint as strict-impact).
+    """
+    if gate is None or atr_provider is None:
+        return None
+    if action.action_type != ActionType.ENTER or action.direction != OrderSide.BUY:
+        return None
+    params = action.execution_params
+    stop_raw = params.get('stop_price') if isinstance(params, Mapping) else None
+    if stop_raw is None or str(stop_raw).strip() in ('', 'None'):
+        return None
+    try:
+        stop_price = Decimal(str(stop_raw))
+    except InvalidOperation:
+        return None
+    entry_price = _resolve_atr_entry_price(action, touch_provider)
+    if entry_price is None:
+        return None
+    atr = atr_provider(_extract_symbol(action), datetime.now(UTC))
+    if atr is None:
+        return ValidationDecision(
+            allowed=False, failed_stage=ValidationStage.INTAKE,
+            reason_code='ATR_UNCALIBRATED',
+            message=(
+                f'ENTER BUY command_id={context.command_id} ATR uncalibrated '
+                f'(empty pre-decision tape over configured window).'
+            ),
+        )
+    decision = gate.evaluate(
+        entry_price=entry_price, stop_price=stop_price, atr=atr,
+    )
+    if decision.allowed:
+        return None
+    return ValidationDecision(
+        allowed=False, failed_stage=ValidationStage.INTAKE,
+        reason_code=f'ATR_{(decision.reason or "denied").upper()}',
+        message=(
+            f'ENTER BUY command_id={context.command_id} stop_distance='
+            f'{decision.stop_distance} < min={decision.min_required_distance} '
+            f'(atr={atr}, k={gate.k}, window={gate.atr_window_seconds}s).'
+        ),
+    )
+
+
+def _resolve_atr_entry_price(
+    action: Action,
+    touch_provider: Callable[[str], Decimal | None] | None,
+) -> Decimal | None:
+    """Best-effort live-entry proxy for the ATR gate.
+
+    Codex round 1 P1: the gate's entry-distance comparison must
+    track the same value R̄'s denominator will use, not the
+    stale window-start seed price. Falls back through (LIMIT
+    rewritten price, current touch, seed) — see
+    `_check_atr_sanity` docstring.
+    """
+    params = action.execution_params if isinstance(action.execution_params, Mapping) else None
+    if action.order_type is not None and action.order_type.name == 'LIMIT' and params is not None:
+        limit_raw = params.get('price')
+        if limit_raw is not None and str(limit_raw).strip() not in ('', 'None'):
+            try:
+                return Decimal(str(limit_raw))
+            except InvalidOperation:
+                pass
+    if touch_provider is not None and params is not None:
+        symbol = params.get('symbol')
+        if isinstance(symbol, str):
+            touch = touch_provider(symbol)
+            if touch is not None:
+                return touch
+    return action.reference_price
 
 
 def _extract_symbol(action: Action) -> str:

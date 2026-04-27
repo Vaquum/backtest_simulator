@@ -131,6 +131,14 @@ def run_window_in_process(
         market_impact_threshold_fraction=Decimal('0.1'),
         strict_impact_policy=strict_impact,
     )
+    # Slice #17 Task 29 — ATR sanity gate, R-denominator floor.
+    # 900s window matches classic 14-period ATR at 1-min buckets.
+    # k=0.5 is the gate's existing test convention: stop must be
+    # ≥ half a local ATR. The strategy template's default
+    # stop_bps=50 on $70k BTC ≈ $350 distance, well above the
+    # floor; the gate fires only on deliberately tight stops
+    # (1-bp gameability vector).
+    atr_gate, atr_provider = _build_atr_gate_and_provider(feed)
     tc = TradingConfig(
         epoch_id=1, venue_rest_url='http://sim', venue_ws_url='ws://sim',
         account_credentials={'bts-sweep': ('k', 's')}, shutdown_timeout=5.0,
@@ -145,6 +153,8 @@ def run_window_in_process(
         )],
         venue_adapter=adapter,
         db_path=work / 'event_spine.sqlite',
+        atr_gate=atr_gate,
+        atr_provider=atr_provider,
     )
     launcher.run_window(window_start, window_end)
     account = adapter.history('bts-sweep')
@@ -243,7 +253,50 @@ def run_window_in_process(
         'market_impact_n_uncalibrated':
             adapter.market_impact_n_uncalibrated,
         'market_impact_n_rejected': adapter.market_impact_n_rejected,
+        # Slice #17 Task 29 — ATR R-denominator gameability gate.
+        # `n_atr_rejected` counts ENTER+BUY denied for stops
+        # tighter than `k * ATR(window)` from entry. Always 0
+        # for strategies whose stops are sane vs local
+        # volatility; non-zero when the strategy emits 1-bp
+        # stops or similar gameability vectors.
+        # `n_atr_uncalibrated` counts denials where the ATR
+        # provider returned None (empty pre-decision tape) —
+        # the operator's "warmup" signal.
+        'n_atr_rejected': launcher.n_atr_rejected,
+        'n_atr_uncalibrated': launcher.n_atr_uncalibrated,
     }
+
+
+def _build_atr_gate_and_provider(
+    feed: object,
+) -> tuple[object, object]:
+    """Construct the ATR sanity gate + per-submit provider.
+
+    Provider closes over `feed`, fetches `[t - 900s, t)` of
+    strict-causal pre-decision tape for the symbol, and calls
+    `compute_atr_from_tape(period_seconds=60)`. The 900s/60s
+    pair gives 15 buckets of 1-minute ranges — classic
+    14-period ATR shape. Slice #17 Task 29.
+    """
+    import polars as pl
+
+    from backtest_simulator.honesty.atr import (
+        AtrSanityGate,
+        compute_atr_from_tape,
+    )
+    gate = AtrSanityGate(atr_window_seconds=900, k=Decimal('0.5'))
+
+    def atr_provider(symbol: str, t: datetime) -> Decimal | None:
+        from datetime import timedelta
+        raw = feed._get_trades_for_venue(
+            symbol, t - timedelta(seconds=900), t,
+            venue_lookahead_seconds=0,
+        )
+        pre = raw.filter(pl.col('time') < t)
+        return compute_atr_from_tape(
+            trades_pre_decision=pre, period_seconds=60,
+        )
+    return gate, atr_provider
 
 
 def _calibrate_slippage(

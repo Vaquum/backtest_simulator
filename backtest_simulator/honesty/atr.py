@@ -18,6 +18,42 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
+import polars as pl
+
+
+def compute_atr_from_tape(
+    *, trades_pre_decision: pl.DataFrame, period_seconds: int = 60,
+) -> Decimal | None:
+    """ATR = mean of per-period (max_price - min_price) over the supplied tape.
+
+    `trades_pre_decision` must carry `time` (Datetime) and `price`
+    columns. Caller is responsible for the strict-causal contract
+    (slice ends BEFORE decision time). `period_seconds` controls
+    the bucket width — 60 = 1-minute periods, the classic ATR
+    convention.
+
+    Returns `None` for empty / single-bucket-zero-range / no-data
+    cases — the "uncalibrated" signal that maps to the gate's
+    `ATR_UNCALIBRATED` rejection. Returning `Decimal('0')` when
+    the tape is flat-but-present is honest: the gate's own
+    `atr_zero` reason rejects on it, so a flat tape correctly
+    blocks all entries.
+    """
+    if trades_pre_decision.is_empty():
+        return None
+    bucketed = trades_pre_decision.with_columns(
+        pl.col('time').dt.truncate(f'{period_seconds}s').alias('_bucket'),
+    )
+    agg = bucketed.group_by('_bucket').agg(
+        (pl.col('price').max() - pl.col('price').min()).alias('_range'),
+    )
+    if agg.is_empty():
+        return None
+    mean_range = agg['_range'].mean()
+    if mean_range is None:
+        return None
+    return Decimal(str(mean_range))
+
 
 @dataclass(frozen=True)
 class AtrSanityDecision:
