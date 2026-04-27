@@ -978,6 +978,72 @@ class BacktestLauncher(Launcher):
         limen_manifest = sfd.manifest()
         return int(limen_manifest.data_source_config.params['kline_size'])
 
+    def _shutdown(self) -> None:
+        # Slice #17 Task 18 / auditor round 5 P1: Praxis's parent
+        # `_shutdown` closes the aiosqlite connection without
+        # commit. EventSpine.append uses the default deferred-
+        # transaction mode (sqlite3 isolation_level='') so writes
+        # are pending until commit; aiosqlite.close() does NOT
+        # auto-commit. Result: the EventSpine sqlite file looks
+        # empty to any fresh reader (e.g. our post-run
+        # `dump_event_spine_to_jsonl`) because the writes were
+        # rolled back at close.
+        #
+        # Commit must happen AFTER Nexus threads join + Trading.stop
+        # (so all post-window appends land first) and BEFORE
+        # _db_conn.close. That requires copying the parent's
+        # shutdown body and injecting the commit at the precise
+        # point — a single-call `super()._shutdown()` followed by
+        # commit (which we tried first) misses the close that
+        # already happened, and a commit before super() misses
+        # appends that fire during Trading.stop. Codex round-5 P1.
+        import asyncio
+        self._stop_healthz()
+        for thread in self._nexus_threads:
+            thread.join(timeout=30)
+            if thread.is_alive():
+                _log.warning(
+                    'nexus thread did not finish within timeout',
+                    extra={'thread': thread.name},
+                )
+        if self._poller is not None:
+            self._poller.stop()
+        if self._trading is not None and self._loop is not None:
+            stop_future = asyncio.run_coroutine_threadsafe(
+                self._trading.stop(), self._loop,
+            )
+            stop_future.result(timeout=30)
+        if (
+            self._owns_spine
+            and self._db_conn is not None
+            and self._loop is not None
+        ):
+            # Inject point: all writers have stopped, all events
+            # are appended to the connection, but the connection
+            # is still open. Commit flushes deferred transactions
+            # to the file before close.
+            commit_future = asyncio.run_coroutine_threadsafe(
+                self._db_conn.commit(), self._loop,
+            )
+            commit_future.result(timeout=10)
+            close_future = asyncio.run_coroutine_threadsafe(
+                self._db_conn.close(), self._loop,
+            )
+            close_future.result(timeout=10)
+            self._db_conn = None
+        # Parent's tail: stop loop, join loop thread, close loop,
+        # null out refs, log. Codex round-6 P1 — the round-5 copy
+        # truncated this and let the loop / loop_thread leak.
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._loop_thread is not None:
+            self._loop_thread.join(timeout=5)
+        if self._loop is not None and not self._loop.is_closed():
+            self._loop.close()
+        self._loop = None
+        self._loop_thread = None
+        _log.info('shutdown complete')
+
     def _signal_handler(self, _signum: int, _frame: FrameType | None) -> None:
         # Backtests aren't daemons; termination is driven by the outer
         # harness calling `request_stop()` when the window ends, not by

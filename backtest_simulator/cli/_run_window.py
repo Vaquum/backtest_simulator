@@ -167,6 +167,19 @@ def run_window_in_process(
         atr_provider=atr_provider,
     )
     launcher.run_window(window_start, window_end)
+    # Slice #17 Task 18: dump the run's EventSpine to JSONL for
+    # ledger-parity comparison. Always-dump (codex round 1 #4): the
+    # operator gets a comparable artifact regardless of whether
+    # `--check-parity-vs` is set. Cost is small (one sqlite scan
+    # post-run); operator can chain into other parity tooling.
+    from backtest_simulator.honesty.ledger_parity import (
+        dump_event_spine_to_jsonl,
+    )
+    spine_jsonl = work / 'event_spine.jsonl'
+    spine_n_events = dump_event_spine_to_jsonl(
+        sqlite_path=work / 'event_spine.sqlite',
+        jsonl_path=spine_jsonl,
+    )
     account = adapter.history('bts-sweep')
     trade_tuples = [
         (
@@ -274,6 +287,8 @@ def run_window_in_process(
         # the operator's "warmup" signal.
         'n_atr_rejected': launcher.n_atr_rejected,
         'n_atr_uncalibrated': launcher.n_atr_uncalibrated,
+        'event_spine_jsonl': str(spine_jsonl),
+        'event_spine_n_events': spine_n_events,
     }
 
 

@@ -86,6 +86,39 @@ def register(sub: argparse._SubParsersAction) -> None:
                        'ATR window in seconds (mean of per-1-min '
                        'ranges). Default: 900s (14-period ATR).'
                    ))
+    # Slice #17 Task 18 — ledger-parity gate. The bts side dumps
+    # event_spine.jsonl on every run regardless. With
+    # --check-parity-vs, after the run, `assert_ledger_parity` is
+    # called against the supplied reference. STRICT default; the
+    # CLOCK_NORMALIZED tolerance strips envelope event_seq +
+    # timestamp (cross-runtime wall-clock vs frozen difference)
+    # but keeps payload bytes intact. Reference must come from a
+    # deterministic-action-id source — Praxis core uuid4 generates
+    # `command_id` (`launcher.py:524,577`) and bts can also
+    # uuid-generate `trade_id` (`action_submitter.py:581`) when
+    # the strategy emits None for either; normal run-vs-run STRICT
+    # parity is structurally blocked by those non-determinisms
+    # until a future task ties IDs to a deterministic counter.
+    p.add_argument('--check-parity-vs', type=Path, default=None,
+                   help=(
+                       'After run, assert event-spine parity vs the '
+                       'JSONL reference at PATH. Reference must come '
+                       'from a deterministic-action-id source '
+                       '(scripted Praxis); normal run-vs-run STRICT '
+                       'parity is blocked by Praxis uuid4 generation '
+                       'of command_id / trade_id and is tracked as '
+                       'a follow-up.'
+                   ))
+    p.add_argument('--parity-tolerance',
+                   choices=['strict', 'clock_normalized'],
+                   default='strict',
+                   help=(
+                       'strict (default): byte-identical compare. '
+                       'clock_normalized: strip envelope event_seq + '
+                       'timestamp, keep payload bytes (for the '
+                       'cross-runtime case where the same scripted '
+                       'Praxis runs at different wall-clock times).'
+                   ))
     add_verbosity_arg(p)
     p.set_defaults(func=_run)
 
@@ -189,9 +222,17 @@ def _run(args: argparse.Namespace) -> int:
             # ATR R-denominator gameability gate (slice #17 Task 29).
             'n_atr_rejected': result.get('n_atr_rejected', 0),
             'n_atr_uncalibrated': result.get('n_atr_uncalibrated', 0),
+            # Slice #17 Task 18 ledger parity. The bts spine is
+            # always dumped post-run; the reference comparison
+            # fires only when --check-parity-vs is set.
+            'event_spine_jsonl': result.get('event_spine_jsonl'),
+            'event_spine_n_events': result.get('event_spine_n_events', 0),
         }
         sys.stdout.write(json.dumps(report) + '\n')
-        return 0
+        # Codex round-5 P1: JSON mode keeps stdout a single
+        # parseable object. Parity status flows via return code
+        # + stderr only (no extra stdout lines).
+        return _maybe_assert_parity(args, result, emit_human=False)
     trades = [Trade(*row) for row in trades_raw]
     declared_stops = {k: Decimal(str(v)) for k, v in stops_raw.items()}
     slip_raw = result.get('slippage_realised_cost_bps')
@@ -215,6 +256,81 @@ def _run(args: argparse.Namespace) -> int:
             'market_impact_n_uncalibrated', 0,
         )),
     )
+    return _maybe_assert_parity(args, result)
+
+
+def _maybe_assert_parity(
+    args: argparse.Namespace, result: dict[str, object],
+    *, emit_human: bool = True,
+) -> int:
+    """Slice #17 Task 18 — call `assert_ledger_parity` if `--check-parity-vs`.
+
+    Returns the CLI exit code: 0 on parity pass (or no check
+    requested), 1 on parity violation OR on missing/invalid spine
+    artifact when a check WAS requested (codex round 4 P1: the
+    parity gate must never silently fail-open).
+
+    `emit_human` controls whether the human-readable status lines
+    are written to stdout. Default True (text mode). JSON mode
+    passes False so stdout stays a single parseable JSON object;
+    parity result still surfaces via return code + stderr (codex
+    round-5 P1).
+    """
+    spine_path_raw = result.get('event_spine_jsonl')
+    n_events = int(result.get('event_spine_n_events', 0))
+    if not isinstance(spine_path_raw, str):
+        if args.check_parity_vs is not None:
+            sys.stderr.write(
+                f'bts run: --check-parity-vs requested but '
+                f'event_spine_jsonl missing from subprocess result '
+                f'(got {type(spine_path_raw).__name__}); failing '
+                f'parity check loudly.\n',
+            )
+            return 1
+        if emit_human:
+            sys.stderr.write(
+                f'bts run: event_spine_jsonl missing from subprocess '
+                f'result (got {type(spine_path_raw).__name__}); '
+                f'no parity check requested.\n',
+            )
+        return 0
+    spine_path = Path(spine_path_raw)
+    if args.check_parity_vs is None:
+        # Always-dump (codex round 1 #4): emit the path so the
+        # operator can chain into other parity tooling. Text mode
+        # only — JSON mode keeps stdout pure.
+        if emit_human:
+            print(
+                f'bts run         event_spine_jsonl={spine_path}  '
+                f'n_events={n_events}',
+            )
+        return 0
+    reference = Path(args.check_parity_vs)
+    from backtest_simulator.exceptions import ParityViolation
+    from backtest_simulator.honesty.ledger_parity import (
+        ParityTolerance,
+        assert_ledger_parity,
+    )
+    tolerance = ParityTolerance[args.parity_tolerance.upper()]
+    try:
+        assert_ledger_parity(
+            backtest_event_spine=spine_path,
+            paper_event_spine=reference,
+            tolerance=tolerance,
+        )
+    except ParityViolation as exc:
+        if emit_human:
+            print(
+                f'bts run         parity FAIL  vs={reference}  '
+                f'tolerance={args.parity_tolerance}  n_events={n_events}',
+            )
+        sys.stderr.write(f'{exc}\n')
+        return 1
+    if emit_human:
+        print(
+            f'bts run         parity PASS  vs={reference}  '
+            f'tolerance={args.parity_tolerance}  n_events={n_events}',
+        )
     return 0
 
 
