@@ -4,10 +4,11 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import sys
+from collections.abc import Callable
 
 
-def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    p = sub.add_parser('version', help='Print the bts version.')
+def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
+    p = add_parser('version', 'Print the bts version.')
     p.set_defaults(func=_run)
 
 

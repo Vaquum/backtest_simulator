@@ -188,6 +188,14 @@ class SimulatedVenueAdapter:
             raise KeyError(msg)
         self._history[account_id] = self._accounts.pop(account_id)
 
+    def close(self) -> None:
+        """No-op: the simulator owns no resources that need lifecycle close.
+
+        Required by Praxis's `VenueAdapter` protocol — live adapters
+        own a websocket and an HTTP client; the simulator's tape is
+        a polars DataFrame held by the feed object, which closes itself.
+        """
+
     def _record_slippage(
         self,
         order: PendingOrder,

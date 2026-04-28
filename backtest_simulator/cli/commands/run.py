@@ -22,7 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -37,10 +37,10 @@ from backtest_simulator.cli._run_window import run_window_in_subprocess
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
 
 
-def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    p = sub.add_parser(
+def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
+    p = add_parser(
         'run',
-        help='Run one backtest window for one decoder.',
+        'Run one backtest window for one decoder.',
     )
     # --exp-code is REQUIRED: bts has no fallback SFD. The
     # operator's file must be a self-contained UEL-compliant

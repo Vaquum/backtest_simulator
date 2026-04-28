@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Final
 
@@ -22,8 +23,8 @@ _FORMAT_TO_NBCONVERT: Final[dict[str, list[str]]] = {
 }
 
 
-def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    p = sub.add_parser('notebook', help='Execute / convert a Jupyter notebook.')
+def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
+    p = add_parser('notebook', 'Execute / convert a Jupyter notebook.')
     p.add_argument('--path', required=True, type=Path,
                    help='Path to the .ipynb file.')
     p.add_argument('--execute', action='store_true', default=True,

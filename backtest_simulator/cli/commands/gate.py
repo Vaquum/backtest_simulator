@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Final
 
@@ -88,8 +89,8 @@ _ALL_GATES: Final[tuple[str, ...]] = (
 )
 
 
-def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    p = sub.add_parser('gate', help='Run a specific CI gate locally.')
+def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
+    p = add_parser('gate', 'Run a specific CI gate locally.')
     p.add_argument('name', choices=[*_ALL_GATES, 'all'],
                    help='Gate name. `all` runs every gate sequentially '
                         'and stops at the first non-zero exit.')

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from datetime import time as dtime
 from decimal import Decimal
@@ -114,10 +115,10 @@ def _runtime_tick_timestamps(
     return ticks
 
 
-def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    p = sub.add_parser(
+def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
+    p = add_parser(
         'sweep',
-        help='Run the backtest pipeline over N decoders x M days.',
+        'Run the backtest pipeline over N decoders x M days.',
     )
     # --exp-code is REQUIRED: bts has no fallback SFD. The
     # operator's file must be a self-contained UEL-compliant

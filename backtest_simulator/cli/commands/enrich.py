@@ -7,17 +7,18 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
 from backtest_simulator.reporting.enriched_results import build_enriched_table
 
 
-def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    p = sub.add_parser(
+def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
+    p = add_parser(
         'enrich',
-        help='Join <experiment_dir>/results.csv with optional '
-             'backtest_results.parquet into results_with_backtest.csv.',
+        'Join <experiment_dir>/results.csv with optional '
+        'backtest_results.parquet into results_with_backtest.csv.',
     )
     p.add_argument('--experiment', required=True, type=Path)
     p.add_argument('--backtest-parquet', type=Path, default=None)

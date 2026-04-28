@@ -57,18 +57,30 @@ def _build_parser() -> argparse.ArgumentParser:
     valid invocation shape is `bts <subcommand> -v ...`. This keeps the
     CLI surface unambiguous and matches the per-subcommand log-level
     contract documented in `docs/cli.md`.
+
+    Each subcommand module exposes a `register(add_parser)` function
+    that takes a closure capable of producing a fresh
+    `argparse.ArgumentParser`. The closure shape avoids exporting
+    `argparse._SubParsersAction` (private in the stdlib stubs) past
+    this module — only this `_build_parser` mentions it via type
+    inference, the subcommand modules see only the `add_parser`
+    callable.
     """
     ap = argparse.ArgumentParser(prog='bts', description='backtest_simulator master CLI')
     sub = ap.add_subparsers(dest='cmd', required=True)
-    _run.register(sub)
-    _sweep.register(sub)
-    _enrich.register(sub)
-    _test.register(sub)
-    _lint.register(sub)
-    _typecheck.register(sub)
-    _gate.register(sub)
-    _notebook.register(sub)
-    _version.register(sub)
+
+    def add_parser(name: str, help_: str) -> argparse.ArgumentParser:
+        return sub.add_parser(name, help=help_)
+
+    _run.register(add_parser)
+    _sweep.register(add_parser)
+    _enrich.register(add_parser)
+    _test.register(add_parser)
+    _lint.register(add_parser)
+    _typecheck.register(add_parser)
+    _gate.register(add_parser)
+    _notebook.register(add_parser)
+    _version.register(add_parser)
     return ap
 
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Final
 
@@ -15,8 +16,8 @@ from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
 _DEFAULT_PATHS: Final[tuple[str, ...]] = ('backtest_simulator',)
 
 
-def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    p = sub.add_parser('typecheck', help='Run pyright strict.')
+def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
+    p = add_parser('typecheck', 'Run pyright strict.')
     p.add_argument('--paths', nargs='*', type=Path, default=None,
                    help='Override paths (default: backtest_simulator).')
     add_verbosity_arg(p)

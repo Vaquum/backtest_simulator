@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Final
 
@@ -17,8 +18,8 @@ _DEFAULT_PATHS: Final[tuple[str, ...]] = (
 )
 
 
-def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    p = sub.add_parser('lint', help='Run ruff check.')
+def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
+    p = add_parser('lint', 'Run ruff check.')
     p.add_argument('--paths', nargs='*', type=Path, default=None,
                    help='Override paths (default: backtest_simulator tools tests scripts).')
     p.add_argument('--fix', action='store_true', help='Apply ruff --fix.')

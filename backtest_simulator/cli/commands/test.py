@@ -8,13 +8,14 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
 
 
-def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    p = sub.add_parser('test', help='Run pytest under bts.')
+def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
+    p = add_parser('test', 'Run pytest under bts.')
     p.add_argument('-k', dest='pattern', type=str, default=None,
                    help='pytest -k pattern.')
     p.add_argument('--honesty', action='store_true',
