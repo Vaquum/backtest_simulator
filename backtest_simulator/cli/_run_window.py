@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING, TypedDict, cast
 
 if TYPE_CHECKING:
     from backtest_simulator.feed.protocol import VenueFeed
+    from backtest_simulator.honesty.maker_fill import MakerFillModel
+    from backtest_simulator.honesty.slippage import SlippageModel
 
 from backtest_simulator.cli._pipeline import (
     SYMBOL,
@@ -488,7 +490,7 @@ def _build_atr_gate_and_provider(
 def _calibrate_slippage(
     feed: VenueFeed,
     window_start: datetime,
-) -> object | None:
+) -> SlippageModel | None:
     """Fit a SlippageModel on the 30 minutes of trades before `window_start`.
 
     Return contract (narrow on purpose):
@@ -544,7 +546,7 @@ def _calibrate_slippage(
 def _calibrate_maker_fill(
     feed: VenueFeed,
     window_start: datetime,
-) -> object:
+) -> MakerFillModel:
     """Build a MakerFillModel from the 30 minutes preceding `window_start`.
 
     Same schema bridge as slippage. Empty pre-window → RAISE
