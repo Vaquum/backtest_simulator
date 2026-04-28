@@ -266,6 +266,8 @@ def test_prescient_via_feed_get_trades_has_no_venue_kwarg() -> None:
 
 _PROTOCOL_MOD = 'backtest_simulator.feed.protocol'
 _CARVE_OUT_ATTR = 'get_trades_for_venue'
+_DYNAMIC_IMPORT_NAMES = frozenset({'__import__', 'import_module'})
+_DYNAMIC_EXEC_NAMES = frozenset({'eval', 'exec'})
 
 
 def _scan_import_from(node: object, rel: Path) -> list[str]:
@@ -294,41 +296,81 @@ def _scan_import(node: object, rel: Path) -> list[str]:
     return [f'{rel}: import {a.name}' for a in node.names if a.name == _PROTOCOL_MOD]
 
 
+def _is_dynamic_import_callable(func: object) -> bool:
+    """Return True if `func` is any name pyright/strategy could use for dynamic import.
+
+    Catches: `__import__(...)`, `import_module(...)` (regardless of how it
+    got bound — `from importlib import import_module`, `import importlib
+    as il; il.import_module(...)`, etc.).
+    """
+    import ast
+    if isinstance(func, ast.Name):
+        return func.id in _DYNAMIC_IMPORT_NAMES
+    if isinstance(func, ast.Attribute):
+        return func.attr in _DYNAMIC_IMPORT_NAMES
+    return False
+
+
 def _scan_call(node: object, rel: Path) -> list[str]:
-    """Catch (5) `__import__` / `importlib.import_module` and (6) `getattr(_, ATTR)`."""
+    """Catch (5) any dynamic import + (6) `getattr(_, ATTR)` + ban eval/exec."""
     import ast
     if not isinstance(node, ast.Call):
         return []
     leaks: list[str] = []
     f = node.func
-    is_const = node.args and isinstance(node.args[0], ast.Constant)
-    if isinstance(f, ast.Name) and f.id == '__import__' and is_const and node.args[0].value == _PROTOCOL_MOD:
-        leaks.append(f'{rel}: __import__({_PROTOCOL_MOD!r})')
-    if (isinstance(f, ast.Attribute) and f.attr == 'import_module'
-            and isinstance(f.value, ast.Name) and f.value.id == 'importlib'
-            and is_const and node.args[0].value == _PROTOCOL_MOD):
-        leaks.append(f'{rel}: importlib.import_module({_PROTOCOL_MOD!r})')
+    if _is_dynamic_import_callable(f):
+        # Strategy modules have NO legitimate need for dynamic imports.
+        # Banning ALL dynamic imports — `__import__(...)`,
+        # `importlib.import_module(...)`, `il.import_module(...)`,
+        # `import_module(...)` (from-imported), regardless of the
+        # argument shape (literal, concatenated, relative, fromlist).
+        kind = f.id if isinstance(f, ast.Name) else f.attr
+        leaks.append(f'{rel}: dynamic-import call ({kind})')
     if (isinstance(f, ast.Name) and f.id == 'getattr'
             and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)
             and node.args[1].value == _CARVE_OUT_ATTR):
         leaks.append(f'{rel}: getattr(_, {_CARVE_OUT_ATTR!r})')
+    if isinstance(f, ast.Name) and f.id in _DYNAMIC_EXEC_NAMES:
+        # Strategy modules have NO legitimate need for eval/exec.
+        # Banning catches the constant-string variant of the
+        # bypass (`eval("__import__('...')")`, `exec("from ...
+        # import VenueFeed")`).
+        leaks.append(f'{rel}: {f.id}() call (banned in strategy modules)')
     return leaks
+
+
+def _scan_attribute(node: object, rel: Path) -> list[str]:
+    """Catch (7) any `_.get_trades_for_venue` attribute read or call."""
+    import ast
+    if not isinstance(node, ast.Attribute):
+        return []
+    if node.attr == _CARVE_OUT_ATTR:
+        return [f'{rel}: attribute access `_.{_CARVE_OUT_ATTR}`']
+    return []
 
 
 def _scan_for_venue_feed_import(path: Path, repo: Path) -> list[str]:
     """Return one entry per VenueFeed-bypass path found in `path`.
 
-    Codex post-auditor-4 round 2 P1: extends the scan to cover every
-    statically-detectable path a cheating strategy could use to
-    reach `VenueFeed` / `get_trades_for_venue`:
+    Catches every statically-detectable path a cheating strategy
+    could use to reach `VenueFeed` / `get_trades_for_venue` (codex
+    post-auditor-4 round 3 expanded the scan to close additional
+    surfaces the round-2 enumeration missed):
 
-      1. `from backtest_simulator.feed.protocol import VenueFeed`
-      2. `from backtest_simulator.feed.protocol import *`
-      3. `from backtest_simulator.feed import protocol [as fp]`
-      4. `import backtest_simulator.feed.protocol`
-      5. `importlib.import_module('backtest_simulator.feed.protocol')`
-         / `__import__('backtest_simulator.feed.protocol')`
-      6. `getattr(_, 'get_trades_for_venue')`
+      1. `from backtest_simulator.feed.protocol import VenueFeed | *`
+      2. `from backtest_simulator.feed import protocol [as X]`
+      3. `import backtest_simulator.feed.protocol`
+      4. ANY dynamic-import call: `__import__(...)`,
+         `importlib.import_module(...)` / `il.import_module(...)` /
+         `import_module(...)` (regardless of how the callable got
+         bound — strategy modules have NO legitimate need for
+         dynamic imports, so the entire call shape is banned).
+      5. `getattr(_, 'get_trades_for_venue')`.
+      6. ANY attribute access `_.get_trades_for_venue` (catches the
+         direct-call form `self._feed.get_trades_for_venue(...)`,
+         attribute-read form, and any chained reach).
+      7. `eval(...)` / `exec(...)` — banned in strategy modules
+         (catches the constant-string variant of the bypass).
 
     Each entry returned is one leak with file + kind + source line.
     """
@@ -340,6 +382,7 @@ def _scan_for_venue_feed_import(path: Path, repo: Path) -> list[str]:
         leaks.extend(_scan_import_from(node, rel))
         leaks.extend(_scan_import(node, rel))
         leaks.extend(_scan_call(node, rel))
+        leaks.extend(_scan_attribute(node, rel))
     return leaks
 
 
