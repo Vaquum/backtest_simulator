@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-GATE_PATH = REPO_ROOT / 'scripts' / 'check_no_swallowed_violations.py'
+GATE_PATH = REPO_ROOT / 'tools' / 'check_no_swallowed_violations.py'
 
 
 def _load_gate():

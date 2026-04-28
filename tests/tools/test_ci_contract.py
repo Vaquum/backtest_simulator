@@ -13,6 +13,10 @@ def test_post_merge_changelog_workflow_removed() -> None:
 
 
 def test_update_changelog_script_removed() -> None:
+    # The legacy auto-changelog script was removed. After scripts/ →
+    # tools/ merge, gate scripts live under tools/; assert the legacy
+    # path doesn't exist there either.
+    assert not (REPO_ROOT / 'tools/update_changelog.py').exists()
     assert not (REPO_ROOT / 'scripts/update_changelog.py').exists()
 
 

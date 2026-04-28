@@ -71,12 +71,11 @@
   "backtest_simulator/cli/commands/notebook.py": 80,
   "backtest_simulator/cli/commands/version.py": 30,
   "backtest_simulator/__main__.py": 20,
-  "scripts/__init__.py": 10,
-  "scripts/check_module_budgets.py": 120,
-  "scripts/check_test_code_ratio.py": 120,
-  "scripts/check_module_docstrings.py": 120,
-  "scripts/check_file_size_balance.py": 120,
-  "scripts/check_coverage_floor.py": 120,
-  "scripts/check_budget_ratchet.py": 120,
-  "scripts/check_no_swallowed_violations.py": 120
+  "tools/check_module_budgets.py": 120,
+  "tools/check_test_code_ratio.py": 120,
+  "tools/check_module_docstrings.py": 120,
+  "tools/check_file_size_balance.py": 120,
+  "tools/check_coverage_floor.py": 120,
+  "tools/check_budget_ratchet.py": 120,
+  "tools/check_no_swallowed_violations.py": 120
 }

@@ -4,9 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "backtest_simulator"
-version = "2.0.4"
+version = "2.0.5"
 description = "Honest, gate-enforced backtester for unmodified Nexus strategies against unmodified Praxis."
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.12"
 dependencies = [
   "freezegun>=1.5.0",
@@ -195,9 +196,9 @@ max-statements = 50
 # stdout (the operator's debug surface) and the sweep / run / pipeline
 # orchestration carries enough branches to exceed PLR0912 / PLR0915.
 # These are CLI surfaces, not library code; the bloat caps are aimed
-# at the latter. Overlaps with `scripts/` on the bloat-rule set
+# at the latter. Overlaps with `tools/` on the bloat-rule set
 # (C901/PLR0912/PLR0913/PLR0915 + T201 + ERA001/D2xx) but
-# intentionally narrower — `scripts/` additionally exempts
+# intentionally narrower — `tools/` additionally exempts
 # FIX001-FIX004 (operator-staged TODO markers in gate scripts) which
 # the CLI surface should not need.
 "backtest_simulator/cli/**/*.py" = [
@@ -210,20 +211,12 @@ max-statements = 50
   "PLR0912", "PLR0913", "PLR0915",
   "D200", "D205", "D415",
 ]
-# tools/ is Out of Scope for slice #11 and legitimately uses patterns
-# (print banners, dense scan loops, TODOs in imported code, etc.)
-# that the bloat rules would otherwise require editing. Exempt the
-# full set that would force modifying tools/. PIE790 stays on.
+# tools/ hosts every gate script — `*_gate.py` (cc, fail_loud,
+# ruleset, slice, typing, version) AND `check_*.py` (bloat budgets,
+# coverage floor, etc., merged from the former scripts/ dir). They
+# print banners by design and use patterns the bloat rules would
+# otherwise require editing. PIE790 stays on.
 "tools/**/*.py" = [
-  "C901", "PLR0912", "PLR0913", "PLR0915",
-  "T201",
-  "FIX001", "FIX002", "FIX003", "FIX004",
-  "ERA001", "D200", "D205", "D415",
-]
-# scripts/ hosts this slice's own gate scripts. They print banners by
-# design. Same exemption set, same rationale, same reason: the gates
-# are allowed to be the gates.
-"scripts/**/*.py" = [
   "C901", "PLR0912", "PLR0913", "PLR0915",
   "T201",
   "FIX001", "FIX002", "FIX003", "FIX004",

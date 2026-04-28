@@ -15,16 +15,20 @@ dist/
 coverage.json
 pyright_output.json
 base_budget.json
+.pytest_cache/
+.ruff_cache/
+.venv/
 
-# IDE / OS.
+# IDE / OS / agent.
 .DS_Store
 .idea/
 .vscode/
 .ipynb_checkpoints/
+.claude/
 
 # Tunneled / CSV artefacts (operator-local sweep outputs).
 e2e.csv
 min.csv
 tiny.csv
-logreg-binary-round-*.csv
+*.csv
 Untitled.ipynb

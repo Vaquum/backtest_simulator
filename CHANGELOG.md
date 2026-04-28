@@ -1,3 +1,69 @@
+# v2.0.5
+
+Package-cleanup slice — no functional change. Drops operator-local
+scratch (CSVs, demo phase scripts, draft notebooks, session journals)
+from the repo root, tracks the previously-untracked `LICENSE` /
+`AGENTS.md` / `uv.lock`, and merges the `scripts/` gate-script
+directory into `tools/` (same purpose, redundant separation).
+
+## Cleanup — operator-local scratch removed
+
+`HANDOFF.md`, `LOG.md`, `OBSERVATIONS.md`, `SPEC.md`, `SELL`,
+`Untitled.ipynb`, `demo/`, `notebooks/`, plus six CSVs (`max.csv`,
+`mid.csv`, `min.csv`, `tiny.csv`, `e2e.csv`, the round-03b sweep
+output) — all removed from working tree. None were tracked or
+referenced by package code / CI.
+
+## Cleanup — build artifacts swept
+
+`.coverage`, `coverage.json`, `pyright_output.json`, `base_budget.json`,
+`build/`, `backtest_simulator.egg-info/`, `.pytest_cache/`,
+`.ruff_cache/`, `.ipynb_checkpoints/`, `.venv/`, `.DS_Store` (root
++ package), every `__pycache__/`. `.gitignore` now lists these
+explicitly under "Local working state" / "IDE / OS / agent". Adds
+`.claude/` (Claude Code session lock) and `.venv/` to the ignore list.
+
+## Tracked — `LICENSE`, `AGENTS.md`, `uv.lock`
+
+Three previously-untracked files now committed:
+
+- `LICENSE` — MIT, referenced from `pyproject.toml` via
+  `license = { file = "LICENSE" }`.
+- `AGENTS.md` — operator-philosophy preamble (the `# AGENTS.md`-
+  headed laws are still in `CLAUDE.md`).
+- `uv.lock` — for reproducible `uv pip install` resolution.
+
+## Refactor — `scripts/` → `tools/`
+
+Both directories hosted gate-enforcement scripts with identical ruff
+exemption sets:
+
+- `tools/*_gate.py` (cc, fail_loud, ruleset, slice, typing, version) —
+  6 structural gates called by `.github/workflows/pr_checks_*.yml`.
+- `scripts/check_*.py` (module budgets, coverage floor, file-size
+  balance, test-code ratio, module docstrings, no-swallowed-violations,
+  budget ratchet) — 7 bloat / honesty gates called by `bts gate lint`
+  + `pr_checks_lint.yml`.
+
+The split was historical — same purpose, same exemptions. Moved all
+seven `scripts/check_*.py` files under `tools/`; deleted the now-empty
+`scripts/__init__.py` (tools is not imported as a package). Updated:
+
+- `.github/workflows/pr_checks_lint.yml` — 7 invocation paths +
+  `ruff check` target list.
+- `.github/module_budgets.json` — 7 path keys (lost `__init__.py`
+  entry, now 7 instead of 8).
+- `backtest_simulator/cli/commands/gate.py` — 5 subprocess paths
+  + the lint-target list.
+- `pyproject.toml::[tool.ruff.lint.per-file-ignores]` — collapsed
+  the duplicated `tools/` and `scripts/` ignore blocks into one.
+- 5 test files — `test_lint_ci_contract.py`, `test_bloat_gates_contract.py`,
+  `test_bloat_gate_mutation.py`, `test_no_swallowed_violations.py`,
+  `test_ci_contract.py` (path constants + assertions).
+
+Behavior unchanged: `bts gate lint`, `pr_checks_lint`, every
+mutation test all run the same gate scripts from the new path.
+
 # v2.0.4
 
 Auditor batch (post-v2.0.3) — 2 P1 findings — plus codex's exhaustive scan caught 4 more P1s in 2 rounds. All closed before this version ships.

@@ -59,12 +59,6 @@ EXPECTED_RUFF_POLICY: Final[dict[str, object]] = {
             'FIX001', 'FIX002', 'FIX003', 'FIX004',
             'ERA001', 'D200', 'D205', 'D415',
         ],
-        'scripts/**/*.py': [
-            'C901', 'PLR0912', 'PLR0913', 'PLR0915',
-            'T201',
-            'FIX001', 'FIX002', 'FIX003', 'FIX004',
-            'ERA001', 'D200', 'D205', 'D415',
-        ],
         # Part 2 Protocol-conformance exemption: SimulatedVenueAdapter
         # implements praxis.infrastructure.venue_adapter.VenueAdapter's
         # 9-parameter `submit_order` signature. The Protocol is
@@ -82,8 +76,8 @@ EXPECTED_RUFF_POLICY: Final[dict[str, object]] = {
         # legitimately print() per-run summaries to stdout (the
         # operator's debug surface) and the sweep / run / pipeline
         # orchestration carries enough branches to exceed PLR0912 /
-        # PLR0915. Overlaps with `scripts/`'s exemption set on the
-        # bloat rules; the CLI does NOT need scripts/'s
+        # PLR0915. Overlaps with `tools/`'s exemption set on the
+        # bloat rules; the CLI does NOT need `tools/`'s
         # FIX001-FIX004 (operator-staged TODO markers in gate
         # scripts).
         'backtest_simulator/cli/**/*.py': [
@@ -131,16 +125,16 @@ def test_pr_checks_lint_runs_pinned_ruff_on_tools_and_tests_tools() -> None:
     workflow = LINT_WORKFLOW.read_text(encoding='utf-8')
 
     assert f"'ruff=={RUFF_VERSION}'" in workflow
-    assert '.venv-lint/bin/python -m ruff check backtest_simulator tools tests scripts' in workflow
+    assert '.venv-lint/bin/python -m ruff check backtest_simulator tools tests' in workflow
     assert 'continue-on-error' not in workflow
     # Hard-mechanical gate surfaces from slice #11 — each invocation
     # must appear verbatim somewhere in the workflow.
-    assert 'scripts/check_module_budgets.py' in workflow
-    assert 'scripts/check_module_docstrings.py' in workflow
-    assert 'scripts/check_file_size_balance.py' in workflow
-    assert 'scripts/check_test_code_ratio.py' in workflow
-    assert 'scripts/check_coverage_floor.py' in workflow
-    assert 'scripts/check_budget_ratchet.py' in workflow
+    assert 'tools/check_module_budgets.py' in workflow
+    assert 'tools/check_module_docstrings.py' in workflow
+    assert 'tools/check_file_size_balance.py' in workflow
+    assert 'tools/check_test_code_ratio.py' in workflow
+    assert 'tools/check_coverage_floor.py' in workflow
+    assert 'tools/check_budget_ratchet.py' in workflow
     assert 'vulture' in workflow
     # No soft-fail pathway: no `|| true`, no continue-on-error on any step.
     assert '|| true' not in workflow
