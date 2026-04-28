@@ -82,7 +82,10 @@ EXPECTED_RUFF_POLICY: Final[dict[str, object]] = {
         # legitimately print() per-run summaries to stdout (the
         # operator's debug surface) and the sweep / run / pipeline
         # orchestration carries enough branches to exceed PLR0912 /
-        # PLR0915. Same exemption set as `scripts/`.
+        # PLR0915. Overlaps with `scripts/`'s exemption set on the
+        # bloat rules; the CLI does NOT need scripts/'s
+        # FIX001-FIX004 (operator-staged TODO markers in gate
+        # scripts).
         'backtest_simulator/cli/**/*.py': [
             'C901', 'PLR0912', 'PLR0913', 'PLR0915',
             'T201',

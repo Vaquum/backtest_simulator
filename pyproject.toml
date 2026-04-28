@@ -195,7 +195,11 @@ max-statements = 50
 # stdout (the operator's debug surface) and the sweep / run / pipeline
 # orchestration carries enough branches to exceed PLR0912 / PLR0915.
 # These are CLI surfaces, not library code; the bloat caps are aimed
-# at the latter. Same exemption set as `scripts/`.
+# at the latter. Overlaps with `scripts/` on the bloat-rule set
+# (C901/PLR0912/PLR0913/PLR0915 + T201 + ERA001/D2xx) but
+# intentionally narrower — `scripts/` additionally exempts
+# FIX001-FIX004 (operator-staged TODO markers in gate scripts) which
+# the CLI surface should not need.
 "backtest_simulator/cli/**/*.py" = [
   "C901", "PLR0912", "PLR0913", "PLR0915",
   "T201",
