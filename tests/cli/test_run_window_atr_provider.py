@@ -12,7 +12,7 @@ gate would silently consume the post-decision tick.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import polars as pl
@@ -70,7 +70,7 @@ def test_atr_provider_fetches_strict_causal_window() -> None:
       - Dropping `venue_lookahead_seconds=0` (defaulting to non-
         zero) flips the recorded kwarg; assert fires.
     """
-    ts = datetime(2024, 12, 1, 12, 5, 0, tzinfo=timezone.utc)
+    ts = datetime(2024, 12, 1, 12, 5, 0, tzinfo=UTC)
     feed = _CapturingFeed(ts, window_seconds=900)
     _gate, atr_provider = _run_window._build_atr_gate_and_provider(
         feed, k=Decimal('0.5'), window_seconds=900,
@@ -118,7 +118,7 @@ def test_atr_provider_filters_out_at_decision_tick(
     `compute_atr_from_tape` then receives 4 rows instead of 3,
     and the assert fires.
     """
-    ts = datetime(2024, 12, 1, 12, 5, 0, tzinfo=timezone.utc)
+    ts = datetime(2024, 12, 1, 12, 5, 0, tzinfo=UTC)
     feed = _CapturingFeed(ts, window_seconds=900)
 
     captured: dict[str, object] = {}

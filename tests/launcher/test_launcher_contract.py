@@ -133,7 +133,7 @@ def test_launcher_rejects_both_event_spine_and_db_path() -> None:
         )
 
 
-def _atr_test_launcher(tmp_path: Path) -> 'BacktestLauncher':
+def _atr_test_launcher(tmp_path: Path) -> BacktestLauncher:
     """Minimal BacktestLauncher for direct counter-method testing.
 
     No instance / strategy / poller is started — the launcher is
@@ -185,12 +185,12 @@ def test_record_atr_rejection_dispatches_by_reason_code(tmp_path: Path) -> None:
     Mutation proof: swapping the two branches would flip both
     counter values here.
     """
+    from nexus.core.domain.enums import OrderSide
+    from nexus.core.domain.order_types import ExecutionMode, OrderType
     from nexus.core.validator.pipeline_models import (
         ValidationDecision,
         ValidationStage,
     )
-    from nexus.core.domain.enums import OrderSide
-    from nexus.core.domain.order_types import ExecutionMode, OrderType
     from nexus.strategy.action import Action, ActionType
 
     launcher = _atr_test_launcher(tmp_path)

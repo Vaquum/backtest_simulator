@@ -47,6 +47,43 @@ _SECOND_WEEK_APRIL_END: Final = datetime(2026, 4, 12, tzinfo=UTC).date()
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
 
+def assert_sweep_signals_parity_ran(
+    sweep_signals_parity_total: int,
+    *, n_picks: int, n_days: int,
+) -> None:
+    """Raise `ParityViolation` if no per-window parity ran across the sweep.
+
+    Codex (post-auditor-4) P1: per-window
+    `try: run_window_in_subprocess() except Exception: continue`
+    swallowed child-window failures. Even with the per-window
+    `assert_signals_parity` mandatory and the per-entry strictness
+    in the helper, a sweep where EVERY window failed at the
+    subprocess level would print "OK n_compared=0" cheerfully
+    (codex's repro produced exactly that with `rc=0`).
+
+    The post-window swallow is now ALSO closed (`raise ... from
+    exc`), but this post-loop guard is the belt-and-braces
+    second line of defence. Reaching this function with `total
+    == 0` means: the sweep DID run, no per-window exception was
+    raised, AND yet zero parity comparisons happened. That can
+    only mean the parity body was bypassed somehow — a future
+    silent regression. Loud, not silent.
+    """
+    if sweep_signals_parity_total > 0:
+        return
+    from backtest_simulator.exceptions import ParityViolation
+    msg = (
+        f'sweep signals parity: 0 comparisons made across the '
+        f'WHOLE sweep ({n_picks} decoder(s) x {n_days} day(s) = '
+        f'{n_picks * n_days} window(s)). The mandatory '
+        f'SignalsTable parity check did NOT run for any window. '
+        f'Possible causes: capture hook bypassed, parity body '
+        f'unreachable due to a refactor regression. Sweep result '
+        f'is unreliable and is rejected.'
+    )
+    raise ParityViolation(msg)
+
+
 def _runtime_tick_timestamps(
     *,
     days: list[datetime], hours_start: dtime, hours_end: dtime,
@@ -321,12 +358,25 @@ def _run(args: argparse.Namespace) -> int:
                     atr_k=str(getattr(args, 'atr_k', '0.5')),
                     atr_window_seconds=int(getattr(args, 'atr_window_seconds', 900)),
                 )
-            except Exception as exc:  # noqa: BLE001 - surface per-run errors
+            except Exception as exc:
+                # Codex (post-auditor-4) P1: prior `continue` pattern
+                # swallowed child-window failures and let the sweep
+                # finish with `rc=0` + "sweep signals parity OK
+                # n_compared=0" cheerful fallthrough — codex
+                # reproduced exactly that with a monkeypatched
+                # subprocess. Fix: re-raise with window context so
+                # the sweep aborts on the first failed window. The
+                # operator gets the original exception via
+                # `raise ... from exc` chaining.
                 dt_ms = int((time.perf_counter() - t0) * 1000)
-                print(
-                    f'  perm {display_id:<6}  {day_label}  FAILED in {dt_ms}ms: {exc!r}',
+                msg = (
+                    f'sweep aborted: perm {display_id} on '
+                    f'{day_label} failed after {dt_ms}ms: {exc!r}. '
+                    f'Per-window failures are not silently '
+                    f'continued — every picked decoder x day must '
+                    f'produce a parity-validated run.'
                 )
-                continue
+                raise RuntimeError(msg) from exc
             trades_raw = result['trades']
             stops_raw = result['declared_stops']
             assert isinstance(trades_raw, list)
@@ -377,27 +427,60 @@ def _run(args: argparse.Namespace) -> int:
             ))
             atr_rejected = int(result.get('n_atr_rejected', 0))
             atr_uncal = int(result.get('n_atr_uncalibrated', 0))
-            # Auditor (post-v2.0.2) "make it real": SignalsTable
-            # is now a sweep-time PARITY REFERENCE — for every
-            # per-window run, compare runtime per-tick predictions
-            # against `signals_per_decoder[display_id]`. Any
-            # mismatch raises `ParityViolation` (HonestyViolation
-            # subclass; check_no_swallowed_violations.py forbids
-            # catching it). The runtime predictions list comes from
-            # `_run_window`'s wrapped `produce_signal` hook — empty
-            # for windows where no PredictLoop tick fired.
+            # Auditor (post-v2.0.3) "parity must not silently skip":
+            # the prior round's `if runtime_preds_raw:` guard let a
+            # broken capture hook or missing payload reach the
+            # final "no comparisons made" print and exit cleanly,
+            # leaving the mandatory SignalsTable path UNVALIDATED.
+            # Now the call ALWAYS runs; the helper raises
+            # `ParityViolation` when it produces 0 comparisons,
+            # making the silent-skip path impossible. The runtime
+            # predictions list comes from `_run_window`'s wrapped
+            # `produce_signal` hook; if it's empty or non-list,
+            # that's itself a capture-side bug surfaced as a
+            # ParityViolation (the Five Principles: bts work that
+            # exists must do real work or fail loudly).
+            decoder_key = str(display_id)
+            table = signals_per_decoder.get(decoder_key)
+            if table is None:
+                from backtest_simulator.exceptions import (
+                    ParityViolation as _ParityViolation,
+                )
+                msg_no_table = (
+                    f'sweep signals parity: decoder '
+                    f'{decoder_key!r} has no SignalsTable in '
+                    f'signals_per_decoder; the build path skipped '
+                    f'this decoder. Mandatory parity reference is '
+                    f'absent — auditor post-v2.0.2 contract requires '
+                    f'a table for every picked decoder.'
+                )
+                raise _ParityViolation(msg_no_table)
             runtime_preds_raw = result.get('runtime_predictions', [])
-            if isinstance(runtime_preds_raw, list) and runtime_preds_raw:
-                decoder_key = str(display_id)
-                table = signals_per_decoder.get(decoder_key)
-                if table is not None:
-                    n_signals_compared = assert_signals_parity(
-                        decoder_id=decoder_key,
-                        table=table,
-                        runtime_predictions=runtime_preds_raw,
-                        tick_timestamps=tick_timestamps,
-                    )
-                    sweep_signals_parity_total += n_signals_compared
+            runtime_preds_list: list[dict[str, object]] = (
+                runtime_preds_raw
+                if isinstance(runtime_preds_raw, list)
+                else []
+            )
+            # Codex (post-auditor-4 round-3): pass PER-WINDOW
+            # expected ticks, NOT the whole sweep grid. A first-
+            # window check must reject a captured second-day tick
+            # (and vice versa). The slice matches
+            # `_runtime_tick_timestamps`'s `(window_start,
+            # window_end]` semantics — INCLUSIVE at end (the
+            # PredictLoop fires AT window_end if it sits on a
+            # boundary; that's the LAST tick of THIS window, not
+            # the first of the next).
+            window_expected_ticks = [
+                t for t in tick_timestamps
+                if window_start < t <= window_end
+            ]
+            n_signals_compared = assert_signals_parity(
+                decoder_id=decoder_key,
+                table=table,
+                runtime_predictions=runtime_preds_list,
+                expected_ticks=window_expected_ticks,
+            )
+            sweep_signals_parity_total += n_signals_compared
             print_run(
                 display_id, day_label, trades, declared_stops,
                 slippage_cost_bps=slip_cost,
@@ -517,26 +600,21 @@ def _run(args: argparse.Namespace) -> int:
         max_seconds=sweep_book_gap_max_seconds,
         total_stops=sweep_book_gap_total_stops,
     )
-    # Auditor (post-v2.0.2) "make it real": positive indicator
-    # that the SignalsTable parity check ran. Mismatches raise
-    # ParityViolation per-window during the loop; reaching this
-    # line means every per-tick comparison passed across the
-    # sweep. Zero comparisons (e.g. when PredictLoop never fired
-    # because the window is shorter than interval_seconds) is
-    # surfaced explicitly so the operator distinguishes "parity
-    # checked + matched" from "parity check did not run".
-    if sweep_signals_parity_total > 0:
-        print(
-            f'sweep signals parity  '
-            f'OK n_compared={sweep_signals_parity_total} '
-            f'(runtime Sensor.predict matches SignalsTable per-tick)',
-        )
-    else:
-        print(
-            'sweep signals parity  '
-            'no comparisons made (runtime never produced predictions; '
-            'window may be shorter than interval_seconds)',
-        )
+    # Auditor (post-v2.0.3) + codex (post-auditor-4): require AT
+    # LEAST ONE window's parity to have actually run across the
+    # whole sweep. Closes the silent-skip path through the
+    # per-window `try: run_window_in_subprocess() except
+    # Exception: continue` block above (subprocess failure for
+    # every window would otherwise print "OK n_compared=0").
+    assert_sweep_signals_parity_ran(
+        sweep_signals_parity_total,
+        n_picks=len(picks), n_days=len(days),
+    )
+    print(
+        f'sweep signals parity  '
+        f'OK n_compared={sweep_signals_parity_total} '
+        f'(runtime Sensor.predict matches SignalsTable per-tick)',
+    )
     # Align decoders by day: drop any day where ANY decoder had
     # trailing inventory. This guarantees DSR/PBO/SPA see same-
     # date returns for every decoder (codex round 2 P1).

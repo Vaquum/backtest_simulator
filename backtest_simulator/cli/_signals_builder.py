@@ -234,7 +234,7 @@ def assert_signals_parity(
     *, decoder_id: str,
     table: SignalsTable,
     runtime_predictions: list[dict[str, object]],
-    tick_timestamps: list[datetime],
+    expected_ticks: list[datetime],
 ) -> int:
     """Verify SignalsTable matches per-tick runtime predictions.
 
@@ -266,30 +266,95 @@ def assert_signals_parity(
     "covered" from "post-window"; the explicit allow-list via
     `tick_timestamps` is the precise gate.
 
-    Returns: the count of TICKS THAT WERE SUCCESSFULLY COMPARED
-    (timestamp ∈ tick_timestamps AND pred matched). The sweep
-    prints this so the operator sees how many predictions the
-    parity check actually validated.
+    Auditor (post-v2.0.3): the prior round let `runtime_predictions=
+    []` reach the helper as a no-op (return 0). The sweep summary
+    then printed "no comparisons made" cheerfully — the mandatory
+    parity check could silently NOT RUN if the capture hook broke
+    or the subprocess result was missing the `runtime_predictions`
+    payload. Now ZERO comparisons is a `ParityViolation`.
+
+    Codex (post-auditor-4) P1: the prior round ALSO silently
+    skipped malformed entries (non-string timestamp, non-int pred)
+    and out-of-grid timestamps. Codex repro:
+    `runtime=[valid match, out-of-grid pred=99]` returned `1` with
+    no violation, so a partial capture-hook failure (one bad row
+    among many good) was silently OK. Fix: ANY skipped entry
+    raises. The operator either gets a clean run (every entry
+    comparable + matched) or a loud violation naming what went
+    wrong.
+
+    Returns: the count of TICKS THAT WERE SUCCESSFULLY COMPARED.
+    Equal to `len(runtime_predictions)` on success — every entry
+    matched. Anything less raises.
     """
     from backtest_simulator.exceptions import ParityViolation
 
-    covered = set(tick_timestamps)
+    # Codex (post-auditor-4 round-2) P1: parity must be a TWO-WAY
+    # multiset match. Every expected tick MUST appear exactly once
+    # in `runtime_predictions`. Missing ticks (capture skipped a
+    # boundary), duplicate ticks (PredictLoop double-fired), and
+    # extra/out-of-grid ticks all raise. Operator-side caller passes
+    # PER-WINDOW expected ticks, NOT the whole sweep grid.
+    if len(set(expected_ticks)) != len(expected_ticks):
+        msg = (
+            f'assert_signals_parity: expected_ticks contains '
+            f'duplicate timestamps for decoder {decoder_id!r}. '
+            f'Caller bug — the per-window scheduled grid must '
+            f'have unique timestamps.'
+        )
+        raise ValueError(msg)
+    covered = set(expected_ticks)
+    captured: list[datetime] = []
     n_compared = 0
     for entry in runtime_predictions:
         ts_raw = entry['timestamp']
         if not isinstance(ts_raw, str):
-            continue
+            # Codex (post-auditor-4) P1: non-string timestamp is
+            # a capture-side serialiser bug — the entry can't be
+            # compared against the table. Loud, not silent.
+            msg = (
+                f'SignalsTable parity violation for decoder '
+                f'{decoder_id!r}: runtime entry has non-string '
+                f'`timestamp` field (got {type(ts_raw).__name__}). '
+                f'Capture serialiser produced unverifiable data; '
+                f'the parity check cannot proceed.'
+            )
+            raise ParityViolation(msg)
         ts = datetime.fromisoformat(ts_raw)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=UTC)
         runtime_pred = entry.get('pred')
         if not isinstance(runtime_pred, int):
-            continue
+            msg = (
+                f'SignalsTable parity violation for decoder '
+                f'{decoder_id!r} at tick {ts.isoformat()}: '
+                f'runtime entry has non-int `pred` field (got '
+                f'{type(runtime_pred).__name__}={runtime_pred!r}). '
+                f'Capture serialiser produced unverifiable data.'
+            )
+            raise ParityViolation(msg)
         if ts not in covered:
-            # Tick is outside the SignalsTable's build-time grid:
-            # the table never claimed coverage at this exact
-            # instant. Silent — neither match nor violation.
-            continue
+            # Codex (post-auditor-4) P1: out-of-grid runtime
+            # ticks were silently skipped, masking a partial
+            # capture failure. Now loud: any tick outside the
+            # scheduled grid is a divergence between when the
+            # PredictLoop fired and what the sweep planned. The
+            # operator sees the offending timestamp + the grid
+            # bounds.
+            grid_min = min(covered) if covered else None
+            grid_max = max(covered) if covered else None
+            msg = (
+                f'SignalsTable parity violation for decoder '
+                f'{decoder_id!r}: runtime tick {ts.isoformat()} '
+                f'falls OUTSIDE the scheduled per-window `expected_ticks` '
+                f'grid (range: {grid_min}..{grid_max}, '
+                f'n_ticks={len(covered)}). The PredictLoop fired '
+                f'at an unexpected instant — sweep replay did not '
+                f'plan a comparison there, or the sweep passed the '
+                f'whole-sweep grid instead of the per-window slice.'
+            )
+            raise ParityViolation(msg)
+        captured.append(ts)
         row = table.lookup(ts)
         if row is None:
             # In-grid timestamp with no row is a build-side bug
@@ -319,4 +384,61 @@ def assert_signals_parity(
             )
             raise ParityViolation(msg)
         n_compared += 1
+    # Codex (post-auditor-4 round-2) P1: two-way multiset check.
+    # Every expected tick MUST appear in `captured` exactly once.
+    # Missing → capture-side skipped a scheduled boundary.
+    # Duplicate → PredictLoop double-fired (or capture-side
+    # double-emitted). Both are honesty violations — neither is
+    # a "valid" PredictLoop output the sweep should accept.
+    from collections import Counter
+    captured_counter = Counter(captured)
+    expected_counter = Counter(expected_ticks)
+    missing = expected_counter - captured_counter
+    duplicates = {
+        t: cnt for t, cnt in captured_counter.items() if cnt > 1
+    }
+    if missing:
+        n_missing = sum(missing.values())
+        sample = sorted(missing)[:3]
+        msg = (
+            f'SignalsTable parity violation for decoder '
+            f'{decoder_id!r}: {n_missing} expected tick(s) NOT '
+            f'captured by runtime (sample: '
+            f'{[t.isoformat() for t in sample]}). Capture hook '
+            f'skipped scheduled boundaries — partial PredictLoop '
+            f'firing or subprocess truncated output. Expected: '
+            f'{len(expected_ticks)} tick(s); captured: '
+            f'{len(captured)}.'
+        )
+        raise ParityViolation(msg)
+    if duplicates:
+        sample_dup = sorted(duplicates.items())[:3]
+        msg = (
+            f'SignalsTable parity violation for decoder '
+            f'{decoder_id!r}: runtime captured duplicate ticks '
+            f'(sample: {[(t.isoformat(), n) for t, n in sample_dup]}). '
+            f'PredictLoop double-fired or capture-side double-'
+            f'emitted; either is a real-runtime bug worth surfacing.'
+        )
+        raise ParityViolation(msg)
+    if n_compared == 0:
+        # Belt-and-braces: even after the multiset check, if
+        # neither runtime_predictions nor expected_ticks contained
+        # comparable entries, the parity body did not run. The
+        # caller (sweep) should never pass empty expected_ticks;
+        # but if it does, this raise surfaces it.
+        n_runtime = len(runtime_predictions)
+        n_covered = len(covered)
+        msg_zero = (
+            f'SignalsTable parity violation for decoder '
+            f'{decoder_id!r}: 0 comparisons made (runtime '
+            f'predictions={n_runtime}, expected ticks={n_covered}). '
+            f'The parity check did NOT run. Either the capture '
+            f'hook is broken, the subprocess payload is missing '
+            f'`runtime_predictions`, every captured entry was '
+            f'malformed, or `expected_ticks` was empty (caller '
+            f'bug — every per-window block must have at least one '
+            f'scheduled tick).'
+        )
+        raise ParityViolation(msg_zero)
     return n_compared

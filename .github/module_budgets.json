@@ -60,7 +60,7 @@
   "backtest_simulator/cli/_run_window.py": 530,
   "backtest_simulator/cli/commands/__init__.py": 10,
   "backtest_simulator/cli/commands/run.py": 420,
-  "backtest_simulator/cli/_signals_builder.py": 280,
+  "backtest_simulator/cli/_signals_builder.py": 360,
   "backtest_simulator/cli/_stats.py": 440,
   "backtest_simulator/cli/commands/sweep.py": 1080,
   "backtest_simulator/cli/commands/enrich.py": 60,

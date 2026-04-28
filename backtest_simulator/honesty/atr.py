@@ -66,15 +66,23 @@ def compute_atr_from_tape(
     true_ranges: list[Decimal] = []
     prev_close: Decimal | None = None
     for row in agg.iter_rows(named=True):
-        h = Decimal(str(row['_high']))
-        l = Decimal(str(row['_low']))
-        c = Decimal(str(row['_close']))
+        # Auditor (post-v2.0.3): renamed `l` -> `low` to satisfy
+        # ruff E741 ambiguous-variable rule (lowercase L vs digit
+        # 1). Same for the H/L/C trio kept side-by-side for
+        # readability of the Wilder TR formula.
+        high = Decimal(str(row['_high']))
+        low = Decimal(str(row['_low']))
+        close = Decimal(str(row['_close']))
         if prev_close is None:
-            tr = h - l
+            tr = high - low
         else:
-            tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+            tr = max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close),
+            )
         true_ranges.append(tr)
-        prev_close = c
+        prev_close = close
     if not true_ranges:
         return None
     return sum(true_ranges, Decimal('0')) / Decimal(str(len(true_ranges)))

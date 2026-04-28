@@ -1,3 +1,38 @@
+# v2.0.4
+
+Auditor batch (post-v2.0.3) — 2 P1 findings — plus codex's exhaustive scan caught 4 more P1s in 2 rounds. All closed before this version ships.
+
+## Auditor P1 #1 — Signals parity made MANDATORY (was silent-skippable)
+
+The v2.0.3 sweep guarded `assert_signals_parity` behind `if runtime_predictions and isinstance(..., list):`, so a broken capture hook or missing subprocess payload reached the final "no comparisons made" print as success.
+
+## Auditor P1 #2 — `bts gate lint` clean
+
+`honesty/atr.py:70`: `l` → `low` (E741). 4 other sites: ruff `--fix` for import-order + UP017 + UP037.
+
+## Codex round-1 P1 (a) — per-window subprocess swallow
+
+`commands/sweep.py:_run`'s per-window `try: ... except Exception: continue` swallowed all child failures. Codex's repro: `RuntimeError('child boom')` produced `rc=0` + cheerful "OK n_compared=0" line. Fix: `raise RuntimeError(...) from exc` with window context. New test `test_sweep_run_aborts_on_subprocess_exception` mutation-proofs the change.
+
+## Codex round-1 P1 (b) — `assert_signals_parity` per-entry strictness
+
+The helper silently skipped malformed (non-str timestamp / non-int pred) and out-of-grid entries when at least one comparison succeeded. Codex's repro: `runtime=[valid match, out-of-grid pred=99]` returned `1` OK despite the partial capture failure. Fix: every skipped entry raises (`non-string timestamp`, `non-int pred`, `OUTSIDE the scheduled`). Plus tests for each failure mode.
+
+## Codex round-1 P1 (c) — sweep-level unconditional parity-call mutation-proofing
+
+The unconditional `assert_signals_parity` call had no test catching its disablement. Codex restored `if runtime_preds_raw: continue` and the entire 319-test suite stayed green. Fix: new `test_sweep_run_calls_parity_unconditionally_even_with_empty_predictions` SPIES on the helper and asserts `n_calls == 1` even when the subprocess returns `runtime_predictions=[]`. Verified mutation-proof.
+
+## Codex round-2 P1 — Two-way multiset parity (per-window scoped)
+
+Even after round 1, parity was ONE-WAY: every captured runtime entry was validated, but missing expected ticks were silent. Codex repro: `runtime=[2 valid in-grid]` against 4 expected ticks returned `n=2` OK. Plus a cross-window leak: a first-window check accepted a second-day tick because sweep passed the full sweep `tick_timestamps` instead of the per-window slice. Fix:
+- `assert_signals_parity` parameter `tick_timestamps` → `expected_ticks` and now requires multiset equality. Missing expected ticks raise. Duplicate runtime ticks raise. Out-of-grid raise (already in round 1).
+- `commands/sweep.py:_run` now slices `[t for t in tick_timestamps if window_start <= t < window_end]` per window and passes that as `expected_ticks`.
+- New tests: `test_signals_parity_partial_capture_missing_tick_raises`, `test_signals_parity_duplicate_runtime_tick_raises`, `test_signals_parity_cross_window_in_sweep_grid_raises`. All mutation-tested.
+
+## Test totals after this version
+
+23 tests in the parity test suites alone (signals_parity + sweep_parity_guard + runtime_prediction_capture). 326+ across the full repo. Every codex mutation locally fired the relevant assertion.
+
 # v2.0.3
 
 Auditor batch (post-v2.0.2) — 3 P1 findings.

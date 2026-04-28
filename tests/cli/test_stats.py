@@ -10,7 +10,8 @@ decoder's returns flips the assertions.
 from __future__ import annotations
 
 import math
-from datetime import UTC, datetime, timedelta, time as dtime
+from datetime import UTC, datetime, timedelta
+from datetime import time as dtime
 from decimal import Decimal
 
 from backtest_simulator.cli._metrics import Trade

@@ -12,8 +12,6 @@ from enum import Enum
 from types import SimpleNamespace
 from typing import cast
 
-from backtest_simulator.honesty.atr import AtrSanityGate
-
 from nexus.core.domain.enums import OrderSide
 from nexus.core.domain.instance_state import InstanceState
 from nexus.core.domain.order_types import ExecutionMode as _NexusExecutionMode
@@ -38,6 +36,8 @@ from praxis.core.domain.enums import STPMode as _PraxisSTPMode
 from praxis.core.domain.single_shot_params import (
     SingleShotParams as _PraxisSingleShotParams,
 )
+
+from backtest_simulator.honesty.atr import AtrSanityGate
 
 _log = logging.getLogger(__name__)
 
