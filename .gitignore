@@ -1,0 +1,30 @@
+# Local credentials — never committed.
+.env
+.env.*
+!.env.example
+
+# Python build artefacts.
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Local working state.
+.coverage
+coverage.json
+pyright_output.json
+base_budget.json
+
+# IDE / OS.
+.DS_Store
+.idea/
+.vscode/
+.ipynb_checkpoints/
+
+# Tunneled / CSV artefacts (operator-local sweep outputs).
+e2e.csv
+min.csv
+tiny.csv
+logreg-binary-round-*.csv
+Untitled.ipynb

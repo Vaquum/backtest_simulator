@@ -8,7 +8,15 @@ import polars as pl
 
 
 class HistoricalFeed(Protocol):
-    """Reads historical bars and trades subject to the no-look-ahead invariant."""
+    """Strategy-facing market data reader, strict no-look-ahead.
+
+    The strategy-facing surface has *no* venue carve-out kwarg: a
+    cheating strategy with a feed reference cannot pass `venue_lookahead_seconds`
+    because the parameter is not on the Protocol and not on the
+    strategy-side reader at all. Venue-only access goes through
+    `get_trades_for_venue` on the implementation, which is
+    deliberately not part of this Protocol.
+    """
 
     def get_window(self, symbol: str, kline_size: int, n_rows: int) -> pl.DataFrame:
         """Return the latest `n_rows` rows with `timestamp <= frozen_now()`.
@@ -23,15 +31,36 @@ class HistoricalFeed(Protocol):
 
     def get_trades(
         self, symbol: str, start: datetime, end: datetime,
-        *, venue_lookahead_seconds: int = 0,
     ) -> pl.DataFrame:
-        """Return trades in [start, end].
+        """Return trades in [start, end] with `end <= frozen_now()`.
 
-        Strategy-facing callers (the default) MUST have `end <= frozen_now()`
-        or LookAheadViolation is raised. The simulated venue may pass
-        `venue_lookahead_seconds > 0` to consult trades within a bounded
-        fill-simulation window past the frozen clock; the ceiling is the
-        adapter's declared `trade_window_seconds`.
+        Strict strategy-facing path: there is no venue carve-out kwarg
+        and the implementation MUST raise `LookAheadViolation` if `end`
+        is past the frozen clock. The simulated venue uses a separate
+        bounded-carve-out method (`get_trades_for_venue`) that is not
+        part of this Protocol — strategies cannot reach it through the
+        public Protocol surface.
         """
+        del symbol, start, end
+        raise NotImplementedError
+
+
+class VenueFeed(HistoricalFeed, Protocol):
+    """Adapter-facing feed: `HistoricalFeed` + the bounded-carve-out method.
+
+    The simulated venue adapter needs to peek up to its declared
+    `trade_window_seconds` past `frozen_now()` to simulate a realistic
+    submit/fill window. That carve-out lives on `get_trades_for_venue`,
+    NOT on `HistoricalFeed`. Adapters type their feed parameter as
+    `VenueFeed` so a strategy-only feed (one that satisfies only the
+    `HistoricalFeed` Protocol) cannot accidentally be plugged in and
+    crash on submit. Codex pinned this contract in slice #17 Task 6.
+    """
+
+    def get_trades_for_venue(
+        self, symbol: str, start: datetime, end: datetime,
+        *, venue_lookahead_seconds: int,
+    ) -> pl.DataFrame:
+        """Return trades in [start, end] with `end <= now + carve-out`."""
         del symbol, start, end, venue_lookahead_seconds
         raise NotImplementedError

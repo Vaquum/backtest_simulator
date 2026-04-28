@@ -1,13 +1,35 @@
 """FillModel — strict-live-reality tape matching; fills at actual tape price, never at declared stop."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 import polars as pl
 
 from backtest_simulator.venue.filters import BinanceSpotFilters
 from backtest_simulator.venue.types import FillModelConfig, FillResult, PendingOrder
+
+if TYPE_CHECKING:
+    from backtest_simulator.honesty.book_gap import BookGapInstrument
+    from backtest_simulator.honesty.maker_fill import MakerFillModel
+
+
+@dataclass(frozen=True)
+class WalkContext:
+    """Optional auxiliary inputs for `walk_trades`.
+
+    Bundles the three optional kw-only parameters (maker model,
+    pre-submit trades for queue calibration, book-gap instrument)
+    so `walk_trades` keeps a 5-argument surface — ruff's PLR0913
+    cap. Every field defaults to None so callers that don't need
+    a specific feature can omit it cleanly.
+    """
+
+    maker_model: MakerFillModel | None = None
+    trades_pre_submit: pl.DataFrame | None = None
+    book_gap_instrument: BookGapInstrument | None = None
 
 # Governing principle (from PR #15 body): backtest ≡ paper ≡ live. One
 # methodology. When the three environments disagree, the one that matches
@@ -36,6 +58,7 @@ def walk_trades(
     trades: pl.DataFrame,
     config: FillModelConfig,
     filters: BinanceSpotFilters,
+    context: WalkContext | None = None,
 ) -> list[FillResult]:
     """Match `order` against the historical `trades` stream — strict-live-reality.
 
@@ -44,8 +67,15 @@ def walk_trades(
     breach the walk HALTS and only the pre-breach qty fills at its
     actual tape prices; no residual is booked at the declared stop.
 
-    LIMIT goes taker if crossed at submit, otherwise maker-queued; an
-    incoming trade later at or beyond the limit fills the maker leg.
+    LIMIT — when `maker_model` is supplied, the maker engine walks the
+    queue against post-submit aggressors and emits fills as queue
+    position depletes. The optional `trades_pre_submit` slice (from
+    the same widened venue fetch) seeds the maker's initial queue
+    position from `[submit_time - lookback_minutes, submit_time)` —
+    the venue derives this slice fresh per submit so an order
+    submitted hours after `window_start` still has a live lookback.
+    When `maker_model` is None, the legacy O(1) "first crossing tick
+    = full fill at limit price" path runs.
 
     STOP_LOSS / STOP_LOSS_LIMIT / TAKE_PROFIT: the tape triggers the
     stop on the FIRST tick at or past `stop_price`. The fill lands at
@@ -56,12 +86,17 @@ def walk_trades(
     window = trades.filter(pl.col('time') >= submit_ts).sort('time')
     if window.is_empty():
         return []
+    ctx = context if context is not None else WalkContext()
     if order.order_type == 'MARKET':
         return _walk_market(order, window, filters)
     if order.order_type == 'LIMIT':
-        return _walk_limit(order, window, filters)
+        return _walk_limit(
+            order, window, filters,
+            maker_model=ctx.maker_model,
+            trades_pre_submit=ctx.trades_pre_submit,
+        )
     if order.order_type in {'STOP_LOSS', 'STOP_LOSS_LIMIT', 'TAKE_PROFIT'}:
-        return _walk_stop(order, window, filters)
+        return _walk_stop(order, window, filters, ctx.book_gap_instrument)
     return []
 
 
@@ -133,7 +168,88 @@ def _walk_market(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpot
     )]
 
 
-def _walk_limit(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFilters) -> list[FillResult]:
+def _walk_limit(
+    order: PendingOrder,
+    window: pl.DataFrame,
+    filters: BinanceSpotFilters,
+    *,
+    maker_model: MakerFillModel | None = None,
+    trades_pre_submit: pl.DataFrame | None = None,
+) -> list[FillResult]:
+    """LIMIT fill path.
+
+    With `maker_model` attached: ALWAYS route through the maker
+    engine. The engine's queue-position logic decides whether the
+    first crossing aggressor fills us as maker (queue=0 → fill at
+    our limit) or doesn't (queue still depleting). Pre-fix, this
+    function decided "marketable at submit" from `window.row(0)` —
+    but for a passive maker pinned at touch, the very first
+    crossing print IS the aggressor that should test our queue, not
+    a sign the limit was already through the book. Misrouting
+    those to taker booked taker VWAP/fees and zeroed maker
+    telemetry on the most common case (touch-pinned LIMIT meeting
+    its first SELL aggressor at touch). Codex P2 pinned this.
+
+    Without `maker_model`: the legacy "marketable at first tick →
+    taker, otherwise full-fill at limit on first cross" path. This
+    is the unrealistic ceiling that the maker engine is wired to
+    replace, but is preserved for sites that don't supply the
+    model (tests, calls without explicit calibration).
+
+    `trades_pre_submit` is the same-fetch pre-submit slice the venue
+    derives from the widened `get_trades_for_venue` query. It
+    seeds the maker engine's initial queue position from
+    `[submit_time - lookback_minutes, submit_time)`. None falls
+    through to the model's stored calibration tape (best-case maker).
+    """
+    if order.limit_price is None:
+        return []
+    if maker_model is None:
+        return _walk_limit_legacy(order, window, filters)
+    # Realistic maker path: rename the venue-feed columns to the
+    # MakerFillModel contract (`time→datetime`, `qty→quantity`),
+    # walk the queue, convert ImmediateFill list → ONE FillResult.
+    # Codex P1 caught the prior shape: emitting one FillResult per
+    # ImmediateFill produced multiple `BUY` trade records for a
+    # single LIMIT order, and `pair_trades` (cli/_metrics.py)
+    # overwrites `open_buy` each BUY before the closing SELL,
+    # silently dropping all but the last partial from sweep PnL.
+    # `_walk_market` aggregates its multi-tick fills into one
+    # VWAP'd FillResult for the same reason — match the shape
+    # here so the pairing logic sees one entry per order.
+    renamed = window.rename({'time': 'datetime', 'qty': 'quantity'})
+    pre = (
+        None if trades_pre_submit is None or trades_pre_submit.is_empty()
+        else trades_pre_submit.rename({'time': 'datetime', 'qty': 'quantity'})
+    )
+    immediates = maker_model.evaluate(
+        order=order, trades_in_window=renamed,
+        trades_pre_submit=pre,
+    )
+    if not immediates:
+        return []
+    total_qty = sum((imm.fill_qty for imm in immediates), Decimal('0'))
+    if total_qty <= Decimal('0'):
+        return []
+    total_notional = sum(
+        (imm.fill_qty * imm.fill_price for imm in immediates),
+        Decimal('0'),
+    )
+    vwap_price = total_notional / total_qty
+    return [FillResult(
+        fill_time=immediates[-1].fill_time,
+        fill_price=filters.round_price(vwap_price),
+        fill_qty=filters.round_qty(total_qty),
+        is_maker=True, reason='limit_maker',
+    )]
+
+
+def _walk_limit_legacy(
+    order: PendingOrder,
+    window: pl.DataFrame,
+    filters: BinanceSpotFilters,
+) -> list[FillResult]:
+    """Legacy LIMIT path: marketable→taker, else first-crossing full-fill."""
     if order.limit_price is None:
         return []
     first_px = Decimal(str(window.row(0, named=True)['price']))
@@ -141,7 +257,15 @@ def _walk_limit(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotF
         order.side == 'SELL' and first_px >= order.limit_price
     )
     if crossed:
-        return _walk_market(order, window, filters)
+        taker_fills = _walk_market(order, window, filters)
+        return [
+            FillResult(
+                fill_time=f.fill_time, fill_price=f.fill_price,
+                fill_qty=f.fill_qty, is_maker=False,
+                reason='limit_taker',
+            )
+            for f in taker_fills
+        ]
     for row in window.iter_rows(named=True):
         px = Decimal(str(row['price']))
         cross = (order.side == 'BUY' and px <= order.limit_price) or (
@@ -151,12 +275,18 @@ def _walk_limit(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotF
             return [FillResult(
                 fill_time=_ts(row['time']),
                 fill_price=filters.round_price(order.limit_price),
-                fill_qty=filters.round_qty(order.qty), is_maker=True, reason='limit_maker',
+                fill_qty=filters.round_qty(order.qty),
+                is_maker=True, reason='limit_maker',
             )]
     return []
 
 
-def _walk_stop(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFilters) -> list[FillResult]:
+def _walk_stop(
+    order: PendingOrder,
+    window: pl.DataFrame,
+    filters: BinanceSpotFilters,
+    book_gap_instrument: BookGapInstrument | None = None,
+) -> list[FillResult]:
     # STOP_LOSS / STOP_LOSS_LIMIT / TAKE_PROFIT: the tape triggers the
     # stop on the first tick at or past `stop_price`. The fill lands
     # at THAT TICK'S ACTUAL PRICE — not at `stop_price` — because
@@ -171,18 +301,36 @@ def _walk_stop(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFi
     # the same as STOP_LOSS (fill at first-tick price) — strict LIMIT
     # semantics after trigger are a follow-up refinement. Conservative
     # choice: same fill path, same realism.
+    #
+    # Slice #17 Task 11 — book-gap instrumentation. When a
+    # `book_gap_instrument` is supplied, record the gap between the
+    # last sub-stop tape tick (`prev_time`) and the trigger tick
+    # (`row_time`). On a first-row trigger (no prior sub-stop tick),
+    # `t_cross = t_first_trade` and the recorded gap is 0 — the
+    # primitive's `n_stops_observed` still counts that as one
+    # observation (codex round 1 P1: dropping zero-gap samples
+    # would make `n_stops_observed` mean something other than
+    # "number of stop triggers observed").
     if order.stop_price is None:
         return []
     stop = order.stop_price
+    prev_time: datetime | None = None
     for row in window.iter_rows(named=True):
         px = Decimal(str(row['price']))
         triggered = (order.side == 'SELL' and px <= stop) or (order.side == 'BUY' and px >= stop)
         if triggered:
+            row_time = _ts(row['time'])
+            if book_gap_instrument is not None:
+                book_gap_instrument.record_stop_cross(
+                    t_cross=prev_time if prev_time is not None else row_time,
+                    t_first_trade=row_time,
+                )
             return [FillResult(
-                fill_time=_ts(row['time']),
+                fill_time=row_time,
                 fill_price=filters.round_price(px),
                 fill_qty=filters.round_qty(order.qty), is_maker=False, reason='stop_trigger',
             )]
+        prev_time = _ts(row['time'])
     return []
 
 

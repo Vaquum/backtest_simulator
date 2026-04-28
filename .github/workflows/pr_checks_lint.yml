@@ -48,6 +48,7 @@ jobs:
             'ruff==0.15.11' \
             'vulture>=2.14' \
             'coverage[toml]>=7.6' \
+            'pyright==1.1.408' \
             pytest
           # The coverage step runs `pytest tests/` across every test
           # file, including the honesty and launcher suites that import

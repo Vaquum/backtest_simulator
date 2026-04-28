@@ -10,7 +10,15 @@ from limen import HistoricalData
 
 _log = logging.getLogger(__name__)
 
-_DEFAULT_START_DATE_LIMIT = '2019-01-01 00:00:00'
+# Public (no leading underscore) so callers that mirror the poller's
+# fetch semantics — slice #17 Task 16's `_signals_builder.py`, which
+# rebuilds at sweep time exactly the slice the poller serves at
+# runtime — can pin to the same constants without reaching into
+# private state. Changing either default here shifts both runtime
+# and sweep-replay together, preserving "strategy tested, strategy
+# deployed".
+DEFAULT_START_DATE_LIMIT = '2019-01-01 00:00:00'
+DEFAULT_N_ROWS = 5000
 
 
 class BacktestMarketDataPoller:
@@ -31,9 +39,9 @@ class BacktestMarketDataPoller:
     def __init__(
         self,
         kline_intervals: dict[int, int] | None = None,
-        n_rows: int = 5000,
+        n_rows: int = DEFAULT_N_ROWS,
         historical_data: HistoricalData | None = None,
-        start_date_limit: str = _DEFAULT_START_DATE_LIMIT,
+        start_date_limit: str = DEFAULT_START_DATE_LIMIT,
     ) -> None:
         self._n_rows = n_rows
         self._historical_data = historical_data or HistoricalData()

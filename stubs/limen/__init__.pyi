@@ -10,9 +10,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from polars import DataFrame as _DataFrame
+
 
 class HistoricalData:
-    data: Any  # noqa: ANN401 - Polars DataFrame; we cast at consumer boundary
+    data: _DataFrame
     data_columns: list[str]
 
     def __init__(self) -> None: ...
@@ -22,7 +24,7 @@ class HistoricalData:
         n_rows: int | None = ...,
         kline_size: int = ...,
         start_date_limit: str | None = ...,
-    ) -> Any: ...  # noqa: ANN401
+    ) -> _DataFrame: ...
 
 
 class Sensor:
@@ -31,7 +33,19 @@ class Sensor:
 
 
 class Trainer:
-    def __init__(self, *, experiment_dir: str | Path) -> None: ...
+    # The real Limen Trainer sets `_manifest` and `_round_data`
+    # in `__init__`. We expose them here so the bts sweep can read
+    # the manifest config + per-permutation params without
+    # reaching past Limen's underscore at the call site (which
+    # pyright would flag as `reportPrivateUsage`).
+    _manifest: Any  # noqa: ANN401 - Limen's Manifest; consumed via .data_source_config / .split_config
+    _round_data: dict[int, dict[str, Any]]  # noqa: ANN401 - per-pid run params dict
+
+    def __init__(
+        self,
+        experiment_dir: str | Path,
+        data: Any = ...,  # noqa: ANN401 - Polars DataFrame | None
+    ) -> None: ...
     def train(self, permutation_ids: object) -> list[Sensor]: ...
 
 

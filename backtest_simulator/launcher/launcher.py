@@ -9,6 +9,7 @@ import os
 import queue
 import threading
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -21,23 +22,30 @@ from limen import HistoricalData
 from nexus.core.domain.capital_state import CapitalState
 from nexus.core.domain.enums import OperationalMode
 from nexus.core.domain.instance_state import InstanceState
+from nexus.core.outcome_loop import ActionSubmitter, OutcomeLoop
 from nexus.core.validator.pipeline_models import (
     ValidationDecision,
     ValidationRequestContext,
 )
 from nexus.infrastructure.manifest import load_manifest
+
+# Use module-qualified import to keep pyright's symbol table from
+# binding the bare name `TradeOutcome` to nexus's class. The override
+# variance check on `_run_nexus_instance` was misresolving the
+# parameter to nexus when both imports landed in the same scope.
+from nexus.infrastructure.praxis_connector import (
+    trade_outcome as _nexus_trade_outcome_mod,
+)
 from nexus.infrastructure.praxis_connector.praxis_inbound import PraxisInbound
 from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
-from nexus.infrastructure.praxis_connector.trade_outcome import (
-    TradeOutcome as NexusTradeOutcome,
-)
 from nexus.infrastructure.state_store import StateStore
 from nexus.instance_config import InstanceConfig as NexusInstanceConfig
-from nexus.startup.sequencer import StartupSequencer
+from nexus.startup.sequencer import StartupSequencer, WiredSensor
 from nexus.startup.shutdown_sequencer import ShutdownSequencer
 from nexus.strategy.action import Action
 from nexus.strategy.context import StrategyContext
 from nexus.strategy.predict_loop import PredictLoop
+from nexus.strategy.runner import StrategyRunner
 from nexus.strategy.timer_loop import TimerLoop
 from praxis.core.domain.enums import OrderSide, OrderType
 from praxis.core.domain.trade_outcome import TradeOutcome
@@ -52,12 +60,15 @@ from backtest_simulator.honesty import (
     build_validation_pipeline,
     capital_totals,
 )
+from backtest_simulator.honesty.atr import AtrSanityGate
 from backtest_simulator.launcher.action_submitter import (
     SubmitterBindings,
     build_action_submitter,
 )
 from backtest_simulator.launcher.clock import accelerated_clock
 from backtest_simulator.launcher.poller import BacktestMarketDataPoller
+
+NexusTradeOutcome = _nexus_trade_outcome_mod.TradeOutcome
 
 _log = logging.getLogger(__name__)
 
@@ -211,13 +222,28 @@ def _maybe_inject_declared_stop(
     stop_price: Decimal | None,
     tracker: CapitalLifecycleTracker,
     declared_stops: dict[str, Decimal],
+    order_type: OrderType,
 ) -> Decimal | None:
     """Return the stop_price to forward to `submit_order`.
 
-    Praxis's `validate_trade_command` strips stop_price from MARKET
-    orders before the command reaches here. We look up the command
-    via its client_order_id and inject the honest declared stop so
-    FillModel.apply_stop can enforce it during the trade walk.
+    Praxis's `validate_trade_command` strips stop_price from non-stop
+    order types (MARKET / LIMIT) before the command reaches here. We
+    look up the command's BTS-declared protective stop via the
+    `client_order_id` and stash it in `declared_stops` for the
+    R-multiple metric to read later, regardless of `order_type`.
+
+    For MARKET orders we ALSO inject the declared stop back into the
+    venue's `stop_price` kwarg so `walk_market` halts on breach and
+    the entry walk respects the protective stop in-line.
+
+    For LIMIT orders we do NOT inject. A LIMIT entry's mechanics are
+    "fill at limit price if the tape crosses, otherwise rest" — the
+    protective stop is a separate STOP_LOSS exit order, not part of
+    the LIMIT order. Injecting the declared stop into a LIMIT would
+    also fail the venue's PRICE_FILTER tick check (the BTS R-anchor
+    is a Kelly-derived fractional price, not a venue-quoted stop
+    trigger), and every LIMIT entry would land as REJECTED. This
+    was the failure pinned during maker-fill wiring.
     """
     if pre_match_command_id is None or stop_price is not None:
         return stop_price
@@ -226,7 +252,9 @@ def _maybe_inject_declared_stop(
         return stop_price
     if client_order_id is not None:
         declared_stops[client_order_id] = declared_stop
-    return declared_stop
+    if order_type == OrderType.MARKET:
+        return declared_stop
+    return stop_price
 
 
 def _sum_fill_totals(result: SubmitResult) -> tuple[Decimal, Decimal]:
@@ -237,6 +265,14 @@ def _sum_fill_totals(result: SubmitResult) -> tuple[Decimal, Decimal]:
         fill_notional += Decimal(str(fill.qty)) * Decimal(str(fill.price))
         fill_fees += Decimal(str(fill.fee))
     return fill_notional, fill_fees
+
+
+def _sum_fill_qty(result: SubmitResult) -> Decimal:
+    """Sum the result's immediate_fills into total filled quantity."""
+    total = Decimal('0')
+    for fill in result.immediate_fills:
+        total += Decimal(str(fill.qty))
+    return total
 
 
 def _finalize_successful_fill(
@@ -282,6 +318,10 @@ def _finalize_successful_fill(
             'unfilled reservation residual back to available capital.',
             command_id, fill_notional, venue_order_id,
         )
+    # Capture the strategy_id BEFORE record_ack_and_fill pops the
+    # pending entry — record_open_position (called below) needs
+    # it to attribute the open position to the right strategy.
+    pending_strategy_id = ctx.tracker.strategy_id_for_pending(command_id)
     ctx.tracker.record_ack_and_fill(
         command_id, venue_order_id, fill_notional, fill_fees,
         release_residual=release_residual,
@@ -290,11 +330,235 @@ def _finalize_successful_fill(
         ctx.capital_state, ctx.initial_pool,
         context=f'order_fill command_id={command_id}',
     )
+    # BUY fills open a position; remember the cost basis + entry
+    # fees so the matching SELL can release them on close. The
+    # capital_state.position_notional already carries this amount
+    # (controller.order_fill moved it from working_order_notional);
+    # the tracker keeps a parallel ledger so `record_close_position`
+    # can subtract the exact cost basis without poking through the
+    # controller's internals. Codex round 4 P0 fix.
+    fill_qty = _sum_fill_qty(result)
+    ctx.tracker.record_open_position(
+        command_id=command_id,
+        strategy_id=pending_strategy_id or 'unknown',
+        cost_basis=fill_notional,
+        entry_fees=fill_fees,
+        entry_qty=fill_qty,
+    )
     _log.info(
         'capital lifecycle: command_id=%s reserve->send->ack->fill%s '
-        'venue_order_id=%s fill_notional=%s fees=%s',
+        'venue_order_id=%s fill_notional=%s fees=%s open_positions=%d',
         command_id, '+cancel' if release_residual else '',
         venue_order_id, fill_notional, fill_fees,
+        ctx.tracker.open_position_count,
+    )
+
+
+def _finalize_sell_close(
+    ctx: _LifecycleContext,
+    result: SubmitResult,
+    sell_command_id: str,
+) -> None:
+    """Run the SELL-fill close-position lifecycle.
+
+    Pulls the FIFO-oldest open position via
+    `tracker.record_close_position`, which mutates
+    `capital_state.position_notional` (releases the proportional
+    cost basis + entry fees) and `per_strategy_deployed` (releases
+    proportional attribution). `capital_pool` is NOT touched —
+    the controller treats it as immutable budget, SELL proceeds
+    are realized PnL not new budget. Returns the realized PnL for
+    the closed leg and asserts conservation afterwards.
+
+    Partial SELL fills only release the SOLD portion of the open
+    position; the residual entry stays open for the next preds=0
+    to finish closing (codex round 5 P2).
+
+    The realized PnL is logged on the lifecycle line so the
+    operator can audit per-trade economics directly from the run
+    log; the trade-pair-level R / return are still computed
+    downstream in `cli/_metrics.py::print_run` (those use the
+    declared-stop-anchored R, which doesn't depend on the capital
+    ledger). Pre-fix the SELL exit silently bypassed this whole
+    flow — codex round 4 P0.
+    """
+    sell_proceeds, sell_fees = _sum_fill_totals(result)
+    sell_qty = _sum_fill_qty(result)
+    realized_pnl, closed_record = ctx.tracker.record_close_position(
+        ctx.capital_state,
+        sell_command_id=sell_command_id,
+        sell_qty=sell_qty,
+        sell_proceeds=sell_proceeds,
+        sell_fees=sell_fees,
+    )
+    assert_conservation(
+        ctx.capital_state, ctx.initial_pool,
+        context=f'sell_close sell_command_id={sell_command_id}',
+    )
+    _log.info(
+        'capital lifecycle: SELL close sell_command_id=%s '
+        'paired_buy_command_id=%s released_cost_basis=%s '
+        'released_entry_fees=%s sell_qty=%s sell_proceeds=%s '
+        'sell_fees=%s realized_pnl=%s open_positions=%d',
+        sell_command_id, closed_record.command_id,
+        closed_record.cost_basis, closed_record.entry_fees,
+        sell_qty, sell_proceeds, sell_fees, realized_pnl,
+        ctx.tracker.open_position_count,
+    )
+
+
+def _outcome_queues_for(trading: object) -> dict[str, queue.Queue[NexusTradeOutcome]]:
+    """Return Trading's per-account outcome-queue dict.
+
+    Trading exposes `register_outcome_queue` /
+    `unregister_outcome_queue` publicly but not the dict of queues
+    itself. Read via `vars()` rather than direct private-attr access
+    (the latter trips ruff SLF001) so the wiring stays explicit
+    about reaching into Trading's internals — a known coupling
+    that disappears once Trading exposes the queues publicly.
+    """
+    raw = vars(trading)['_outcome_queues']
+    return cast(
+        'dict[str, queue.Queue[NexusTradeOutcome]]',
+        raw,
+    )
+
+
+def _translate_praxis_outcome(
+    praxis_outcome: TradeOutcome,
+) -> NexusTradeOutcome | None:
+    """Convert a Praxis `TradeOutcome` into Nexus's `TradeOutcome` shape.
+
+    The two `TradeOutcome` dataclasses differ:
+      - Praxis: `command_id`, `trade_id`, `account_id`, `status`,
+        `target_qty`, `filled_qty`, `avg_fill_price`, `created_at`...
+      - Nexus: `outcome_id`, `command_id`, `outcome_type`, `timestamp`,
+        `fill_size`, `fill_price`, `fill_notional`, `actual_fees`...
+
+    Mapping:
+      - `outcome_id` ← `f'{command_id}-{status.value}'` (Praxis carries
+        no outcome_id; deterministic synthetic id from command + status
+        is enough for the strategy state machine to dedup).
+      - `outcome_type`: Praxis FILLED/PARTIAL/REJECTED/EXPIRED/CANCELED
+        map 1:1; Praxis PENDING with `filled_qty==0` after the
+        backtest's bounded lookahead means "no fill in window" —
+        translate to Nexus EXPIRED so the strategy's `_pending_buy`
+        gets cleared (codex P1: leaving PENDING dropped silently let
+        zero-fill LIMITs jam the strategy's pending-buy gate forever).
+      - `fill_size` ← `filled_qty` (delta from prior outcome would be
+        more precise; for our single-outcome-per-command backtest
+        cumulative IS the delta).
+      - `fill_price` ← `avg_fill_price`
+      - `fill_notional` ← `filled_qty * avg_fill_price`
+      - `actual_fees` ← Decimal('0') (Praxis TradeOutcome carries no
+        fee aggregate; the per-fill fees live on the venue's
+        `Account.trades`. The strategy state machine doesn't read
+        actual_fees, so 0 is honest enough for state reconciliation
+        — pinning it here keeps the deeper "real fees on outcomes"
+        slice for a follow-up).
+      - `reject_reason` ← Praxis `reason` (or a synthesized fallback
+        for non-empty validation requirement on REJECTED outcomes;
+        codex P2 caught the post-init blow-up otherwise).
+    """
+    from nexus.infrastructure.praxis_connector.trade_outcome_type import (
+        TradeOutcomeType,
+    )
+    from praxis.core.domain.enums import TradeStatus
+    status = praxis_outcome.status
+    type_map = {
+        TradeStatus.FILLED: TradeOutcomeType.FILLED,
+        TradeStatus.PARTIAL: TradeOutcomeType.PARTIAL,
+        TradeStatus.REJECTED: TradeOutcomeType.REJECTED,
+        TradeStatus.EXPIRED: TradeOutcomeType.EXPIRED,
+        TradeStatus.CANCELED: TradeOutcomeType.CANCELED,
+        # Praxis stamps PENDING when the order was accepted but no
+        # fill landed within the deadline. In our bounded-lookahead
+        # backtest that IS terminal — no later outcome will arrive
+        # for the same command. Map to EXPIRED so the strategy
+        # clears `_pending_buy` and the next signal can re-enter.
+        TradeStatus.PENDING: TradeOutcomeType.EXPIRED,
+    }
+    nexus_type = type_map.get(status)
+    if nexus_type is None:
+        return None
+    is_fill = status in {TradeStatus.FILLED, TradeStatus.PARTIAL}
+    fill_size = praxis_outcome.filled_qty if is_fill else None
+    fill_price = praxis_outcome.avg_fill_price if is_fill else None
+    fill_notional = (
+        praxis_outcome.filled_qty * praxis_outcome.avg_fill_price
+        if is_fill and praxis_outcome.avg_fill_price is not None
+        else None
+    )
+    actual_fees = Decimal('0') if is_fill else None
+    reject_reason = (
+        praxis_outcome.reason if praxis_outcome.reason
+        else f'translated-from-praxis-{status.value}'
+    ) if status == TradeStatus.REJECTED else praxis_outcome.reason
+    return NexusTradeOutcome(
+        outcome_id=f'{praxis_outcome.command_id}-{status.value}',
+        command_id=praxis_outcome.command_id,
+        outcome_type=nexus_type,
+        timestamp=praxis_outcome.created_at,
+        fill_size=fill_size,
+        fill_price=fill_price,
+        fill_notional=fill_notional,
+        actual_fees=actual_fees,
+        reject_reason=reject_reason,
+    )
+
+
+def _build_outcome_loop(
+    *,
+    runner: StrategyRunner,
+    praxis_inbound: PraxisInbound,
+    state: InstanceState,
+    context_provider: Callable[[str], StrategyContext],
+    wired_sensors: Sequence[WiredSensor],
+    action_submit: ActionSubmitter,
+) -> OutcomeLoop:
+    """Wire up the Nexus `OutcomeLoop` for backtest-runtime outcome dispatch.
+
+    Without an `OutcomeLoop`, `TradeOutcome`s pile up in the queue
+    and never reach the strategy's `on_outcome` — which broke
+    `--maker` runs where the strategy reconciles `_long` /
+    `_entry_qty` from actual fills (a partial-fill BUY LIMIT would
+    leave the strategy thinking it's flat forever; a zero-fill BUY
+    would let a later preds=0 emit a phantom SELL). Codex P1
+    pinned this.
+
+    `resolve_strategy_id` returns the single registered
+    strategy_id — backtest manifests today wire one strategy per
+    instance, so the resolver doesn't need a per-command registry.
+    Multiple strategies on one instance would need that — fail
+    loud here so the gap doesn't smuggle the wrong on_outcome
+    target into a multi-strategy backtest.
+    """
+    if not wired_sensors:
+        msg = (
+            'BacktestLauncher: no wired sensors after sequencer.start(); '
+            'OutcomeLoop has nothing to resolve outcomes against.'
+        )
+        raise RuntimeError(msg)
+    strategy_ids = {s.strategy_id for s in wired_sensors}
+    if len(strategy_ids) != 1:
+        msg = (
+            f'BacktestLauncher: multiple strategy_ids wired '
+            f'({sorted(strategy_ids)}) — outcome resolution requires '
+            f'a per-command registry, not yet implemented.'
+        )
+        raise RuntimeError(msg)
+    single = next(iter(strategy_ids))
+
+    def _resolve(_outcome: NexusTradeOutcome) -> str | None:
+        return single
+
+    return OutcomeLoop(
+        runner=runner,
+        praxis_inbound=praxis_inbound,
+        state=state,
+        context_provider=context_provider,
+        resolve_strategy_id=_resolve,
+        action_submit=action_submit,
     )
 
 
@@ -339,7 +603,7 @@ def _install_capital_adapter_wrapper(
         _check_tracker_match_required(pre_match_command_id, side, client_order_id)
         stop_price = _maybe_inject_declared_stop(
             pre_match_command_id, client_order_id, stop_price,
-            tracker, declared_stops,
+            tracker, declared_stops, order_type,
         )
         # If the original adapter raises mid-submit we MUST release
         # the capital reservation — otherwise the reservation stays
@@ -359,19 +623,60 @@ def _install_capital_adapter_wrapper(
                 assert_conservation(
                     capital_state, initial_pool,
                     context=f'adapter_raised command_id={pre_match_command_id}',
-                )
+                            )
             raise
         command_id = _match_command_id(tracker, client_order_id)
-        if command_id is None:
-            _log.info(
-                'capital lifecycle: no pending command matches '
-                'client_order_id=%s (expected for SELL exits); '
-                'pending_count=%d',
-                client_order_id, tracker.pending_count,
-            )
-            return result
         venue_order_id = result.venue_order_id
         status_name = result.status.name
+        if command_id is None:
+            # SELL exits don't go through the BUY reservation
+            # tracker (no `record_reservation` call) — the
+            # action_submitter's SELL fast-path skips
+            # validation_pipeline.validate (see TODO Task 27 for
+            # the architectural decision: CapitalController has
+            # no close_position primitive, so the close
+            # lifecycle is BTS-side via
+            # `record_close_position`). The CLOSE half releases
+            # the matched BUY's `cost_basis + entry_fees` from
+            # `position_notional` and decrements
+            # `per_strategy_deployed[strategy_id]` by the same
+            # amount; `capital_pool` stays untouched (it's the
+            # immutable strategy budget, not a cash ledger).
+            # Codex round 4 P0: pre-fix this branch just
+            # logged-and-returned, so `position_notional` and
+            # the per-strategy attribution dict went
+            # permanently out of sync after every close.
+            # `.name` comparison instead of `is` / `==` against
+            # Praxis's OrderSide so the branch still fires when
+            # callers pass the Nexus-side OrderSide enum (the
+            # adapter Protocol type-annotates Praxis but Nexus's
+            # action_submitter and several tests use Nexus's
+            # enum — both have `.name == 'SELL'` on the SELL
+            # member). Identity comparison on `is`/`==` returns
+            # False across the two distinct Enum classes even
+            # though they're behaviourally identical.
+            if (
+                side.name == 'SELL'
+                and status_name in ('FILLED', 'PARTIALLY_FILLED')
+                and result.immediate_fills
+            ):
+                # Both FILLED and PARTIALLY_FILLED feed the close
+                # flow; `record_close_position` releases the
+                # proportional share of the matched BUY's cost
+                # basis (sold qty / entry qty) and leaves the
+                # residual open if any. The strategy's
+                # `_pending_sell` clears on the outcome dispatch
+                # so the next preds=0 can finish the residual.
+                _finalize_sell_close(
+                    ctx, result, client_order_id or 'unknown',
+                )
+            else:
+                _log.info(
+                    'capital lifecycle: no pending command matches '
+                    'client_order_id=%s; pending_count=%d',
+                    client_order_id, tracker.pending_count,
+                )
+            return result
         # REJECTED (filter rejection, never reached the venue) and
         # EXPIRED (validated, sent to the venue, didn't fill in window)
         # both terminate without a fill, but their lifecycle audit
@@ -395,7 +700,7 @@ def _install_capital_adapter_wrapper(
             assert_conservation(
                 capital_state, initial_pool,
                 context=f'order_reject command_id={command_id}',
-            )
+                    )
             _log.info(
                 'capital lifecycle: command_id=%s %s (reservation released)',
                 command_id, status_name,
@@ -404,24 +709,33 @@ def _install_capital_adapter_wrapper(
         if status_name == 'OPEN':
             # `OPEN` means a GTC LIMIT / STOP_LOSS / STOP_LOSS_LIMIT /
             # TAKE_PROFIT order is resting on the book waiting to
-            # trigger or cross. The capital lifecycle should keep the
-            # reservation locked AND keep the tracker entry alive
-            # (cancel/fill events arrive later). M1's strategy template
-            # only emits MARKET orders, so OPEN should never appear
-            # here in practice; if it does, fall through to
-            # `_finalize_successful_fill` would silently leak working-
-            # order notional. Fail loud with a pointer to the gap so
-            # future LIMIT support adds the proper resting-order path
-            # rather than masking it.
-            msg = (
-                f'OPEN status returned for command_id={command_id} venue_order_id='
-                f'{venue_order_id}: M1 emits MARKET only and the resting-order '
-                f'capital lifecycle path (record_resting / cancel coordination) '
-                f'is not yet wired. Adding LIMIT-style support requires extending '
-                f'`CapitalLifecycleTracker` and this branch together — see '
-                f'`_finalize_successful_fill` for the analogous fill path.'
+            # trigger or cross. In live this is a long-lived state;
+            # in the backtest the venue evaluates the entire post-
+            # submit `trade_window_seconds` slice in one shot via
+            # `MakerFillModel.evaluate`, so OPEN at return-time means
+            # "the maker engine ran and produced zero fills inside
+            # the lookahead window." There will be no later fill
+            # event — this slice's MakerFillModel does not stream;
+            # the order's effective lifetime IS the lookahead.
+            # Treat as EXPIRED for capital lifecycle purposes:
+            # `record_sent` then `record_rejection` releases the
+            # reservation, matching the audit trail of a venue-
+            # accepted order that didn't trade. The order remains
+            # in `account.orders` with status=OPEN so the operator
+            # can see it surfaced in maker-fill telemetry
+            # (`n_limit_filled_zero` increments).
+            tracker.record_sent(command_id, venue_order_id)
+            tracker.record_rejection(command_id, venue_order_id)
+            assert_conservation(
+                capital_state, initial_pool,
+                context=f'limit_open_no_fill command_id={command_id}',
+                    )
+            _log.info(
+                'capital lifecycle: command_id=%s OPEN (LIMIT no-fill in '
+                'lookahead window — reservation released)',
+                command_id,
             )
-            raise RuntimeError(msg)
+            return result
         _finalize_successful_fill(
             ctx, command_id, result, venue_order_id, status_name,
         )
@@ -504,6 +818,8 @@ class BacktestLauncher(Launcher):
         event_spine: EventSpine | None = None,
         db_path: Path | None = None,
         historical_data: HistoricalData | None = None,
+        atr_gate: AtrSanityGate | None = None,
+        atr_provider: Callable[[str, datetime], Decimal | None] | None = None,
     ) -> None:
         # A backtest run is one window, one set of events — not a live
         # service that needs durable state across processes. Starting
@@ -534,6 +850,87 @@ class BacktestLauncher(Launcher):
         self._submitted_commands = 0
         self._submit_lock = threading.Lock()
         self._venue_adapter = venue_adapter
+        # Slice #17 Task 29 — ATR R-denominator gameability gate.
+        # Either being None disables the gate; CLI path supplies
+        # both. Counters surface on `bts run` JSON + `bts sweep`.
+        self._atr_gate = atr_gate
+        self._atr_provider = atr_provider
+        self._n_atr_rejected = 0
+        self._n_atr_uncalibrated = 0
+
+    @property
+    def n_atr_rejected(self) -> int:
+        """Stop-tighter-than `k*ATR(window)` ENTER+BUY denials."""
+        return self._n_atr_rejected
+
+    @property
+    def n_atr_uncalibrated(self) -> int:
+        """ENTER+BUY denials where the ATR provider returned None."""
+        return self._n_atr_uncalibrated
+
+    def _record_atr_rejection(
+        self, decision: ValidationDecision, action: Action,
+    ) -> None:
+        del action
+        if decision.reason_code == 'ATR_UNCALIBRATED':
+            self._n_atr_uncalibrated += 1
+        else:
+            self._n_atr_rejected += 1
+
+    def _start_trading(self) -> None:
+        """Wire `Trading.route_outcome` into the execution_manager.
+
+        Praxis's `TradingConfig.on_trade_outcome` is None by default
+        in our backtest setup. Without it, fill events emitted by
+        `ExecutionManager._publish_outcome` never reach
+        `Trading.route_outcome`, so per-account outcome queues never
+        get populated, `PraxisInbound.receive_outcome` always sees
+        empty, and `OutcomeLoop` can't dispatch `on_outcome` to the
+        strategy. Codex P1 caught this: with `--maker` the strategy
+        reconciles `_long` / `_entry_qty` from actual fills, but
+        without the route the outcome never reaches the strategy
+        and `_long` stays False forever.
+
+        Praxis's `TradeOutcome` and Nexus's `TradeOutcome` are
+        different dataclasses (Nexus expects `outcome_type`,
+        `fill_size`, `fill_price`, `fill_notional`, `actual_fees`;
+        Praxis emits `status`, `target_qty`, `filled_qty`,
+        `avg_fill_price`). The route closure translates Praxis →
+        Nexus before pushing into the queue so `OutcomeLoop` can
+        dispatch a Nexus-shaped outcome to `Strategy.on_outcome`
+        without each strategy author rolling their own translator.
+
+        We can't pass this callback into TradingConfig at
+        construction (it lives on the not-yet-created Trading
+        instance). After `super()._start_trading()` returns,
+        `self._trading` exists; mutate the execution_manager's
+        `_on_trade_outcome` to the wrapped translator + router.
+        """
+        super()._start_trading()
+        if self._trading is None:
+            msg = (
+                'BacktestLauncher._start_trading: super()._start_trading '
+                'returned without populating self._trading.'
+            )
+            raise RuntimeError(msg)
+        trading = self._trading
+
+        async def _route_and_translate(praxis_outcome: TradeOutcome) -> None:
+            nexus_outcome = _translate_praxis_outcome(praxis_outcome)
+            if nexus_outcome is None:
+                return
+            queues = _outcome_queues_for(trading)
+            account_queue = queues.get(praxis_outcome.account_id)
+            if account_queue is None:
+                return
+            account_queue.put_nowait(nexus_outcome)
+
+        # Praxis's `ExecutionManager._on_trade_outcome` is the documented
+        # hook seam for routing Praxis -> Nexus outcomes; the underscore
+        # is Praxis's "callback slot" naming, not an internal-only flag.
+        # `setattr` keeps pyright's `reportPrivateUsage` happy without
+        # losing the documented contract.
+        setattr(trading.execution_manager, '_on_trade_outcome', _route_and_translate)
 
     def _start_poller(self) -> None:
         kline_intervals = self._resolve_kline_intervals_from_manifests()
@@ -593,6 +990,72 @@ class BacktestLauncher(Launcher):
         limen_manifest = sfd.manifest()
         return int(limen_manifest.data_source_config.params['kline_size'])
 
+    def _shutdown(self) -> None:
+        # Slice #17 Task 18 / auditor round 5 P1: Praxis's parent
+        # `_shutdown` closes the aiosqlite connection without
+        # commit. EventSpine.append uses the default deferred-
+        # transaction mode (sqlite3 isolation_level='') so writes
+        # are pending until commit; aiosqlite.close() does NOT
+        # auto-commit. Result: the EventSpine sqlite file looks
+        # empty to any fresh reader (e.g. our post-run
+        # `dump_event_spine_to_jsonl`) because the writes were
+        # rolled back at close.
+        #
+        # Commit must happen AFTER Nexus threads join + Trading.stop
+        # (so all post-window appends land first) and BEFORE
+        # _db_conn.close. That requires copying the parent's
+        # shutdown body and injecting the commit at the precise
+        # point — a single-call `super()._shutdown()` followed by
+        # commit (which we tried first) misses the close that
+        # already happened, and a commit before super() misses
+        # appends that fire during Trading.stop. Codex round-5 P1.
+        import asyncio
+        self._stop_healthz()
+        for thread in self._nexus_threads:
+            thread.join(timeout=30)
+            if thread.is_alive():
+                _log.warning(
+                    'nexus thread did not finish within timeout',
+                    extra={'thread': thread.name},
+                )
+        if self._poller is not None:
+            self._poller.stop()
+        if self._trading is not None and self._loop is not None:
+            stop_future = asyncio.run_coroutine_threadsafe(
+                self._trading.stop(), self._loop,
+            )
+            stop_future.result(timeout=30)
+        if (
+            self._owns_spine
+            and self._db_conn is not None
+            and self._loop is not None
+        ):
+            # Inject point: all writers have stopped, all events
+            # are appended to the connection, but the connection
+            # is still open. Commit flushes deferred transactions
+            # to the file before close.
+            commit_future = asyncio.run_coroutine_threadsafe(
+                self._db_conn.commit(), self._loop,
+            )
+            commit_future.result(timeout=10)
+            close_future = asyncio.run_coroutine_threadsafe(
+                self._db_conn.close(), self._loop,
+            )
+            close_future.result(timeout=10)
+            self._db_conn = None
+        # Parent's tail: stop loop, join loop thread, close loop,
+        # null out refs, log. Codex round-6 P1 — the round-5 copy
+        # truncated this and let the loop / loop_thread leak.
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._loop_thread is not None:
+            self._loop_thread.join(timeout=5)
+        if self._loop is not None and not self._loop.is_closed():
+            self._loop.close()
+        self._loop = None
+        self._loop_thread = None
+        _log.info('shutdown complete')
+
     def _signal_handler(self, _signum: int, _frame: FrameType | None) -> None:
         # Backtests aren't daemons; termination is driven by the outer
         # harness calling `request_stop()` when the window ends, not by
@@ -603,7 +1066,23 @@ class BacktestLauncher(Launcher):
         """Ask `launch()` to return. Outer harness uses this at window end."""
         self._stop_event.set()
 
-    def _run_nexus_instance(
+    def _start_nexus_instances(self) -> None:
+        # Spawn at this level (instead of overriding _run_nexus_instance)
+        # to avoid pyright's false-positive invariance check on
+        # Queue[TradeOutcome] at the cross-module override site.
+        if self._trading is None or self._loop is None:
+            msg = 'trading not started'
+            raise RuntimeError(msg)
+        for inst in self._instances:
+            t = threading.Thread(
+                target=self._run_my_nexus_instance,
+                args=(inst, self._outcome_queues[inst.account_id]),
+                daemon=True, name=f'nexus-{inst.account_id}',
+            )
+            self._nexus_threads.append(t)
+            t.start()
+
+    def _run_my_nexus_instance(
         self, inst: InstanceConfig, outcome_queue: queue.Queue[TradeOutcome],
     ) -> None:
         """Mirror praxis.Launcher._run_nexus_instance but wire `action_submit`.
@@ -665,15 +1144,30 @@ class BacktestLauncher(Launcher):
             initial_pool=self._capital_initial_pool,
             declared_stops=self._declared_stops,
         )
+        # Touch + tick providers feed the action_submitter's
+        # LIMIT-touch-refresh hook. The hook rewrites a LIMIT
+        # action's `execution_params['price']` to `touch ± tick`
+        # before validation. `SimulatedVenueAdapter` exposes both
+        # providers; non-sim adapters fall back to None (action
+        # submitter's no-touch path).
+        from backtest_simulator.venue.simulated import SimulatedVenueAdapter
+        sva = self._venue_adapter if isinstance(self._venue_adapter, SimulatedVenueAdapter) else None
+        touch_provider = sva.touch_for_symbol if sva is not None else None
+        tick_provider = sva.tick_for_symbol if sva is not None else None
         action_submit = build_action_submitter(
             SubmitterBindings(
                 nexus_config=nexus_config, state=state,
                 praxis_outbound=praxis_outbound,
                 validation_pipeline=pipeline,
                 strategy_budget=allocated_capital,
+                touch_provider=touch_provider,
+                tick_provider=tick_provider,
+                atr_gate=self._atr_gate,
+                atr_provider=self._atr_provider,
             ),
             on_reservation=self._record_reservation,
             on_submit=self._record_submitted_command,
+            on_atr_reject=self._record_atr_rejection,
         )
 
         def market_data_provider(kline_size: int) -> pl.DataFrame:
@@ -714,10 +1208,18 @@ class BacktestLauncher(Launcher):
             'queue.Queue[NexusTradeOutcome]', outcome_queue,
         )
         praxis_inbound = PraxisInbound(outcome_queue=nexus_outcome_queue)
+        outcome_loop = _build_outcome_loop(
+            runner=runner, praxis_inbound=praxis_inbound, state=state,
+            context_provider=context_provider,
+            wired_sensors=sequencer.wired_sensors,
+            action_submit=action_submit,
+        )
+        outcome_loop.start()
         # Direct event signal — no log-message interception. The running
         # event is initialised in `run_window` on `self._nexus_running`.
         self._nexus_running.set()
         self._stop_event.wait()
+        outcome_loop.stop()
 
         # `sequencer.start()` has returned, so `manifest` and
         # `instance_state` are both populated — but the public

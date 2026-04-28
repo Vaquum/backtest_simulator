@@ -120,10 +120,33 @@ class ClickHouseFeed:
         )
         raise NotImplementedError(msg)
 
-    def get_trades(
+    def get_trades(self, symbol: str, start: datetime, end: datetime) -> pl.DataFrame:
+        """Strategy-facing strict path: `end <= frozen_now()` always."""
+        return self._get_trades_impl(
+            symbol, start, end, venue_lookahead_seconds=0,
+        )
+
+    def get_trades_for_venue(
         self, symbol: str, start: datetime, end: datetime,
-        *, venue_lookahead_seconds: int = 0,
+        *, venue_lookahead_seconds: int,
     ) -> pl.DataFrame:
+        """Venue-only carve-out: `end <= frozen_now() + venue_lookahead_seconds`.
+
+        Underscore-prefixed and not on the `HistoricalFeed` Protocol;
+        strategies have no public path to this method. The simulated
+        venue's adapter passes its declared `trade_window_seconds`
+        for the realistic submit/fill-window peek.
+        """
+        return self._get_trades_impl(
+            symbol, start, end,
+            venue_lookahead_seconds=venue_lookahead_seconds,
+        )
+
+    def _get_trades_impl(
+        self, symbol: str, start: datetime, end: datetime,
+        *, venue_lookahead_seconds: int,
+    ) -> pl.DataFrame:
+        """Shared body for the two get_trades surfaces."""
         assert_trades_causal(end, symbol=symbol, venue_lookahead_seconds=venue_lookahead_seconds)
         if symbol != self._symbol:
             msg = f'ClickHouseFeed configured for {self._symbol}; received {symbol}'

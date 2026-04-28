@@ -100,6 +100,30 @@ class _PendingLifecycle:
     acked: bool = False
 
 
+@dataclass
+class _OpenPosition:
+    """Per-BUY open-position bookkeeping for the SELL-exit lifecycle.
+
+    `cost_basis` is the BUY's `fill_notional` (qty * fill_price), and
+    `entry_fees` is the BUY's actual fees. `CapitalController.order_fill`
+    moved `cost_basis + entry_fees` into `capital_state.position_notional`,
+    so the matching close releases the same `cost_basis + entry_fees`
+    on full close. `entry_qty` enables proportional release on partial
+    SELLs: a SELL fill of `sell_qty` releases
+    `sell_qty / entry_qty * (cost_basis + entry_fees)` and shrinks
+    the open position to the residual qty (codex round 5 P2 caught
+    the prior shape: full-pop on partial SELL collapsed the residual).
+    `command_id` and `strategy_id` echo the BUY's identity for
+    audit-trail purposes.
+    """
+
+    command_id: str
+    strategy_id: str
+    cost_basis: Decimal
+    entry_fees: Decimal
+    entry_qty: Decimal
+
+
 class CapitalLifecycleTracker:
     """Feed the `CapitalController` the 4-step lifecycle events.
 
@@ -120,6 +144,13 @@ class CapitalLifecycleTracker:
     def __init__(self, controller: CapitalController) -> None:
         self._controller = controller
         self._pending: dict[str, _PendingLifecycle] = {}
+        # FIFO queue of open positions; `record_open_position`
+        # appends on BUY fill, `record_close_position` pops from
+        # the front on SELL fill. Single-position long-only
+        # strategies have at most one entry; the FIFO discipline
+        # extends naturally to multi-position scenarios without
+        # changing the API. See `_OpenPosition`.
+        self._open_positions: list[_OpenPosition] = []
         self._lock = Lock()
 
     def record_reservation(
@@ -146,6 +177,18 @@ class CapitalLifecycleTracker:
         with self._lock:
             entry = self._pending.get(command_id)
             return entry.declared_stop_price if entry is not None else None
+
+    def strategy_id_for_pending(self, command_id: str) -> str | None:
+        """Lookup the strategy_id for a still-pending command_id.
+
+        The launcher's adapter wrapper calls this BEFORE
+        `record_ack_and_fill` (which pops the pending entry) so
+        `record_open_position` can capture the strategy_id for
+        the open-position ledger.
+        """
+        with self._lock:
+            entry = self._pending.get(command_id)
+            return entry.strategy_id if entry is not None else None
 
     def declared_reservation_for_command(self, command_id: str) -> Decimal | None:
         """Lookup the reserved notional for a still-pending command_id.
@@ -331,6 +374,157 @@ class CapitalLifecycleTracker:
                         f'category={result.category}'
                     )
                     raise RuntimeError(msg)
+
+    def record_open_position(
+        self,
+        *,
+        command_id: str,
+        strategy_id: str,
+        cost_basis: Decimal,
+        entry_fees: Decimal,
+        entry_qty: Decimal,
+    ) -> None:
+        """Append an open position after a BUY fill.
+
+        `cost_basis` is the BUY's `fill_notional`. `entry_fees` is
+        the BUY's actual fees (controller deployed
+        `cost_basis + entry_fees` into `position_notional`).
+        `entry_qty` is the BUY's filled quantity — used by
+        `record_close_position` to release proportionally on
+        partial SELL fills.
+
+        Idempotent under repeated calls with the same
+        command_id? No — caller must dedup. The launcher's
+        adapter wrapper calls this exactly once per BUY fill
+        (after `record_ack_and_fill`).
+        """
+        with self._lock:
+            self._open_positions.append(_OpenPosition(
+                command_id=command_id, strategy_id=strategy_id,
+                cost_basis=cost_basis, entry_fees=entry_fees,
+                entry_qty=entry_qty,
+            ))
+
+    def record_close_position(
+        self,
+        capital_state: CapitalState,
+        *,
+        sell_command_id: str,
+        sell_qty: Decimal,
+        sell_proceeds: Decimal,
+        sell_fees: Decimal,
+    ) -> tuple[Decimal, _OpenPosition]:
+        """FIFO-match a SELL fill against the oldest open position.
+
+        Returns `(realized_pnl, closed_position)`. Mutates
+        `capital_state` to reverse the BUY's deployment exactly:
+          - `position_notional -= (cost_basis + entry_fees)` —
+            mirrors the controller's `order_fill` line
+            `position_notional += fill_notional + actual_fees`,
+            so the close inverts the open one-for-one and
+            available-budget capacity (`capital_pool -
+            total_deployed`) is restored.
+          - `per_strategy_deployed[strategy_id] -=
+            (cost_basis + entry_fees)` — the controller's
+            attribution dict is keyed on strategy_id and gets
+            pruned to zero on perfect close. Without this the
+            next BUY's `compute_strategy_budget` sees stale
+            deployment and may deny legitimate entries.
+          - `capital_pool` is NOT touched. The controller
+            treats `capital_pool` as the immutable strategy
+            budget; SELL proceeds are NOT new budget. Realized
+            PnL is reported via the return value (callers log
+            it, and a future compounding slice can feed it
+            into `compute_strategy_budget(strategy_realized_pnl=...)`).
+            Codex round 5 P1 caught the prior shape: crediting
+            `sell_proceeds - sell_fees` to `capital_pool` was
+            double-counting (capital_pool was never debited at
+            BUY — only `position_notional` grew).
+
+        Realized PnL = `sell_proceeds - cost_basis - entry_fees -
+        sell_fees`. Includes BOTH legs' fees so the operator-
+        visible PnL matches the audit-trail trade-pair PnL.
+
+        Raises if no open position is available (SELL with no
+        prior BUY — the strategy's `_long` gate should prevent
+        this; raising surfaces a state-machine bug rather than
+        silently corrupting capital).
+        """
+        with self._lock:
+            if not self._open_positions:
+                msg = (
+                    f'record_close_position: SELL command_id='
+                    f'{sell_command_id} has no matching open '
+                    f'position. The strategy emitted a SELL while '
+                    f'the lifecycle tracker held zero entries — '
+                    f'either `_long` gating regressed or a prior '
+                    f'BUY fill bypassed `record_open_position`.'
+                )
+                raise RuntimeError(msg)
+            head = self._open_positions[0]
+            if sell_qty <= Decimal('0'):
+                msg = (
+                    f'record_close_position: SELL command_id='
+                    f'{sell_command_id} sell_qty={sell_qty} must be '
+                    f'positive.'
+                )
+                raise ValueError(msg)
+            if sell_qty > head.entry_qty:
+                msg = (
+                    f'record_close_position: SELL command_id='
+                    f'{sell_command_id} sell_qty={sell_qty} exceeds '
+                    f'oldest open entry_qty={head.entry_qty}; '
+                    f'cross-position closes are not yet supported '
+                    f'(single-position long-only invariant).'
+                )
+                raise RuntimeError(msg)
+            ratio = sell_qty / head.entry_qty
+            cost_release = head.cost_basis * ratio
+            fee_release = head.entry_fees * ratio
+            deployed_release = cost_release + fee_release
+            realized_pnl = (
+                sell_proceeds - cost_release - fee_release - sell_fees
+            )
+            capital_state.position_notional -= deployed_release
+            current_attr = capital_state.per_strategy_deployed.get(
+                head.strategy_id, Decimal('0'),
+            )
+            new_attr = current_attr - deployed_release
+            if new_attr <= Decimal('0'):
+                capital_state.per_strategy_deployed.pop(
+                    head.strategy_id, None,
+                )
+            else:
+                capital_state.per_strategy_deployed[
+                    head.strategy_id
+                ] = new_attr
+            if sell_qty == head.entry_qty:
+                self._open_positions.pop(0)
+                return realized_pnl, head
+            # Partial close: shrink the head position by the
+            # closed share. `entry_qty`, `cost_basis`, and
+            # `entry_fees` all decrement proportionally so a
+            # subsequent SELL against the residual continues to
+            # ratio against the remaining qty correctly. Keeps
+            # the FIFO entry alive for the next preds=0 to
+            # finish closing.
+            head.entry_qty -= sell_qty
+            head.cost_basis -= cost_release
+            head.entry_fees -= fee_release
+            partial_record = _OpenPosition(
+                command_id=head.command_id,
+                strategy_id=head.strategy_id,
+                cost_basis=cost_release,
+                entry_fees=fee_release,
+                entry_qty=sell_qty,
+            )
+            return realized_pnl, partial_record
+
+    @property
+    def open_position_count(self) -> int:
+        """Number of currently-open positions awaiting SELL close."""
+        with self._lock:
+            return len(self._open_positions)
 
     @property
     def pending_count(self) -> int:
