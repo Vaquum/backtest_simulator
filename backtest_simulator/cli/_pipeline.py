@@ -171,14 +171,16 @@ def _atomic_write_text(path: Path, content: str) -> None:
 def _exclusive_dir_lock(lock_path: Path) -> Iterator[None]:
     """Hold an `fcntl.flock` exclusive lock on `lock_path` for the block.
 
-    Codex round-5 P1: `train_single_decoder`'s validate-then-wipe
-    sequence has a TOCTOU window between
-    `_per_decoder_cache_is_valid(...)` and `shutil.rmtree(...)`.
-    Two concurrent sweeps targeting the same `sub_dir` can both
-    see "stale", both wipe + retrain, and trample each other.
+    Codex round-5 P1: the validate-then-wipe sequence in both
+    `ensure_trained_from_exp_code` and `train_single_decoder`
+    has a TOCTOU window between
+    `_cache_dir_matches_expected_module(...)` and
+    `shutil.rmtree(...)`. Two concurrent sweeps targeting the
+    same cache_dir can both see "stale", both wipe + retrain,
+    and trample each other.
 
     Wrapping the whole validate+wipe+retrain block in this
-    per-sub_dir lock serializes them. The kernel-level
+    per-cache_dir lock serializes them. The kernel-level
     `fcntl.flock` is released automatically when the file
     handle closes (via `with open`), so no `LOCK_UN` plumbing
     is needed.
@@ -428,22 +430,44 @@ def ensure_trained_from_exp_code(
     # on `_OP_SFD_CACHE` (which is on sys.path via _snapshot_exp_code,
     # and propagated to subprocess workers via PYTHONPATH —
     # see `op_sfd_pythonpath`).
-    _, snapshot_path = _snapshot_exp_code(exp_code_path)
+    op_module_name, snapshot_path = _snapshot_exp_code(exp_code_path)
     file_hash = hashlib.sha256(exp_code_path.read_bytes()).hexdigest()
     cache_dir = (
         WORK_DIR / 'fresh'
         / f'{exp_code_path.stem}_n{n_permutations}_{file_hash[:16]}'
     )
-    if (cache_dir / 'results.csv').is_file():
-        return cache_dir
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    from backtest_simulator.pipeline import ExperimentPipeline
-    pipe = ExperimentPipeline(experiment_dir=cache_dir)
-    loaded = pipe.load_from_file(snapshot_path)
-    pipe.run(
-        loaded, experiment_name=exp_code_path.stem,
-        n_permutations=n_permutations, seed=42,
-    )
+    # Auditor (post-round-7): the prior `(cache_dir / 'results.csv').
+    # is_file()` check returned on results.csv alone, so a stale
+    # cache_dir from an earlier buggy build (e.g. one whose
+    # `metadata['sfd_module']` is the bare operator stem rather
+    # than `_bts_op_<sha16>`, or one whose `_OP_SFD_CACHE`
+    # snapshot was deleted) would silently re-serve broken
+    # semantics with no loud signal. Bring `ensure_trained_from_
+    # exp_code` to FULL parity with `train_single_decoder`'s
+    # round-4/5 fix: validate the same four conditions
+    # (`_cache_dir_matches_expected_module`) AND serialize the
+    # validate-then-wipe-then-retrain block under a per-cache_dir
+    # `fcntl.LOCK_EX` so concurrent operators with the same
+    # exp-code + n_permutations don't trample each other.
+    cache_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_dir.parent / f'.{cache_dir.name}.lock'
+    with _exclusive_dir_lock(lock_path):
+        if _cache_dir_matches_expected_module(cache_dir, op_module_name):
+            return cache_dir
+        # Stale (or absent) — clear and retrain. `mkdir(parents=True)`
+        # below recreates the dir; `shutil.rmtree` is safe because
+        # `cache_dir` is bts-controlled (under WORK_DIR / 'fresh')
+        # AND we hold the exclusive lock.
+        if cache_dir.is_dir():
+            shutil.rmtree(cache_dir)
+        cache_dir.mkdir(parents=True)
+        from backtest_simulator.pipeline import ExperimentPipeline
+        pipe = ExperimentPipeline(experiment_dir=cache_dir)
+        loaded = pipe.load_from_file(snapshot_path)
+        pipe.run(
+            loaded, experiment_name=exp_code_path.stem,
+            n_permutations=n_permutations, seed=42,
+        )
     return cache_dir
 
 
@@ -553,7 +577,7 @@ def train_single_decoder(
     with _exclusive_dir_lock(lock_path):
         # Re-validate UNDER the lock — a concurrent process may
         # have produced a valid sub_dir while we waited.
-        if _per_decoder_cache_is_valid(sub_dir, pd_module_name):
+        if _cache_dir_matches_expected_module(sub_dir, pd_module_name):
             return
         # Stale (or absent) — clear and retrain. `mkdir(parents=True)`
         # below recreates the dir; `shutil.rmtree` is safe because
@@ -573,25 +597,33 @@ def train_single_decoder(
         pipe.run(loaded, experiment_name='single', n_permutations=1, seed=42)
 
 
-def _per_decoder_cache_is_valid(
-    sub_dir: Path, expected_pd_module_name: str,
+def _cache_dir_matches_expected_module(
+    cache_dir: Path, expected_module_name: str,
 ) -> bool:
-    """Return True iff `sub_dir` is a complete + reimportable cache hit.
+    """Return True iff `cache_dir` is a complete + reimportable cache hit.
+
+    Shared validity check used by BOTH cache paths:
+      - `ensure_trained_from_exp_code` (cache_dir under
+        `WORK_DIR / 'fresh'`, expects `_bts_op_<sha16>`)
+      - `train_single_decoder` (cache_dir under
+        `WORK_DIR / 'trained_from_file'`, expects `_bts_pd_<sha16>`)
 
     Cache hit requires:
       1. `results.csv` exists (Limen finished writing the run)
       2. `metadata.json` exists and is parseable JSON
-      3. `metadata['sfd_module']` equals the expected
-         `_bts_pd_<sha16>` content-addressed name AND the
-         corresponding snapshot file exists in `_OP_SFD_CACHE`
+      3. `metadata['sfd_module']` equals `expected_module_name`
+         AND the corresponding snapshot file exists in
+         `_OP_SFD_CACHE`
 
     Any other state -> stale, return False so the caller wipes
-    and retrains. Codex round-4 P0: catches sub_dirs left over
-    from the round-3 build that recorded `sfd_module='exp'`,
-    plus any partial-write / corrupted-metadata leftovers.
+    and retrains. Codex round-4 P0 + auditor: catches cache_dirs
+    left over from earlier builds (`sfd_module='exp'` or
+    `sfd_module='op_sfd'`), partial-write / corrupted-metadata
+    leftovers, and operator-side `_OP_SFD_CACHE` deletions that
+    leave `cache_dir` orphaned.
     """
-    results_csv = sub_dir / 'results.csv'
-    metadata_path = sub_dir / 'metadata.json'
+    results_csv = cache_dir / 'results.csv'
+    metadata_path = cache_dir / 'metadata.json'
     if not (results_csv.is_file() and metadata_path.is_file()):
         return False
     try:
@@ -608,11 +640,11 @@ def _per_decoder_cache_is_valid(
     if not isinstance(metadata, dict):
         return False
     typed_metadata = cast('dict[str, object]', metadata)
-    if typed_metadata.get('sfd_module') != expected_pd_module_name:
+    if typed_metadata.get('sfd_module') != expected_module_name:
         return False
     # Snapshot file MUST also exist (operator could have wiped
-    # _OP_SFD_CACHE by hand even though sub_dir survived).
-    snapshot_path = _OP_SFD_CACHE / f'{expected_pd_module_name}.py'
+    # _OP_SFD_CACHE by hand even though cache_dir survived).
+    snapshot_path = _OP_SFD_CACHE / f'{expected_module_name}.py'
     return snapshot_path.is_file()
 
 

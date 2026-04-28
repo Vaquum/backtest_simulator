@@ -804,7 +804,7 @@ def test_train_single_decoder_repairs_stale_round3_cache(
     self-healing without `rm -rf`.
 
     Mutation proof: removing the
-    `_per_decoder_cache_is_valid` check (or weakening it to
+    `_cache_dir_matches_expected_module` check (or weakening it to
     only check `results.csv`) keeps the stale `sfd_module='exp'`
     and `import_module` raises.
     """
@@ -1067,3 +1067,177 @@ def test_exclusive_dir_lock_acquires_and_releases(
     # handle closed. Re-acquire to confirm the lock is reusable.
     with _pipeline._exclusive_dir_lock(lock_path):
         assert lock_path.is_file()
+
+
+def test_ensure_trained_repairs_stale_fresh_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auditor P0: `ensure_trained_from_exp_code` cache-hit must validate
+    metadata + snapshot existence — not just `results.csv`.
+
+    The pre-fix cache-hit path returned as soon as `results.csv`
+    existed, so a stale `cache_dir` from an earlier buggy build
+    (one whose `metadata['sfd_module']` is the bare operator
+    stem rather than `_bts_op_<sha16>`, or one whose
+    `_OP_SFD_CACHE` snapshot was deleted) would silently re-serve
+    broken semantics with no loud signal — drifting bts back onto
+    old semantics.
+
+    The fix brings `ensure_trained_from_exp_code` to FULL parity
+    with `train_single_decoder`'s round-4/5 fix:
+    `_cache_dir_matches_expected_module(cache_dir, op_module_name)`
+    inside `_exclusive_dir_lock`. Stale -> wipe + retrain.
+
+    Mutation proof: reverting to `(cache_dir / 'results.csv').
+    is_file()` accepts the seeded stale cache; the assertion that
+    `metadata['sfd_module']` was repaired to `_bts_op_<sha16>`
+    fires.
+    """
+    from backtest_simulator.pipeline import experiment as exp_module
+
+    monkeypatch.setattr(_pipeline, 'WORK_DIR', tmp_path / 'work')
+    monkeypatch.setattr(
+        _pipeline, '_OP_SFD_CACHE', tmp_path / 'work' / 'op_sfds',
+    )
+
+    exp_code = tmp_path / 'op_sfd.py'
+    _write_exp_code(exp_code)
+
+    # Compute the cache_dir the production path would target
+    # (mirroring `ensure_trained_from_exp_code`'s key derivation).
+    import hashlib as _hl
+    file_hash = _hl.sha256(exp_code.read_bytes()).hexdigest()
+    cache_dir = (
+        _pipeline.WORK_DIR / 'fresh'
+        / f'{exp_code.stem}_n1_{file_hash[:16]}'
+    )
+    cache_dir.mkdir(parents=True)
+    # Seed STALE artifacts: results.csv exists + metadata records
+    # the bare operator stem (the round-3-era non-reimportable
+    # name). The pre-fix code happily returned this cache_dir.
+    (cache_dir / 'results.csv').write_text('id\n0\n', encoding='utf-8')
+    (cache_dir / 'metadata.json').write_text(
+        json.dumps({'sfd_module': exp_code.stem}),  # 'op_sfd' (bare)
+        encoding='utf-8',
+    )
+    (cache_dir / 'round_data.jsonl').write_text('', encoding='utf-8')
+
+    # Stub UEL so the wipe-then-retrain happy path completes
+    # quickly: write a metadata.json reflecting the SFD passed in.
+    class _FakeUEL:
+        def __init__(self, **kw: object) -> None:
+            self.sfd = kw['sfd']
+            self.exp_dir = Path(kw['experiment_dir'])  # type: ignore[arg-type]
+
+        def run(self, **kw: object) -> None:
+            del kw
+            self.exp_dir.mkdir(parents=True, exist_ok=True)
+            (self.exp_dir / 'metadata.json').write_text(
+                json.dumps({'sfd_module': self.sfd.__name__}),  # type: ignore[attr-defined]
+                encoding='utf-8',
+            )
+            (self.exp_dir / 'results.csv').write_text(
+                'id\n0\n', encoding='utf-8',
+            )
+
+    monkeypatch.setattr(exp_module, 'UniversalExperimentLoop', _FakeUEL)
+
+    returned_dir = _pipeline.ensure_trained_from_exp_code(
+        exp_code, n_permutations=1,
+    )
+    assert returned_dir == cache_dir, (
+        f'ensure_trained_from_exp_code must return the same '
+        f'cache_dir; got {returned_dir} vs expected {cache_dir}'
+    )
+
+    metadata = json.loads(
+        (cache_dir / 'metadata.json').read_text(encoding='utf-8'),
+    )
+    name = metadata['sfd_module']
+    assert name.startswith('_bts_op_'), (
+        f'stale fresh-cache must be repaired in place; got '
+        f'sfd_module={name!r}. Without the validate-under-lock '
+        f'fix, the bare operator stem is silently re-served and '
+        f'Limen\'s Trainer reimport fails downstream.'
+    )
+
+    # Snapshot file MUST exist for the repaired cache to be a
+    # valid hit on the NEXT call.
+    snapshot_path = _pipeline._OP_SFD_CACHE / f'{name}.py'
+    assert snapshot_path.is_file()
+
+    # And reimport works.
+    sys.modules.pop(name, None)
+    cache_str = str(_pipeline._OP_SFD_CACHE)
+    if cache_str not in sys.path:
+        sys.path.insert(0, cache_str)
+    reimported = importlib.import_module(name)
+    assert callable(reimported.manifest)
+
+
+def test_cache_dir_matches_expected_module_rejects_missing_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validity helper rejects cache_dirs whose `_OP_SFD_CACHE` snapshot is gone.
+
+    Rule #3 of `_cache_dir_matches_expected_module`: even when
+    `metadata['sfd_module']` matches the expected name, the
+    snapshot file MUST exist in `_OP_SFD_CACHE`. Otherwise the
+    cache_dir is "orphaned" (reimport would fail) and must be
+    treated as stale.
+
+    This is a UNIT test of the helper's contract — not an
+    integration test against `ensure_trained_from_exp_code`,
+    because that function calls `_snapshot_exp_code` UPSTREAM
+    of the validity check, which auto-heals a missing snapshot
+    by atomic re-write. The orphan case is therefore self-
+    healing at the call boundary; what matters is that the
+    helper itself rejects the orphan state, so any future caller
+    that does NOT pre-snapshot is protected.
+
+    Codex post-auditor P1: my prior `test_ensure_trained_repairs_
+    orphaned_cache_when_snapshot_missing` was tautological —
+    BOTH the round-7 (results.csv-only) and round-8 (helper-
+    based) code passed it because `_snapshot_exp_code` runs
+    first and re-creates the snapshot. Replace with this
+    helper-level test that DOES distinguish (mutation: removing
+    rule #3 makes the helper return True for the orphan, and
+    this assert fires).
+    """
+    monkeypatch.setattr(
+        _pipeline, '_OP_SFD_CACHE', tmp_path / 'op_sfds',
+    )
+    _pipeline._OP_SFD_CACHE.mkdir(parents=True)
+
+    cache_dir = tmp_path / 'cache_dir'
+    cache_dir.mkdir()
+    (cache_dir / 'results.csv').write_text('id\n0\n', encoding='utf-8')
+    expected_module = '_bts_op_deadbeefdeadbeef'
+    (cache_dir / 'metadata.json').write_text(
+        json.dumps({'sfd_module': expected_module}),
+        encoding='utf-8',
+    )
+    # Orphan: snapshot file is intentionally NOT created.
+    snapshot_path = _pipeline._OP_SFD_CACHE / f'{expected_module}.py'
+    assert not snapshot_path.exists()
+
+    # Helper MUST reject this orphan state.
+    assert not _pipeline._cache_dir_matches_expected_module(
+        cache_dir, expected_module,
+    ), (
+        'validity helper must reject cache_dirs whose snapshot '
+        'file is missing from _OP_SFD_CACHE; otherwise an '
+        'operator-side `rm -rf op_sfds` leaves bts in a state '
+        'where the cache_dir is silently treated as valid but '
+        'a fresh-process reimport would raise '
+        'ModuleNotFoundError.'
+    )
+
+    # Now create the snapshot — helper should return True.
+    snapshot_path.write_text(
+        'def manifest(): return None\ndef params(): return {}\n',
+        encoding='utf-8',
+    )
+    assert _pipeline._cache_dir_matches_expected_module(
+        cache_dir, expected_module,
+    )

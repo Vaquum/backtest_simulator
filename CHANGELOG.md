@@ -1,3 +1,13 @@
+# v2.0.1
+
+- **Auditor-found P0 fix**: `ensure_trained_from_exp_code` cache-hit path was too permissive. The round-7 v2.0.0 code returned on `(cache_dir / 'results.csv').is_file()` alone, so a stale `cache_dir` from an earlier buggy build (one whose `metadata['sfd_module']` is the bare operator stem rather than `_bts_op_<sha16>`) would silently re-serve broken semantics — drifting bts back onto old non-reimportable manifests with no loud signal. The per-decoder retrain path (`train_single_decoder`) already validated metadata + snapshot existence under a per-sub_dir `fcntl.LOCK_EX`; the fresh-cache path lacked parity.
+- Fix: extracted `_per_decoder_cache_is_valid` -> `_cache_dir_matches_expected_module(cache_dir, expected_module_name)` (neutral name, shared by both paths). `ensure_trained_from_exp_code` now mirrors `train_single_decoder`'s validate-under-lock pattern: snapshot first, then `with _exclusive_dir_lock(...): if _cache_dir_matches_expected_module(...): return` else `shutil.rmtree(cache_dir); cache_dir.mkdir(parents=True);` re-train.
+- 2 new tests in `tests/cli/test_pick_decoders_cache_key.py`:
+  - `test_ensure_trained_repairs_stale_fresh_cache`: seeds `metadata['sfd_module']='op_sfd'` (bare stem), calls `ensure_trained_from_exp_code`, asserts repair to `_bts_op_<sha16>`.
+  - `test_cache_dir_matches_expected_module_rejects_missing_snapshot`: unit test of the shared validity helper's rule #3 — without the snapshot file in `_OP_SFD_CACHE`, the helper returns False (mutation-proof).
+- Live verification on the existing fresh-cache `cache_dir` at `/tmp/bts_sweep/run/fresh/test_round3_n5_c0fe9c4f27af8b88`: tampered `metadata['sfd_module']` to `test_round3` (bare stem); re-ran `bts sweep --exp-code /tmp/test_round3.py`; sweep RE-RAN UEL (not cache-hit); `metadata` repaired to `_bts_op_c0fe9c4f27af8b88`.
+- Codex review (gpt-5.5 xhigh): 1 round caught the orphaned-snapshot test as tautological (`_snapshot_exp_code` upstream re-creates the snapshot, so OLD code passed too); replaced with the unit test of the validity helper. Round 2: `approved`.
+
 # v2.0.0
 
 - **BREAKING**: `bts sweep` and `bts run` now REQUIRE `--exp-code FILE.py` on every invocation. Operator-mandated contract: bts must not run without the strategy code; there is no fallback SFD. Old invocations (without `--exp-code`) exit 2 with `--exp-code is required`.
