@@ -21,6 +21,7 @@ import sys
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import TypedDict, cast
 
 from backtest_simulator.cli._pipeline import (
     SYMBOL,
@@ -35,6 +36,51 @@ from backtest_simulator.cli._pipeline import (
 # PredictLoop fires at runtime — the byte-equivalence promise
 # under "strategy tested, strategy deployed".
 RUN_WINDOW_INTERVAL_SECONDS: int = 3600
+
+
+# Shape of the dict returned by `run_window_in_process` and
+# `run_window_in_subprocess`. The window result crosses a JSON
+# subprocess boundary, so all "decimal" / "datetime" values are
+# strings here — sweep.py re-narrows to Decimal / datetime at use.
+# `total=True` so each consumer site reads through the typed shape;
+# `runtime_predictions` is the only optional-via-default field.
+class WindowResult(TypedDict):
+    trades: list[list[str]]
+    declared_stops: dict[str, str]
+    orders: int
+    slippage_realised_bps: str | None
+    slippage_realised_cost_bps: str | None
+    slippage_realised_buy_bps: str | None
+    slippage_realised_sell_bps: str | None
+    slippage_predicted_cost_bps: str | None
+    slippage_predict_vs_realised_gap_bps: str | None
+    slippage_n_samples: int
+    slippage_n_excluded: int
+    slippage_n_uncalibrated_predict: int
+    slippage_n_predicted_samples: int
+    n_limit_orders_submitted: int
+    n_limit_filled_full: int
+    n_limit_filled_partial: int
+    n_limit_filled_zero: int
+    n_limit_marketable_taker: int
+    n_passive_limits: int
+    maker_fill_efficiency_p50: str | None
+    maker_fill_efficiency_mean: str | None
+    market_impact_realised_bps: str | None
+    market_impact_n_samples: int
+    market_impact_n_flagged: int
+    market_impact_n_uncalibrated: int
+    market_impact_n_rejected: int
+    atr_k: str
+    atr_window_seconds: int
+    n_atr_rejected: int
+    n_atr_uncalibrated: int
+    event_spine_jsonl: str
+    event_spine_n_events: int
+    book_gap_max_seconds: float
+    book_gap_n_observed: int
+    book_gap_p95_seconds: float
+    runtime_predictions: list[dict[str, object]]
 
 
 def capture_runtime_prediction(
@@ -102,7 +148,7 @@ def run_window_in_process(
     strict_impact: bool = False,
     atr_k: str = '0.5',
     atr_window_seconds: int = 900,
-) -> dict[str, object]:
+) -> WindowResult:
     """In-process single-window run — picklable result for cross-process use."""
     from praxis.launcher import InstanceConfig
     from praxis.trading_config import TradingConfig
@@ -554,7 +600,7 @@ def run_window_in_subprocess(
     strict_impact: bool = False,
     atr_k: str = '0.5',
     atr_window_seconds: int = 900,
-) -> dict[str, object]:
+) -> WindowResult:
     """Run one window in a fresh Python interpreter for state isolation."""
     payload = json.dumps({
         'perm_id': perm_id,
@@ -596,7 +642,11 @@ def run_window_in_subprocess(
     if last is None:
         msg = f'child produced no JSON result; stdout tail: {proc.stdout[-400:]}'
         raise RuntimeError(msg)
-    return json.loads(last)
+    # The child writes a `WindowResult`-shaped dict via `json.dumps`;
+    # `json.loads` returns `Any`, so a typed cast at this boundary
+    # gives the parent (`sweep.py`) typed access without piling up
+    # `reportUnknown*` cascades on every key read.
+    return cast('WindowResult', json.loads(last))
 
 
 def _child_main() -> int:

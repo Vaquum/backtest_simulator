@@ -88,6 +88,16 @@ class SignalsTable:
     # text via `repr(signals)`.
     _frame: pl.DataFrame = field(repr=False)
 
+    @property
+    def n_bars(self) -> int:
+        """Number of precomputed rows (== covered ticks).
+
+        Public read-only counter. The internal `_frame` is intentionally
+        private (it carries every label_t0/label_t1 future row); callers
+        that only need the count should use this.
+        """
+        return int(self._frame.height)
+
     @classmethod
     def from_predictions(
         cls,

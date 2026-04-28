@@ -379,10 +379,8 @@ def _run(args: argparse.Namespace) -> int:
                 raise RuntimeError(msg) from exc
             trades_raw = result['trades']
             stops_raw = result['declared_stops']
-            assert isinstance(trades_raw, list)
-            assert isinstance(stops_raw, dict)
             trades = [Trade(*row) for row in trades_raw]
-            declared_stops = {k: Decimal(str(v)) for k, v in stops_raw.items()}
+            declared_stops = {k: Decimal(v) for k, v in stops_raw.items()}
             slip_raw = result.get('slippage_realised_cost_bps')
             slip_cost = (
                 None if slip_raw is None else Decimal(str(slip_raw))
@@ -455,12 +453,7 @@ def _run(args: argparse.Namespace) -> int:
                     f'a table for every picked decoder.'
                 )
                 raise _ParityViolation(msg_no_table)
-            runtime_preds_raw = result.get('runtime_predictions', [])
-            runtime_preds_list: list[dict[str, object]] = (
-                runtime_preds_raw
-                if isinstance(runtime_preds_raw, list)
-                else []
-            )
+            runtime_preds_list = result.get('runtime_predictions', [])
             # Codex (post-auditor-4 round-3): pass PER-WINDOW
             # expected ticks, NOT the whole sweep grid. A first-
             # window check must reject a captured second-day tick
@@ -748,10 +741,7 @@ def _print_sweep_signals_summary(
     if not tables:
         print('sweep signals    skipped: no SignalsTables built')
         return
-    bar_counts = [
-        t._frame.height
-        for t in tables.values()
-    ]
+    bar_counts = [t.n_bars for t in tables.values()]
     expected = len(tick_timestamps)
     avg_bars = sum(bar_counts) // max(1, len(bar_counts))
     if expected > 0:
