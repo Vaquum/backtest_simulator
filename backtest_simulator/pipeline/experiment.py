@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import sys
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,6 +75,17 @@ class ExperimentPipeline:
             msg = f'could not build import spec for {source_path}'
             raise ImportError(msg)
         module = importlib.util.module_from_spec(spec)
+        # Register before exec so circular intra-module imports
+        # (operator's file importing back into itself by name)
+        # resolve, AND so Limen's later `importlib.import_module(
+        # metadata['sfd_module'])` finds the already-loaded
+        # module without re-executing it. Codex round-2 P0:
+        # without this, `Trainer.train()` does a fresh
+        # `import_module(...)` and gets a SECOND module object
+        # whose `params`/`manifest` aliases are re-bound — fine
+        # for pure-Python aliases but lossy if exec_module had
+        # side effects (e.g. registration in a global registry).
+        sys.modules[module.__name__] = module
         spec.loader.exec_module(module)
 
         params_fn_raw = getattr(module, 'params', None)
@@ -151,8 +163,19 @@ class ExperimentPipeline:
         self._experiment_dir.mkdir(parents=True, exist_ok=True)
         domain = ParamDomain(experiment_file.params())
         strategy = RandomStrategy(domain, seed=seed)
+        # Use the operator's module as the SFD (codex round-1 P0):
+        # the constructor's `sfd=logreg_binary` default was passing
+        # logreg_binary's manifest to UEL even when the operator's
+        # file defined its own SFD class with `params`/`manifest`
+        # aliases. The operator's module ITSELF carries those
+        # aliases at module level (per the load_from_file
+        # contract), so passing the module as the SFD makes UEL
+        # use the operator's manifest. That also makes
+        # `metadata.json["sfd_module"]` point at the operator's
+        # module, so Limen's `Trainer.train()` re-imports the
+        # operator's module on retrain (not logreg_binary).
         uel = UniversalExperimentLoop(
-            sfd=self._sfd, search_strategy=strategy,
+            sfd=experiment_file.module, search_strategy=strategy,
             experiment_dir=self._experiment_dir,
         )
         _run_uel(uel, experiment_name, n_permutations, resume=resume)

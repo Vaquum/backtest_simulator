@@ -1,3 +1,30 @@
+# v2.0.0
+
+- **BREAKING**: `bts sweep` and `bts run` now REQUIRE `--exp-code FILE.py` on every invocation. Operator-mandated contract: bts must not run without the strategy code; there is no fallback SFD. Old invocations (without `--exp-code`) exit 2 with `--exp-code is required`.
+- The `--exp-code` file must be a self-contained UEL-compliant Python file with module-level `params()` and `manifest()` callables. Operator convention is to define an SFD class (`class Round3SFD: @staticmethod def params(): ...`) and expose its static methods via two module-level alias lines:
+  ```python
+  params = Round3SFD.params
+  manifest = Round3SFD.manifest
+  ```
+  Any `uel.run(...)` boilerplate must be guarded by `if __name__ == '__main__':` so importing the file has no side effects — bts drives uel itself with bts-controlled `n_permutations` / `experiment_name`.
+- 7 codex round-trip review cycles (gpt-5.5 xhigh) caught and resolved:
+  - **Round 1 P0**: `ExperimentPipeline.run` was passing `self._sfd` (default `logreg_binary`) to UEL even when the operator's file declared its own SFD. Now passes `experiment_file.module` so UEL uses the operator's manifest.
+  - **Round 1 P1**: Cache key for `--input-from-file` retrains hashed only the path, not file content; in-place edits to `sfd.py` aliased to stale trainings. Now hashes file SHA-256 too.
+  - **Round 2 P0**: `metadata.json["sfd_module"]` recorded the operator's bare file stem (`op_sfd`); `Trainer.train()` later did `importlib.import_module('op_sfd')` which failed because the path-loaded module isn't on sys.path. Fix: snapshot operator's exp-code into bts cache dir under content-addressed name `_bts_op_<sha16>.py`; load from that path so `module.__name__` IS importable; propagate `_OP_SFD_CACHE` to subprocess workers via `PYTHONPATH`.
+  - **Round 2 P1**: `train_single_decoder` and `pick_decoders` hardcoded logreg's 12 hyperparameter columns via a `_PARAM_COLS` constant. Non-logreg SFDs declare different keys, so the hardcode silently mis-trained. Now derives keys from `loaded.params()` via `derive_op_param_keys(exp_code_path)`; CSV columns validated against operator-declared keys before training.
+  - **Round 3 P0**: Per-decoder `exp.py` was loaded by bare stem (`'exp'`), so `metadata['sfd_module']='exp'` was non-reimportable. Fix: snapshot the per-decoder body to `_OP_SFD_CACHE / _bts_pd_<sha16>.py` and load from there.
+  - **Round 4 P0**: `train_single_decoder` cache-hit path returned on `results.csv` existence alone; sub_dirs left over from earlier builds (with `sfd_module='exp'`) silently re-served the broken metadata. Fix: validate `metadata['sfd_module']` matches the expected `_bts_pd_<sha16>` AND the snapshot file exists in `_OP_SFD_CACHE`. Stale -> wipe + retrain (self-healing without `rm -rf`).
+  - **Round 5 P1 (a)**: Snapshot existence != snapshot validity (a partial write left a corrupt file). Fix: re-hash content on every snapshot call; rewrite atomically on mismatch.
+  - **Round 5 P1 (b)**: Validate-then-wipe-then-retrain block was not locked; concurrent sweeps could both wipe + retrain. Fix: `fcntl.LOCK_EX` per-sub_dir lock; re-validate UNDER the lock so the second-arriving process sees the first's completed work.
+  - **Round 6 P1**: `_atomic_write_bytes` used a deterministic `<path>.tmp` filename; concurrent writers contending on the same target raced. Fix: unique tmp filename per writer (`<path>.<pid>.<uuid4>.tmp`).
+  - **Round 7**: `approved`.
+- New helpers in `cli/_pipeline.py`: `_snapshot_exp_code`, `op_sfd_pythonpath`, `derive_op_param_keys`, `_atomic_write_bytes`, `_atomic_write_text`, `_exclusive_dir_lock`, `_per_decoder_cache_is_valid`.
+- `pipeline/experiment.py:load_from_file` registers the loaded module in `sys.modules` so the in-process `Trainer.train()` reimport finds it.
+- `cli/_run_window.py:run_window_in_subprocess` propagates `op_sfd_pythonpath()` into the child's `PYTHONPATH`.
+- 19/19 tests pass in `tests/cli/test_pick_decoders_cache_key.py` (8 new since 1.16.2 covering the 7 codex rounds + the lock-helper smoke test).
+- Live verification with the operator's `Round3SFD`-style file on real ClickHouse data: 5-permutation sweep + per-decoder retrain, both with `_bts_op_<sha16>` and `_bts_pd_<sha16>` snapshots in `_OP_SFD_CACHE`, fresh-process reimports both succeed.
+- Concurrency stress: 64 concurrent `_snapshot_exp_code` writers (mp.Pool(16)) — 0 errors, no `.tmp` leftovers in cache dir.
+
 # v1.16.2
 
 - **Operator-reported bug fix**: `bts sweep --input-from-file mid.csv` crashed with `TypeError: float() argument must be a string or a real number, not 'NoneType'` deep in `_q` instead of giving any clue what was wrong. Cause: the operator's CSV exported numeric columns with leading whitespace (e.g. ` -0.343` from `to_csv(float_format=' %.3f')`); polars' `cast(Float64, strict=False)` returns null on whitespace-padded strings, the entire 10000-row pool dropped to null, then the quantile machinery tripped on the empty Series.

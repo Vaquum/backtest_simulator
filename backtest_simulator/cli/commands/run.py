@@ -28,8 +28,7 @@ from pathlib import Path
 
 from backtest_simulator.cli._metrics import Trade, print_run
 from backtest_simulator.cli._pipeline import (
-    EXP_DIR,
-    ensure_trained,
+    ensure_trained_from_exp_code,
     pick_decoders,
     preflight_tunnel,
 )
@@ -42,6 +41,25 @@ def register(sub: argparse._SubParsersAction) -> None:
         'run',
         help='Run one backtest window for one decoder.',
     )
+    # --exp-code is REQUIRED: bts has no fallback SFD. The
+    # operator's file must be a self-contained UEL-compliant
+    # Python file with module-level `params()` and `manifest()`
+    # callables. Operator convention is to define an SFD class
+    # (e.g. `class Round3SFD: @staticmethod def params(): ...`)
+    # and expose its static methods at module level via
+    # `params = Round3SFD.params; manifest = Round3SFD.manifest`.
+    # Any uel.run boilerplate must be guarded by
+    # `if __name__ == '__main__':` so importing the file has no
+    # side effects — bts drives uel itself with bts-controlled
+    # n_permutations.
+    p.add_argument('--exp-code', required=True, type=Path,
+                   help=(
+                       'Path to a UEL-compliant Python file with '
+                       'module-level params() and manifest() '
+                       'callables. REQUIRED — bts has no fallback '
+                       'SFD; this file is the source of truth for '
+                       'training and retraining picked decoders.'
+                   ))
     p.add_argument('--window-start', required=True, type=str,
                    help='ISO8601 (e.g. 2026-04-20T08:00:00+00:00).')
     p.add_argument('--window-end', required=True, type=str,
@@ -353,14 +371,34 @@ def _maybe_assert_parity(
 
 
 def _resolve_decoder(args: argparse.Namespace) -> tuple[int, Decimal, Path, int]:
-    """Pick one decoder from the cache or by explicit id."""
+    """Pick one decoder via the operator's `--exp-code` file."""
+    exp_code_path = Path(args.exp_code).expanduser().resolve()
+    if not exp_code_path.is_file():
+        msg = (
+            f'bts run: --exp-code file not found: {exp_code_path}. '
+            f'Supply a self-contained UEL-compliant Python file with '
+            f'module-level params() and manifest() callables.'
+        )
+        raise FileNotFoundError(msg)
     if args.decoder_id is not None:
-        exp_dir = args.experiment_dir or EXP_DIR
-        return args.decoder_id, _kelly_for_decoder(exp_dir, args.decoder_id), exp_dir, args.decoder_id
-    if args.input_from_file is None:
-        ensure_trained(args.n_decoders)
+        # Explicit decoder by id — use the experiment_dir produced
+        # by the operator's exp-code file (or args.experiment_dir
+        # if they want to point at a pre-existing one).
+        if args.experiment_dir is not None:
+            exp_dir = args.experiment_dir
+        else:
+            exp_dir = ensure_trained_from_exp_code(
+                exp_code_path, args.n_decoders,
+            )
+        return (
+            args.decoder_id,
+            _kelly_for_decoder(exp_dir, args.decoder_id),
+            exp_dir, args.decoder_id,
+        )
     picks, _ = pick_decoders(
         args.n_decoders,
+        exp_code_path=exp_code_path,
+        n_permutations=args.n_decoders,
         input_from_file=args.input_from_file,
     )
     perm_id, kelly, exp_dir, display_id = picks[0]

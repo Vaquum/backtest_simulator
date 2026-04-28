@@ -20,7 +20,6 @@ import polars as pl
 
 from backtest_simulator.cli._metrics import Trade, print_run
 from backtest_simulator.cli._pipeline import (
-    ensure_trained,
     pick_decoders,
     preflight_tunnel,
     seed_price_at,
@@ -84,6 +83,25 @@ def register(sub: argparse._SubParsersAction) -> None:
         'sweep',
         help='Run the backtest pipeline over N decoders x M days.',
     )
+    # --exp-code is REQUIRED: bts has no fallback SFD. The
+    # operator's file must be a self-contained UEL-compliant
+    # Python file with module-level `params()` and `manifest()`
+    # callables. Operator convention is to define an SFD class
+    # (e.g. `class Round3SFD: @staticmethod def params(): ...`)
+    # and expose its static methods at module level via
+    # `params = Round3SFD.params; manifest = Round3SFD.manifest`.
+    # Any uel.run boilerplate must be guarded by
+    # `if __name__ == '__main__':` so importing the file has no
+    # side effects — bts drives uel itself with bts-controlled
+    # n_permutations + experiment_name.
+    p.add_argument('--exp-code', required=True, type=Path,
+                   help=(
+                       'Path to a UEL-compliant Python file with '
+                       'module-level params() and manifest() '
+                       'callables. REQUIRED — bts has no fallback '
+                       'SFD; this file is the source of truth for '
+                       'training and retraining picked decoders.'
+                   ))
     p.add_argument('--n-decoders', type=int, default=1)
     p.add_argument('--n-permutations', type=int, default=30)
     p.add_argument('--trading-hours-start', type=str, default=None)
@@ -175,14 +193,20 @@ def _run(args: argparse.Namespace) -> int:
     hours_start, hours_end = _resolve_hours(args)
     days = _resolve_days(args)
     preflight_tunnel()
-    if args.input_from_file is None:
-        ensure_trained(args.n_permutations)
+    exp_code_path = Path(args.exp_code).expanduser().resolve()
+    if not exp_code_path.is_file():
+        sys.stderr.write(
+            f'bts sweep: --exp-code file not found: {exp_code_path}\n',
+        )
+        return 2
     trades_q_range: tuple[float, float] | None = None
     if args.trades_q_range is not None:
         lo_str, hi_str = args.trades_q_range.split(',')
         trades_q_range = (float(lo_str), float(hi_str))
     picks, candidate_pool_size = pick_decoders(
         args.n_decoders,
+        exp_code_path=exp_code_path,
+        n_permutations=args.n_permutations,
         trades_q_range=trades_q_range,
         tp_min_q=args.tp_min_q,
         fpr_max_q=args.fpr_max_q,

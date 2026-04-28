@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -21,7 +22,12 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
-from backtest_simulator.cli._pipeline import SYMBOL, WORK_DIR, seed_price_at
+from backtest_simulator.cli._pipeline import (
+    SYMBOL,
+    WORK_DIR,
+    op_sfd_pythonpath,
+    seed_price_at,
+)
 
 # Tick cadence baked into every per-window manifest. Importers
 # (e.g. `_signals_builder.py` via `sweep.py`) pin to this constant
@@ -469,10 +475,23 @@ def run_window_in_subprocess(
         'atr_k': str(atr_k),
         'atr_window_seconds': int(atr_window_seconds),
     })
+    # Propagate the bts op-sfd cache dir to the child's
+    # PYTHONPATH so Limen's `Trainer.train()` (invoked inside
+    # the child via `BacktestLauncher`) can resolve
+    # `metadata['sfd_module']` (= `_bts_op_<sha16>`) via plain
+    # `importlib.import_module(...)`. Codex round-2 P0: without
+    # this, the child's sys.path lacks the snapshot dir and the
+    # reimport raises `ModuleNotFoundError`.
+    env = os.environ.copy()
+    existing = env.get('PYTHONPATH', '')
+    env['PYTHONPATH'] = os.pathsep.join(
+        p for p in (op_sfd_pythonpath(), existing) if p
+    )
     proc = subprocess.run(
         [sys.executable, '-m', 'backtest_simulator.cli._run_window'],
         input=payload,
         capture_output=True, text=True, check=False, timeout=120,
+        env=env,
     )
     if proc.returncode != 0:
         msg = f'child exit={proc.returncode}; stderr tail: {proc.stderr[-400:]}'
