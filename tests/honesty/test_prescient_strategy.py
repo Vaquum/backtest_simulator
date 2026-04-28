@@ -265,82 +265,111 @@ def test_prescient_via_feed_get_trades_has_no_venue_kwarg() -> None:
 
 
 _PROTOCOL_MOD = 'backtest_simulator.feed.protocol'
+_FEED_MOD = 'backtest_simulator.feed'
 _CARVE_OUT_ATTR = 'get_trades_for_venue'
 _DYNAMIC_IMPORT_NAMES = frozenset({'__import__', 'import_module'})
 _DYNAMIC_EXEC_NAMES = frozenset({'eval', 'exec'})
+# Modules strategy code has NO legitimate need to import at all.
+# `importlib` and `builtins` are both reach-around levers a cheating
+# strategy could use to bind `__import__` / `import_module` /
+# `eval` / `exec` under arbitrary names.
+_BANNED_HELPER_MODULES = frozenset({'importlib', 'builtins'})
+
+
+def _module_path_matches(node_module: str | None, level: int, target: str) -> bool:
+    """Return True if `node` resolves (with relative-level normalization) to `target`.
+
+    `from ..feed.protocol import VenueFeed` lands as `module="feed.protocol"`
+    with `level=2`, etc. For the bypass scan we don't need full
+    package resolution — any `from <relative>.feed.protocol import _`
+    or `from <relative>.feed import protocol` is suspicious regardless
+    of the leading dots.
+    """
+    if level == 0:
+        return node_module == target
+    suffix = target.split('.', 1)[1] if '.' in target else target
+    return node_module is not None and (
+        node_module == target or node_module.endswith(suffix) or node_module == suffix
+    )
 
 
 def _scan_import_from(node: object, rel: Path) -> list[str]:
-    """Catch (1) `from PROTOCOL import VenueFeed | *` and (3) `from FEED import protocol`."""
+    """Catch protocol imports + banned helper-module imports.
+
+    Direct: `from PROTOCOL import VenueFeed | *`,
+    `from FEED import protocol [as X]`. Relative: `from ..feed.protocol
+    import VenueFeed`, `from ..feed import protocol`. And
+    `from importlib import _`, `from builtins import _`.
+    """
     import ast
     if not isinstance(node, ast.ImportFrom):
         return []
     leaks: list[str] = []
-    if node.module == _PROTOCOL_MOD:
+    level = node.level or 0
+    if _module_path_matches(node.module, level, _PROTOCOL_MOD):
         for a in node.names:
             if a.name in ('VenueFeed', '*'):
-                leaks.append(f'{rel}: from {node.module} import {a.name}')
-    elif node.module == 'backtest_simulator.feed':
+                dots = '.' * level
+                leaks.append(f'{rel}: from {dots}{node.module or ""} import {a.name}')
+    elif _module_path_matches(node.module, level, _FEED_MOD):
         for a in node.names:
             if a.name == 'protocol':
                 tail = f' as {a.asname}' if a.asname else ''
-                leaks.append(f'{rel}: from backtest_simulator.feed import protocol{tail}')
+                dots = '.' * level
+                leaks.append(f'{rel}: from {dots}{node.module or ""} import protocol{tail}')
+    if node.module in _BANNED_HELPER_MODULES:
+        names = [a.name for a in node.names]
+        leaks.append(f'{rel}: from {node.module} import {names!r} (banned helper module)')
     return leaks
 
 
 def _scan_import(node: object, rel: Path) -> list[str]:
-    """Catch (4) `import backtest_simulator.feed.protocol`."""
+    """Catch `import PROTOCOL` and `import importlib | builtins`."""
     import ast
     if not isinstance(node, ast.Import):
         return []
-    return [f'{rel}: import {a.name}' for a in node.names if a.name == _PROTOCOL_MOD]
-
-
-def _is_dynamic_import_callable(func: object) -> bool:
-    """Return True if `func` is any name pyright/strategy could use for dynamic import.
-
-    Catches: `__import__(...)`, `import_module(...)` (regardless of how it
-    got bound — `from importlib import import_module`, `import importlib
-    as il; il.import_module(...)`, etc.).
-    """
-    import ast
-    if isinstance(func, ast.Name):
-        return func.id in _DYNAMIC_IMPORT_NAMES
-    if isinstance(func, ast.Attribute):
-        return func.attr in _DYNAMIC_IMPORT_NAMES
-    return False
+    leaks: list[str] = []
+    for a in node.names:
+        if a.name == _PROTOCOL_MOD:
+            leaks.append(f'{rel}: import {a.name}')
+        if a.name in _BANNED_HELPER_MODULES:
+            leaks.append(f'{rel}: import {a.name} (banned helper module)')
+    return leaks
 
 
 def _scan_call(node: object, rel: Path) -> list[str]:
-    """Catch (5) any dynamic import + (6) `getattr(_, ATTR)` + ban eval/exec."""
+    """Ban dynamic-import callables, getattr, and eval/exec in strategy modules."""
     import ast
     if not isinstance(node, ast.Call):
         return []
     leaks: list[str] = []
     f = node.func
-    if _is_dynamic_import_callable(f):
-        # Strategy modules have NO legitimate need for dynamic imports.
-        # Banning ALL dynamic imports — `__import__(...)`,
-        # `importlib.import_module(...)`, `il.import_module(...)`,
-        # `import_module(...)` (from-imported), regardless of the
-        # argument shape (literal, concatenated, relative, fromlist).
-        kind = f.id if isinstance(f, ast.Name) else f.attr
-        leaks.append(f'{rel}: dynamic-import call ({kind})')
-    if (isinstance(f, ast.Name) and f.id == 'getattr'
-            and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value == _CARVE_OUT_ATTR):
-        leaks.append(f'{rel}: getattr(_, {_CARVE_OUT_ATTR!r})')
-    if isinstance(f, ast.Name) and f.id in _DYNAMIC_EXEC_NAMES:
-        # Strategy modules have NO legitimate need for eval/exec.
-        # Banning catches the constant-string variant of the
-        # bypass (`eval("__import__('...')")`, `exec("from ...
-        # import VenueFeed")`).
-        leaks.append(f'{rel}: {f.id}() call (banned in strategy modules)')
+    name = (f.id if isinstance(f, ast.Name)
+            else f.attr if isinstance(f, ast.Attribute) else None)
+    # Dynamic imports — any callable named `__import__` / `import_module`,
+    # whether bound via `__import__`, `importlib.import_module`,
+    # `il.import_module`, `from importlib import import_module as im; im()`,
+    # `getattr(importlib, 'import_module')(...)`. Strategy modules have
+    # NO legitimate dynamic-import use; the entire shape is banned.
+    if name in _DYNAMIC_IMPORT_NAMES:
+        leaks.append(f'{rel}: dynamic-import call ({name})')
+    # eval / exec — direct (`eval(...)`) and attribute form
+    # (`builtins.eval(...)`). Same blanket ban — no legitimate use
+    # in strategy modules.
+    if name in _DYNAMIC_EXEC_NAMES:
+        leaks.append(f'{rel}: {name}() call (banned in strategy modules)')
+    # `getattr(...)` — banned outright in strategy modules. Strategy
+    # code reads named attributes directly; getattr is the dynamic
+    # escape hatch a cheating strategy uses to bypass the type system
+    # AND the constant-arg AST scan (e.g. `getattr(feed,
+    # 'get_trades_' + 'for_venue')`, `getattr(builtins, '__import__')`).
+    if isinstance(f, ast.Name) and f.id == 'getattr':
+        leaks.append(f'{rel}: getattr(...) call (banned in strategy modules)')
     return leaks
 
 
 def _scan_attribute(node: object, rel: Path) -> list[str]:
-    """Catch (7) any `_.get_trades_for_venue` attribute read or call."""
+    """Catch any `_.get_trades_for_venue` attribute read or call."""
     import ast
     if not isinstance(node, ast.Attribute):
         return []
