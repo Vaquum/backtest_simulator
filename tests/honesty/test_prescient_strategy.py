@@ -270,10 +270,20 @@ _CARVE_OUT_ATTR = 'get_trades_for_venue'
 _DYNAMIC_IMPORT_NAMES = frozenset({'__import__', 'import_module'})
 _DYNAMIC_EXEC_NAMES = frozenset({'eval', 'exec'})
 # Modules strategy code has NO legitimate need to import at all.
-# `importlib` and `builtins` are both reach-around levers a cheating
-# strategy could use to bind `__import__` / `import_module` /
-# `eval` / `exec` under arbitrary names.
-_BANNED_HELPER_MODULES = frozenset({'importlib', 'builtins'})
+# Each is a reach-around lever a cheating strategy could use to bind
+# `__import__` / `import_module` / `eval` / `exec` (or attribute-
+# walk into the protocol module) under arbitrary names. Matching by
+# ROOT module name (`x.y.z` → `x`) catches submodule imports too
+# (`import importlib.util`, `from importlib.util import _`).
+_BANNED_HELPER_MODULES = frozenset({'importlib', 'builtins', 'sys', 'inspect'})
+_BANNED_NAMESPACE_BUILTINS = frozenset({'globals', 'locals', 'vars', 'dir', 'type'})
+# Meta-introspection attribute names — banning these closes the
+# `type(feed).__dict__['carve_out']` / `feed.__getattribute__('...')`
+# bypass paths.
+_BANNED_META_ATTRS = frozenset({
+    '__dict__', '__class__', '__mro__', '__subclasses__',
+    '__getattribute__', '__getattr__', '__builtins__',
+})
 
 
 def _module_path_matches(node_module: str | None, level: int, target: str) -> bool:
@@ -293,14 +303,15 @@ def _module_path_matches(node_module: str | None, level: int, target: str) -> bo
     )
 
 
-def _scan_import_from(node: object, rel: Path) -> list[str]:
-    """Catch protocol imports + banned helper-module imports.
+def _root_module(name: str | None) -> str | None:
+    """Return the leftmost dotted segment (`importlib.util` → `importlib`)."""
+    if name is None:
+        return None
+    return name.split('.', 1)[0]
 
-    Direct: `from PROTOCOL import VenueFeed | *`,
-    `from FEED import protocol [as X]`. Relative: `from ..feed.protocol
-    import VenueFeed`, `from ..feed import protocol`. And
-    `from importlib import _`, `from builtins import _`.
-    """
+
+def _scan_import_from(node: object, rel: Path) -> list[str]:
+    """Catch protocol imports + banned helper-module imports (root-matched)."""
     import ast
     if not isinstance(node, ast.ImportFrom):
         return []
@@ -317,14 +328,14 @@ def _scan_import_from(node: object, rel: Path) -> list[str]:
                 tail = f' as {a.asname}' if a.asname else ''
                 dots = '.' * level
                 leaks.append(f'{rel}: from {dots}{node.module or ""} import protocol{tail}')
-    if node.module in _BANNED_HELPER_MODULES:
+    if _root_module(node.module) in _BANNED_HELPER_MODULES:
         names = [a.name for a in node.names]
         leaks.append(f'{rel}: from {node.module} import {names!r} (banned helper module)')
     return leaks
 
 
 def _scan_import(node: object, rel: Path) -> list[str]:
-    """Catch `import PROTOCOL` and `import importlib | builtins`."""
+    """Catch `import PROTOCOL` and `import {importlib|builtins|sys|inspect}[.x]`."""
     import ast
     if not isinstance(node, ast.Import):
         return []
@@ -332,13 +343,13 @@ def _scan_import(node: object, rel: Path) -> list[str]:
     for a in node.names:
         if a.name == _PROTOCOL_MOD:
             leaks.append(f'{rel}: import {a.name}')
-        if a.name in _BANNED_HELPER_MODULES:
-            leaks.append(f'{rel}: import {a.name} (banned helper module)')
+        if _root_module(a.name) in _BANNED_HELPER_MODULES:
+            leaks.append(f'{rel}: import {a.name} (banned helper module root)')
     return leaks
 
 
 def _scan_call(node: object, rel: Path) -> list[str]:
-    """Ban dynamic-import callables, getattr, and eval/exec in strategy modules."""
+    """Ban dynamic-import / getattr / eval / exec / namespace-introspection calls."""
     import ast
     if not isinstance(node, ast.Call):
         return []
@@ -346,35 +357,38 @@ def _scan_call(node: object, rel: Path) -> list[str]:
     f = node.func
     name = (f.id if isinstance(f, ast.Name)
             else f.attr if isinstance(f, ast.Attribute) else None)
-    # Dynamic imports — any callable named `__import__` / `import_module`,
-    # whether bound via `__import__`, `importlib.import_module`,
-    # `il.import_module`, `from importlib import import_module as im; im()`,
-    # `getattr(importlib, 'import_module')(...)`. Strategy modules have
-    # NO legitimate dynamic-import use; the entire shape is banned.
     if name in _DYNAMIC_IMPORT_NAMES:
         leaks.append(f'{rel}: dynamic-import call ({name})')
-    # eval / exec — direct (`eval(...)`) and attribute form
-    # (`builtins.eval(...)`). Same blanket ban — no legitimate use
-    # in strategy modules.
     if name in _DYNAMIC_EXEC_NAMES:
-        leaks.append(f'{rel}: {name}() call (banned in strategy modules)')
-    # `getattr(...)` — banned outright in strategy modules. Strategy
-    # code reads named attributes directly; getattr is the dynamic
-    # escape hatch a cheating strategy uses to bypass the type system
-    # AND the constant-arg AST scan (e.g. `getattr(feed,
-    # 'get_trades_' + 'for_venue')`, `getattr(builtins, '__import__')`).
+        leaks.append(f'{rel}: {name}() call (banned)')
     if isinstance(f, ast.Name) and f.id == 'getattr':
-        leaks.append(f'{rel}: getattr(...) call (banned in strategy modules)')
+        leaks.append(f'{rel}: getattr(...) call (banned)')
+    # `globals()` / `locals()` / `vars()` / `dir()` / `type()` — the
+    # namespace-introspection callables. Strategy code has no legitimate
+    # need; banning catches the `__builtins__.__dict__['__import__']`
+    # bypass shape (where the strategy reads its own globals).
+    if isinstance(f, ast.Name) and f.id in _BANNED_NAMESPACE_BUILTINS:
+        leaks.append(f'{rel}: {f.id}() call (banned namespace builtin)')
     return leaks
 
 
 def _scan_attribute(node: object, rel: Path) -> list[str]:
-    """Catch any `_.get_trades_for_venue` attribute read or call."""
+    """Catch carve-out access AND meta-introspection attrs."""
     import ast
     if not isinstance(node, ast.Attribute):
         return []
     if node.attr == _CARVE_OUT_ATTR:
         return [f'{rel}: attribute access `_.{_CARVE_OUT_ATTR}`']
+    if node.attr in _BANNED_META_ATTRS:
+        return [f'{rel}: attribute access `_.{node.attr}` (banned meta attr)']
+    return []
+
+
+def _scan_name(node: object, rel: Path) -> list[str]:
+    """Catch bare `__builtins__` reads (it shadows the module ban)."""
+    import ast
+    if isinstance(node, ast.Name) and node.id == '__builtins__':
+        return [f'{rel}: name `__builtins__` (banned global)']
     return []
 
 
@@ -412,6 +426,7 @@ def _scan_for_venue_feed_import(path: Path, repo: Path) -> list[str]:
         leaks.extend(_scan_import(node, rel))
         leaks.extend(_scan_call(node, rel))
         leaks.extend(_scan_attribute(node, rel))
+        leaks.extend(_scan_name(node, rel))
     return leaks
 
 
