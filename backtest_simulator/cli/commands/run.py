@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -313,7 +314,7 @@ def _run(args: argparse.Namespace) -> int:
 
 
 def _maybe_assert_parity(
-    args: argparse.Namespace, result: dict[str, object],
+    args: argparse.Namespace, result: Mapping[str, object],
     *, emit_human: bool = True,
 ) -> int:
     """Slice #17 Task 18 — call `assert_ledger_parity` if `--check-parity-vs`.

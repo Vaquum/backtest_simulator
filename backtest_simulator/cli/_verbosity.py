@@ -65,7 +65,13 @@ def _silence_tqdm_and_structlog() -> None:
     """
     import structlog
     import tqdm as _tqdm
-    _tqdm.tqdm = lambda iterable=None, *_a, **_kw: iterable if iterable is not None else iter(())
+
+    def _tqdm_passthrough(
+        iterable: object = None, *_a: object, **_kw: object,
+    ) -> object:
+        return iterable if iterable is not None else iter(())
+
+    _tqdm.tqdm = _tqdm_passthrough
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR),
     )

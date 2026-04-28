@@ -11,11 +11,18 @@
 # rejected it before submission).
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Final
 
 STARTING_CAPITAL: Final[Decimal] = Decimal('100000')
+
+
+@dataclass(frozen=True, slots=True)
+class _Side:
+    """Side wrapper exposing `name` (matches Praxis's OrderSide.name shape)."""
+    name: str
 
 
 class Trade:
@@ -33,7 +40,7 @@ class Trade:
         fee: str, fee_asset: str, ts: str,
     ) -> None:
         self.client_order_id = coid
-        self.side = type('_Side', (), {'name': side})()
+        self.side = _Side(name=side)
         self.qty = Decimal(qty)
         self.price = Decimal(price)
         self.fee = Decimal(fee)
