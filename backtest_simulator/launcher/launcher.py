@@ -43,7 +43,7 @@ from nexus.strategy.predict_loop import PredictLoop
 from nexus.strategy.runner import StrategyRunner
 from nexus.strategy.timer_loop import TimerLoop
 from praxis.core.domain.enums import OrderSide, OrderType
-from praxis.core.domain.trade_outcome import TradeOutcome as PraxisTradeOutcome
+from praxis.core.domain.trade_outcome import TradeOutcome
 from praxis.infrastructure.event_spine import EventSpine
 from praxis.infrastructure.venue_adapter import SubmitResult, VenueAdapter
 from praxis.launcher import InstanceConfig, Launcher
@@ -418,7 +418,7 @@ def _outcome_queues_for(trading: object) -> dict[str, queue.Queue[NexusTradeOutc
 
 
 def _translate_praxis_outcome(
-    praxis_outcome: PraxisTradeOutcome,
+    praxis_outcome: TradeOutcome,
 ) -> NexusTradeOutcome | None:
     """Convert a Praxis `TradeOutcome` into Nexus's `TradeOutcome` shape.
 
@@ -908,7 +908,7 @@ class BacktestLauncher(Launcher):
             raise RuntimeError(msg)
         trading = self._trading
 
-        async def _route_and_translate(praxis_outcome: PraxisTradeOutcome) -> None:
+        async def _route_and_translate(praxis_outcome: TradeOutcome) -> None:
             nexus_outcome = _translate_praxis_outcome(praxis_outcome)
             if nexus_outcome is None:
                 return
@@ -1060,7 +1060,7 @@ class BacktestLauncher(Launcher):
         self._stop_event.set()
 
     def _run_nexus_instance(
-        self, inst: InstanceConfig, outcome_queue: queue.Queue[PraxisTradeOutcome],
+        self, inst: InstanceConfig, outcome_queue: queue.Queue[TradeOutcome],
     ) -> None:
         """Mirror praxis.Launcher._run_nexus_instance but wire `action_submit`.
 
