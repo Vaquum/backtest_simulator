@@ -24,9 +24,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from backtest_simulator.feed.protocol import VenueFeed
+    from backtest_simulator.honesty.atr import AtrSanityGate
     from backtest_simulator.honesty.maker_fill import MakerFillModel
     from backtest_simulator.honesty.slippage import SlippageModel
+
+    AtrProvider = Callable[[str, datetime], Decimal | None]
 
 from backtest_simulator.cli._pipeline import (
     SYMBOL,
@@ -282,10 +287,12 @@ def run_window_in_process(
     runtime_predictions: list[dict[str, object]] = []
     import nexus.strategy.predict_loop as _predict_loop_mod
     # Nexus's `produce_signal(wired, market_data) -> Signal` is
-    # untyped at the package boundary; saved reference captured
-    # BEFORE we overwrite the module attribute.
-    _real_produce_signal = _predict_loop_mod.produce_signal
-
+    # not in `__all__`, so `predict_loop_mod.produce_signal` direct
+    # reads trigger `reportPrivateImportUsage`. Use `getattr` /
+    # `setattr` for the read + override seam — the contract IS
+    # public (Nexus's PredictLoop calls it), just not advertised
+    # via `__all__`.
+    _real_produce_signal = getattr(_predict_loop_mod, 'produce_signal')
     def _capturing_produce_signal(
         wired: object, market_data: object,
     ) -> object:
@@ -295,11 +302,11 @@ def run_window_in_process(
         )
         return signal
 
-    _predict_loop_mod.produce_signal = _capturing_produce_signal
+    setattr(_predict_loop_mod, 'produce_signal', _capturing_produce_signal)
     try:
         launcher.run_window(window_start, window_end)
     finally:
-        _predict_loop_mod.produce_signal = _real_produce_signal
+        setattr(_predict_loop_mod, 'produce_signal', _real_produce_signal)
     # Slice #17 Task 18: dump the run's EventSpine to JSONL for
     # ledger-parity comparison. Always-dump (codex round 1 #4): the
     # operator gets a comparable artifact regardless of whether
@@ -322,13 +329,19 @@ def run_window_in_process(
         )
         for t in account.trades
     ]
-    declared_stops = {k: str(v) for k, v in launcher._declared_stops.items()}
+    # `_declared_stops` is the launcher's per-trade honesty record
+    # (coid -> declared_stop_price). The underscore is internal-state
+    # naming; we read it here from the same package's launcher and
+    # the slot has no public accessor (the launcher is the only
+    # writer; sweep parent rehydrates via this dict for `R` math).
+    _stops: dict[str, Decimal] = getattr(launcher, '_declared_stops')
+    declared_stops = {str(k): str(v) for k, v in _stops.items()}
 
     def _emit(value: Decimal | None) -> str | None:
         return None if value is None else str(value)
 
-    return {
-        'trades': trade_tuples,
+    result: WindowResult = {
+        'trades': [list(row) for row in trade_tuples],
         'declared_stops': declared_stops,
         'orders': len(account.orders),
         # Signed mean — directional, NOT a cost metric on its own.
@@ -451,11 +464,12 @@ def run_window_in_process(
         # in the window (e.g. window shorter than interval_seconds).
         'runtime_predictions': runtime_predictions,
     }
+    return result
 
 
 def _build_atr_gate_and_provider(
     feed: VenueFeed, *, k: Decimal, window_seconds: int,
-) -> tuple[object, object]:
+) -> tuple[AtrSanityGate, AtrProvider]:
     """Construct the ATR sanity gate + per-submit provider.
 
     Provider closes over `feed`, fetches `[t - window_seconds,

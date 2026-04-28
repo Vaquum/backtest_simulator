@@ -718,7 +718,7 @@ def pick_decoders(
             msg = f'--input-from-file: {file_path} does not exist.'
             raise FileNotFoundError(msg)
         results = pl.read_csv(file_path)
-        available_cols = cast('list[str]', list(results.columns))
+        available_cols = list(results.columns)
         missing_cols = [k for k in op_param_keys if k not in available_cols]
         if missing_cols:
             msg = (
@@ -811,7 +811,15 @@ def pick_decoders(
         if series.dtype == pl.Utf8:
             series = series.cast(pl.Float64, strict=False)
         series = series.drop_nulls().drop_nans()
-        return float(series.quantile(pct))
+        # `Series.quantile()` returns `float | None` (None for empty
+        # series). The caller's drop_nulls/drop_nans + the surrounding
+        # check_columns_present means a non-empty series is the
+        # contract; if it's somehow empty, surface that loudly.
+        q = series.quantile(pct)
+        if q is None:
+            msg = f'_q({col!r}, {pct!r}): series quantile returned None'
+            raise ValueError(msg)
+        return float(q)
 
     def _numeric_col(col: str) -> pl.Expr:
         dtype = results[col].dtype

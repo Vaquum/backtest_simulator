@@ -69,7 +69,7 @@ class SlippageModel:
     """
 
     _buckets_by_side: dict[OrderSide, tuple[SlippageBucket, ...]] = field(
-        default_factory=dict,
+        default_factory=lambda: {},
     )
     _dt_seconds: int = 0
 
