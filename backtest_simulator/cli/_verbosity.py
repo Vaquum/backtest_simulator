@@ -50,11 +50,11 @@ def configure(verbosity: int) -> None:
         warnings.filterwarnings('ignore', category=UserWarning)
         warnings.filterwarnings('ignore', category=DeprecationWarning)
     if verbosity < 3:
-        _silence_tqdm_and_structlog()
+        _silence_tqdm_and_structlog(level)
 
 
-def _silence_tqdm_and_structlog() -> None:
-    """Silence Limen's tqdm training bar + Praxis's structlog formatters.
+def _silence_tqdm_and_structlog(level: int) -> None:
+    """Silence Limen's tqdm bar; track structlog filter to `level`.
 
     Both bypass stdlib logging — tqdm writes directly to stderr and
     structlog has its own processor chain — so configuring `logging`
@@ -63,6 +63,13 @@ def _silence_tqdm_and_structlog() -> None:
     vaquum-nexus / vaquum-praxis), so direct imports are honest
     here — if either is absent, the bts venv is misconfigured and
     we want a loud ImportError, not a silent no-op.
+
+    zero-bang post-auditor-4 P1: prior code hardcoded
+    `make_filtering_bound_logger(ERROR)` for all verbosity<3,
+    which left Praxis/Nexus/Limen structlog suppressed at `-v`
+    (INFO) and `-vv` (DEBUG) — contradicting both the module
+    docstring and docs/cli.md. Now `level` tracks stdlib so
+    structlog mirrors the operator-requested verbosity.
     """
     import structlog
     import tqdm as _tqdm
@@ -97,5 +104,5 @@ def _silence_tqdm_and_structlog() -> None:
 
     _tqdm.tqdm = _NoopTqdm
     structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR),
+        wrapper_class=structlog.make_filtering_bound_logger(level),
     )

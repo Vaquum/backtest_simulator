@@ -272,17 +272,35 @@ _DYNAMIC_EXEC_NAMES = frozenset({'eval', 'exec'})
 # Modules strategy code has NO legitimate need to import at all.
 # Each is a reach-around lever a cheating strategy could use to bind
 # `__import__` / `import_module` / `eval` / `exec` (or attribute-
-# walk into the protocol module) under arbitrary names. Matching by
-# ROOT module name (`x.y.z` → `x`) catches submodule imports too
-# (`import importlib.util`, `from importlib.util import _`).
-_BANNED_HELPER_MODULES = frozenset({'importlib', 'builtins', 'sys', 'inspect'})
-_BANNED_NAMESPACE_BUILTINS = frozenset({'globals', 'locals', 'vars', 'dir', 'type'})
+# walk into the protocol module). Root-matched, so submodules
+# (`importlib.util`, `ctypes.pythonapi`) are also banned.
+_BANNED_HELPER_MODULES = frozenset({
+    'importlib', 'builtins', 'sys', 'inspect',
+    'operator', 'ctypes', 'gc', 'pkgutil', 'pydoc',
+})
+# Banned callable names — matched whether bound by direct name
+# (`getattr(_)`), attribute (`logging.sys.modules['builtins'].getattr(_)`),
+# or alias (`ga = getattr; ga(_)`). Strategy code uses simple
+# named attribute reads; everything in this set is escape-hatch
+# territory.
+_BANNED_CALLABLES = frozenset({
+    'getattr', 'hasattr', 'setattr', 'delattr',
+    'globals', 'locals', 'vars', 'dir', 'type',
+    'eval', 'exec',
+    '__import__', 'import_module',
+    'attrgetter', 'methodcaller',  # operator.attrgetter / methodcaller
+    'resolve_name', 'locate',  # pkgutil.resolve_name / pydoc.locate
+})
 # Meta-introspection attribute names — banning these closes the
-# `type(feed).__dict__['carve_out']` / `feed.__getattribute__('...')`
-# bypass paths.
+# `type(feed).__dict__['carve_out']`, `feed.__getattribute__('...')`,
+# `func.__globals__['__builtins__'][...]`, `print.__self__.foo`
+# style bypasses.
 _BANNED_META_ATTRS = frozenset({
     '__dict__', '__class__', '__mro__', '__subclasses__',
     '__getattribute__', '__getattr__', '__builtins__',
+    '__globals__', '__self__', '__func__', '__code__',
+    '__closure__', '__module__', '__base__', '__bases__',
+    '__reduce__', '__reduce_ex__',
 })
 
 
@@ -349,27 +367,22 @@ def _scan_import(node: object, rel: Path) -> list[str]:
 
 
 def _scan_call(node: object, rel: Path) -> list[str]:
-    """Ban dynamic-import / getattr / eval / exec / namespace-introspection calls."""
+    """Ban every banned-callable call shape (Name, Attribute, alias).
+
+    Resolves the function's final binding name and matches against
+    `_BANNED_CALLABLES`. Catches: bare `getattr(_)`,
+    `obj.getattr(_)`, `logging.sys.modules['builtins'].getattr(_)`,
+    `operator.attrgetter('...')(_)`, `pkgutil.resolve_name('...')(_)`.
+    """
     import ast
     if not isinstance(node, ast.Call):
         return []
-    leaks: list[str] = []
     f = node.func
     name = (f.id if isinstance(f, ast.Name)
             else f.attr if isinstance(f, ast.Attribute) else None)
-    if name in _DYNAMIC_IMPORT_NAMES:
-        leaks.append(f'{rel}: dynamic-import call ({name})')
-    if name in _DYNAMIC_EXEC_NAMES:
-        leaks.append(f'{rel}: {name}() call (banned)')
-    if isinstance(f, ast.Name) and f.id == 'getattr':
-        leaks.append(f'{rel}: getattr(...) call (banned)')
-    # `globals()` / `locals()` / `vars()` / `dir()` / `type()` — the
-    # namespace-introspection callables. Strategy code has no legitimate
-    # need; banning catches the `__builtins__.__dict__['__import__']`
-    # bypass shape (where the strategy reads its own globals).
-    if isinstance(f, ast.Name) and f.id in _BANNED_NAMESPACE_BUILTINS:
-        leaks.append(f'{rel}: {f.id}() call (banned namespace builtin)')
-    return leaks
+    if name in _BANNED_CALLABLES:
+        return [f'{rel}: banned-callable call `{name}(...)`']
+    return []
 
 
 def _scan_attribute(node: object, rel: Path) -> list[str]:
@@ -385,10 +398,22 @@ def _scan_attribute(node: object, rel: Path) -> list[str]:
 
 
 def _scan_name(node: object, rel: Path) -> list[str]:
-    """Catch bare `__builtins__` reads (it shadows the module ban)."""
+    """Catch any read of a banned callable / `__builtins__` global.
+
+    A cheating strategy can alias a banned callable
+    (`ga = getattr`) and call the alias instead. This `Name`-Load
+    walker rejects any `Load`-context read of a banned name —
+    catches the alias-binding shape AND the bare-`__builtins__`
+    shape from the round-5 lockdown.
+    """
     import ast
-    if isinstance(node, ast.Name) and node.id == '__builtins__':
-        return [f'{rel}: name `__builtins__` (banned global)']
+    if not isinstance(node, ast.Name):
+        return []
+    if not isinstance(getattr(node, 'ctx', None), ast.Load):
+        return []
+    banned = _BANNED_CALLABLES | {'__builtins__'}
+    if node.id in banned:
+        return [f'{rel}: banned-name read `{node.id}` (alias bypass)']
     return []
 
 
