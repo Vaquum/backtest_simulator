@@ -264,28 +264,82 @@ def test_prescient_via_feed_get_trades_has_no_venue_kwarg() -> None:
     )
 
 
-def _scan_for_venue_feed_import(path: Path, repo: Path) -> list[str]:
-    """Return one entry per VenueFeed-import leak found in `path`.
+_PROTOCOL_MOD = 'backtest_simulator.feed.protocol'
+_CARVE_OUT_ATTR = 'get_trades_for_venue'
 
-    AST scan — catches `from backtest_simulator.feed.protocol import
-    VenueFeed` (direct), aliased forms (`as Alias`), and the bare
-    `import backtest_simulator.feed.protocol` form (which lets the
-    caller reach VenueFeed via attribute access).
+
+def _scan_import_from(node: object, rel: Path) -> list[str]:
+    """Catch (1) `from PROTOCOL import VenueFeed | *` and (3) `from FEED import protocol`."""
+    import ast
+    if not isinstance(node, ast.ImportFrom):
+        return []
+    leaks: list[str] = []
+    if node.module == _PROTOCOL_MOD:
+        for a in node.names:
+            if a.name in ('VenueFeed', '*'):
+                leaks.append(f'{rel}: from {node.module} import {a.name}')
+    elif node.module == 'backtest_simulator.feed':
+        for a in node.names:
+            if a.name == 'protocol':
+                tail = f' as {a.asname}' if a.asname else ''
+                leaks.append(f'{rel}: from backtest_simulator.feed import protocol{tail}')
+    return leaks
+
+
+def _scan_import(node: object, rel: Path) -> list[str]:
+    """Catch (4) `import backtest_simulator.feed.protocol`."""
+    import ast
+    if not isinstance(node, ast.Import):
+        return []
+    return [f'{rel}: import {a.name}' for a in node.names if a.name == _PROTOCOL_MOD]
+
+
+def _scan_call(node: object, rel: Path) -> list[str]:
+    """Catch (5) `__import__` / `importlib.import_module` and (6) `getattr(_, ATTR)`."""
+    import ast
+    if not isinstance(node, ast.Call):
+        return []
+    leaks: list[str] = []
+    f = node.func
+    is_const = node.args and isinstance(node.args[0], ast.Constant)
+    if isinstance(f, ast.Name) and f.id == '__import__' and is_const and node.args[0].value == _PROTOCOL_MOD:
+        leaks.append(f'{rel}: __import__({_PROTOCOL_MOD!r})')
+    if (isinstance(f, ast.Attribute) and f.attr == 'import_module'
+            and isinstance(f.value, ast.Name) and f.value.id == 'importlib'
+            and is_const and node.args[0].value == _PROTOCOL_MOD):
+        leaks.append(f'{rel}: importlib.import_module({_PROTOCOL_MOD!r})')
+    if (isinstance(f, ast.Name) and f.id == 'getattr'
+            and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == _CARVE_OUT_ATTR):
+        leaks.append(f'{rel}: getattr(_, {_CARVE_OUT_ATTR!r})')
+    return leaks
+
+
+def _scan_for_venue_feed_import(path: Path, repo: Path) -> list[str]:
+    """Return one entry per VenueFeed-bypass path found in `path`.
+
+    Codex post-auditor-4 round 2 P1: extends the scan to cover every
+    statically-detectable path a cheating strategy could use to
+    reach `VenueFeed` / `get_trades_for_venue`:
+
+      1. `from backtest_simulator.feed.protocol import VenueFeed`
+      2. `from backtest_simulator.feed.protocol import *`
+      3. `from backtest_simulator.feed import protocol [as fp]`
+      4. `import backtest_simulator.feed.protocol`
+      5. `importlib.import_module('backtest_simulator.feed.protocol')`
+         / `__import__('backtest_simulator.feed.protocol')`
+      6. `getattr(_, 'get_trades_for_venue')`
+
+    Each entry returned is one leak with file + kind + source line.
     """
     import ast
     tree = ast.parse(path.read_text(encoding='utf-8'))
-    leaks: list[str] = []
     rel = path.relative_to(repo)
+    leaks: list[str] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            if node.module == 'backtest_simulator.feed.protocol':
-                for alias in node.names:
-                    if alias.name == 'VenueFeed':
-                        leaks.append(f'{rel}: from {node.module} import VenueFeed')
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name == 'backtest_simulator.feed.protocol':
-                    leaks.append(f'{rel}: import {alias.name}')
+        leaks.extend(_scan_import_from(node, rel))
+        leaks.extend(_scan_import(node, rel))
+        leaks.extend(_scan_call(node, rel))
     return leaks
 
 

@@ -21,7 +21,7 @@ STARTING_CAPITAL: Final[Decimal] = Decimal('100000')
 
 @dataclass(frozen=True, slots=True)
 class _Side:
-    """Side wrapper exposing `name` (matches Praxis's OrderSide.name shape)."""
+    """Side wrapper with `.name` (matches Praxis's OrderSide.name)."""
     name: str
 
 
@@ -64,18 +64,21 @@ def pair_trades(trades: list[Trade]) -> tuple[list[tuple[Trade, Trade]], list[Tr
 def pair_metrics(
     pair: tuple[Trade, Trade], declared_stop: Decimal | None,
 ) -> tuple[Decimal, Decimal, Decimal | None]:
-    """Return `(net_pnl, return_pct, r_multiple_or_none)` for one BUY→SELL pair."""
+    """`(net_pnl, net_return_pct, r_mult|None)` for one BUY→SELL pair.
+
+    `net_return_pct = net / (buy.price * qty) * 100` — net of
+    both legs' fees. Coherent accounting basis with PF/R/DD on
+    the summary line (zero-bang post-auditor-4 P1).
+    """
     buy, sell = pair
     qty = buy.qty
-    gross = (sell.price - buy.price) * qty
-    net = gross - (buy.fee + sell.fee)
-    return_pct = (sell.price - buy.price) / buy.price * Decimal('100')
+    net = (sell.price - buy.price) * qty - (buy.fee + sell.fee)
+    notional = buy.price * qty
+    return_pct = Decimal('0') if notional == 0 else net / notional * Decimal('100')
     if declared_stop is None or declared_stop == buy.price:
-        r_mult: Decimal | None = None
-    else:
-        risk = abs(buy.price - declared_stop) * qty
-        r_mult = None if risk == 0 else net / risk
-    return net, return_pct, r_mult
+        return net, return_pct, None
+    risk = abs(buy.price - declared_stop) * qty
+    return net, return_pct, (None if risk == 0 else net / risk)
 
 
 def max_drawdown_pct(net_pnls: list[Decimal], capital: Decimal) -> Decimal:

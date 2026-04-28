@@ -66,12 +66,29 @@ def _silence_tqdm_and_structlog() -> None:
     import structlog
     import tqdm as _tqdm
 
-    def _tqdm_passthrough(
-        iterable: object = None, *_a: object, **_kw: object,
-    ) -> object:
-        return iterable if iterable is not None else iter(())
+    class _NoopTqdm:
+        # zero-bang post-auditor-4 P1: replaces a bare `iter(())`
+        # passthrough that broke tqdm's manual-mode API
+        # (`.update()` / `.close()`). Iterates the wrapped iterable;
+        # any other attribute (.update, .set_description, .close,
+        # .refresh, etc.) returns a no-op via __getattr__. Also a
+        # no-op context manager.
+        def __init__(self, iterable: object = None, *_a: object, **_kw: object) -> None:
+            self._iterable = iterable
 
-    _tqdm.tqdm = _tqdm_passthrough
+        def __iter__(self) -> object:
+            return iter(self._iterable) if self._iterable is not None else iter(())
+
+        def __getattr__(self, _name: str) -> object:
+            return lambda *_a, **_kw: None
+
+        def __enter__(self) -> object:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+    _tqdm.tqdm = _NoopTqdm
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR),
     )
