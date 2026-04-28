@@ -1,4 +1,4 @@
-"""bts master CLI — see docs/cli.md for the operator-facing surface."""
+"""bts master CLI — see docs/CLI.md for the operator-facing surface."""
 
 # Subcommands: run, sweep, enrich, test, lint, typecheck, gate, notebook,
 # version. Verbosity flags `-v`, `-vv`, `-vvv` are accepted on every
@@ -56,7 +56,7 @@ def _build_parser() -> argparse.ArgumentParser:
     the top-level parser, so `bts -v run ...` is rejected and the only
     valid invocation shape is `bts <subcommand> -v ...`. This keeps the
     CLI surface unambiguous and matches the per-subcommand log-level
-    contract documented in `docs/cli.md`.
+    contract documented in `docs/CLI.md`.
 
     Each subcommand module exposes a `register(add_parser)` function
     that takes a closure capable of producing a fresh

@@ -72,6 +72,17 @@ The gates check shape, scope, format, ratchets, and named test suites. They do n
 
 This is collaboration. If the requirement is unclear, if the scope is ambiguous, if a gate's meaning is unobvious, if the fix would require touching something that wasn't asked for — stop and ask the operator. Proceeding through doubt is where harm accumulates.
 
+## Task completion
+
+Always work with codex on command line until codex approves your work. 
+
+Only use this command: `codex exec --skip-git-repo-check -c model_reasoning_effort=xhigh {content} 2>&1`
+
+Never use tail or other things that block codex output. Let it all be fully exposed to you. Do not save the context.
+
+If you made a commit, post the `hash`.
+If you made a PR, post the link.
+
 ## The Five Principles
 
 - no duck-taping or saga ornamentation

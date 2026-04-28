@@ -12,7 +12,7 @@ from typing import Final
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 BUDGET_JSON: Final[Path] = REPO_ROOT / '.github/module_budgets.json'
 LINT_WORKFLOW: Final[Path] = REPO_ROOT / '.github/workflows/pr_checks_lint.yml'
-SCRIPTS_DIR: Final[Path] = REPO_ROOT / 'scripts'
+SCRIPTS_DIR: Final[Path] = REPO_ROOT / 'tools'
 PYPROJECT: Final[Path] = REPO_ROOT / 'pyproject.toml'
 
 GATE_SCRIPTS: Final[list[str]] = [
@@ -51,7 +51,7 @@ def test_module_budgets_is_valid_json() -> None:
 def test_module_budgets_covers_every_m1_path_from_issue_10() -> None:
     data = json.loads(BUDGET_JSON.read_text(encoding='utf-8'))
     bts_paths = {p for p in data if p.startswith('backtest_simulator/')}
-    script_paths = {p for p in data if p.startswith('scripts/')}
+    script_paths = {p for p in data if p.startswith('tools/')}
     # M1+M2 as shipped: the package spans 39 files. The original
     # issue #10 plan assumed 30 (single launcher.py, single
     # runtime/*), but the Part 1 honesty rework split `launcher`,
@@ -64,7 +64,10 @@ def test_module_budgets_covers_every_m1_path_from_issue_10() -> None:
         f'extra={sorted(bts_paths - actual_paths)}, '
         f'missing={sorted(actual_paths - bts_paths)}'
     )
-    assert len(script_paths) == 8, f'expected 8 scripts paths, got {len(script_paths)}'
+    # 7 tools/check_*.py gate scripts (the scripts/ → tools/ merge
+    # dropped scripts/__init__.py; tools/ doesn't need an
+    # __init__.py because it isn't imported as a package).
+    assert len(script_paths) == 7, f'expected 7 tools/check_* paths, got {len(script_paths)}'
 
 
 def _actual_bts_paths() -> set[str]:
@@ -115,9 +118,9 @@ def test_fail_banners_are_declared_in_each_script_source() -> None:
 def test_workflow_invokes_every_gate() -> None:
     workflow = LINT_WORKFLOW.read_text(encoding='utf-8')
     for script in GATE_SCRIPTS:
-        assert f'scripts/{script}' in workflow, f'{script} not invoked by workflow'
+        assert f'tools/{script}' in workflow, f'{script} not invoked by workflow'
     assert 'vulture backtest_simulator/' in workflow
-    assert 'ruff check backtest_simulator tools tests scripts' in workflow
+    assert 'ruff check backtest_simulator tools tests' in workflow
 
 
 def test_no_soft_fail_pathway_in_workflow() -> None:
@@ -131,7 +134,7 @@ def test_no_soft_fail_pathway_in_workflow() -> None:
 def test_scripts_are_self_budgeted() -> None:
     data = json.loads(BUDGET_JSON.read_text(encoding='utf-8'))
     for name in GATE_SCRIPTS:
-        key = f'scripts/{name}'
+        key = f'tools/{name}'
         assert key in data, f'{key} missing from module_budgets.json'
         assert data[key] <= 120, f'{key} budget {data[key]} exceeds the 120-line self-limit'
 

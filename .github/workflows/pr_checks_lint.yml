@@ -66,19 +66,19 @@ jobs:
           uv pip install --python .venv-lint/bin/python '.[integration]'
 
       - name: Run ruff lint (bloat-mechanical rules active)
-        run: .venv-lint/bin/python -m ruff check backtest_simulator tools tests scripts
+        run: .venv-lint/bin/python -m ruff check backtest_simulator tools tests
 
       - name: Module line-count budget gate
-        run: .venv-lint/bin/python scripts/check_module_budgets.py
+        run: .venv-lint/bin/python tools/check_module_budgets.py
 
       - name: Module docstring gate
-        run: .venv-lint/bin/python scripts/check_module_docstrings.py
+        run: .venv-lint/bin/python tools/check_module_docstrings.py
 
       - name: File size balance gate
-        run: .venv-lint/bin/python scripts/check_file_size_balance.py
+        run: .venv-lint/bin/python tools/check_file_size_balance.py
 
       - name: Test/code SLOC ratio gate
-        run: .venv-lint/bin/python scripts/check_test_code_ratio.py
+        run: .venv-lint/bin/python tools/check_test_code_ratio.py
 
       - name: Dead-code (vulture)
         run: .venv-lint/bin/python -m vulture backtest_simulator/ --min-confidence 80
@@ -88,7 +88,7 @@ jobs:
         # that catches HonestyViolation or any subclass under
         # backtest_simulator/ or tests/. Honesty violations must reach
         # the test boundary; production code can never swallow them.
-        run: .venv-lint/bin/python scripts/check_no_swallowed_violations.py
+        run: .venv-lint/bin/python tools/check_no_swallowed_violations.py
 
       - name: Coverage floor gate
         # Hard-fail only: no soft-fail markers, no pipeline bypass. If
@@ -100,7 +100,7 @@ jobs:
           .venv-lint/bin/python -m coverage run --branch --source=backtest_simulator \
             -m pytest tests/ -q
           .venv-lint/bin/python -m coverage json -o coverage.json
-          .venv-lint/bin/python scripts/check_coverage_floor.py
+          .venv-lint/bin/python tools/check_coverage_floor.py
 
       - name: Budget-raise ratchet gate
         env:
@@ -109,6 +109,6 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
         run: |
           git fetch origin "$BASE_REF" --depth=1
-          .venv-lint/bin/python scripts/check_budget_ratchet.py \
+          .venv-lint/bin/python tools/check_budget_ratchet.py \
             --base-ref "origin/$BASE_REF" \
             --pr-number "$PR_NUMBER"

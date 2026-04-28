@@ -1,6 +1,6 @@
 """`bts gate <name>` — invoke a specific CI gate locally."""
 
-# Wraps the existing `scripts/check_*.py` and `tools/*_gate.py` scripts
+# Wraps the existing `tools/check_*.py` and `tools/*_gate.py` scripts
 # so the operator runs the same gate locally that CI runs at PR time.
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def _honesty_paths(repo_root: Path) -> list[str]:
 def _build_command(name: str, repo_root: Path) -> list[str]:
     if name == 'lint':
         return [sys.executable, '-m', 'ruff', 'check',
-                'backtest_simulator', 'tools', 'tests', 'scripts']
+                'backtest_simulator', 'tools', 'tests']
     if name == 'typing':
         # Mirror the pr_checks_typing workflow: pyright JSON output
         # piped into tools/typing_gate.py against the protected base-
@@ -74,12 +74,12 @@ _STATIC_GATE_COMMANDS: Final[dict[str, list[str]]] = {
     'slice': [sys.executable, 'tools/slice_gate.py'],
     'version': [sys.executable, 'tools/version_gate.py'],
     'ruleset': [sys.executable, 'tools/ruleset_gate.py'],
-    'module_budgets': [sys.executable, 'scripts/check_module_budgets.py'],
-    'docstrings': [sys.executable, 'scripts/check_module_docstrings.py'],
-    'file_size_balance': [sys.executable, 'scripts/check_file_size_balance.py'],
-    'test_code_ratio': [sys.executable, 'scripts/check_test_code_ratio.py'],
+    'module_budgets': [sys.executable, 'tools/check_module_budgets.py'],
+    'docstrings': [sys.executable, 'tools/check_module_docstrings.py'],
+    'file_size_balance': [sys.executable, 'tools/check_file_size_balance.py'],
+    'test_code_ratio': [sys.executable, 'tools/check_test_code_ratio.py'],
     'no_swallowed_violations': [
-        sys.executable, 'scripts/check_no_swallowed_violations.py',
+        sys.executable, 'tools/check_no_swallowed_violations.py',
     ],
 }
 

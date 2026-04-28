@@ -10,11 +10,11 @@ from pathlib import Path
 from typing import Final
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
-SCRIPTS_DIR: Final[Path] = REPO_ROOT / 'scripts'
+SCRIPTS_DIR: Final[Path] = REPO_ROOT / 'tools'
 
 
 def _clone_script_into(root: Path, name: str) -> Path:
-    dest_dir = root / 'scripts'
+    dest_dir = root / 'tools'
     dest_dir.mkdir(parents=True, exist_ok=True)
     (dest_dir / '__init__.py').write_text('', encoding='utf-8')
     dest = dest_dir / name
