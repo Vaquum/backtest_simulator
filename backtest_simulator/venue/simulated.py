@@ -1,7 +1,7 @@
 """SimulatedVenueAdapter — real Praxis VenueAdapter Protocol against historical trades."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -251,7 +251,7 @@ class SimulatedVenueAdapter:
                 self._slippage_n_excluded += 1
                 continue
             mid_value = preceding['price'].median()
-            if mid_value is None or mid_value <= 0:
+            if not isinstance(mid_value, (int, float)) or mid_value <= 0:
                 self._slippage_n_excluded += 1
                 continue
             mid = Decimal(str(mid_value))
@@ -280,7 +280,7 @@ class SimulatedVenueAdapter:
 
     def _aggregate_bps_when_active(
         self,
-        sample_filter: object = None,
+        sample_filter: Callable[[Decimal, NexusOrderSide], bool] | None = None,
     ) -> Decimal | None:
         """Mean of recorded bps under `sample_filter`; None when slippage is off."""
         if self._slippage_model is None:
