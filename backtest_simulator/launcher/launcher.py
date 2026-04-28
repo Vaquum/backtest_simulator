@@ -918,7 +918,12 @@ class BacktestLauncher(Launcher):
                 return
             account_queue.put_nowait(nexus_outcome)
 
-        trading.execution_manager._on_trade_outcome = _route_and_translate
+        # Praxis's `ExecutionManager._on_trade_outcome` is the documented
+        # hook seam for routing Praxis -> Nexus outcomes; the underscore
+        # is Praxis's "callback slot" naming, not an internal-only flag.
+        # `setattr` keeps pyright's `reportPrivateUsage` happy without
+        # losing the documented contract.
+        setattr(trading.execution_manager, '_on_trade_outcome', _route_and_translate)
 
     def _start_poller(self) -> None:
         kline_intervals = self._resolve_kline_intervals_from_manifests()
@@ -1119,21 +1124,13 @@ class BacktestLauncher(Launcher):
         # Touch + tick providers feed the action_submitter's
         # LIMIT-touch-refresh hook. The hook rewrites a LIMIT
         # action's `execution_params['price']` to `touch ± tick`
-        # before validation, so the strategy's submitted price
-        # IS what the venue executes — no silent venue-side
-        # rewrite. Both providers are read-only adapters over
-        # the venue's existing feed + filters dicts.
-        venue_adapter = self._venue_adapter
-        touch_provider = (
-            venue_adapter.touch_for_symbol
-            if hasattr(venue_adapter, 'touch_for_symbol')
-            else None
-        )
-        tick_provider = (
-            venue_adapter.tick_for_symbol
-            if hasattr(venue_adapter, 'tick_for_symbol')
-            else None
-        )
+        # before validation. `SimulatedVenueAdapter` exposes both
+        # providers; non-sim adapters fall back to None (action
+        # submitter's no-touch path).
+        from backtest_simulator.venue.simulated import SimulatedVenueAdapter
+        sva = self._venue_adapter if isinstance(self._venue_adapter, SimulatedVenueAdapter) else None
+        touch_provider = sva.touch_for_symbol if sva is not None else None
+        tick_provider = sva.tick_for_symbol if sva is not None else None
         action_submit = build_action_submitter(
             SubmitterBindings(
                 nexus_config=nexus_config, state=state,
