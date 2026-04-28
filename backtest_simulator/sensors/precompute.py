@@ -173,8 +173,18 @@ class SignalsTable:
         """Map t -> group_id (Lopez de Prado §11 CSCV) and check membership."""
         if self._frame.is_empty():
             return False
+        # `min()`/`max()` returns `Optional[PythonLiteral]`; narrow to
+        # datetime (the schema's `timestamp` dtype) so pyright reads
+        # the arithmetic below as datetime - datetime.
         first_ts = self._frame['timestamp'].min()
         last_ts = self._frame['timestamp'].max()
+        if not isinstance(first_ts, datetime) or not isinstance(last_ts, datetime):
+            msg = (
+                f'SignalsTable._t_in_allowed_groups: timestamp min/max '
+                f'returned non-datetime '
+                f'(first={type(first_ts).__name__}); schema corrupt.'
+            )
+            raise TypeError(msg)
         span_seconds = (last_ts - first_ts).total_seconds()
         if span_seconds <= 0:
             # Single-row table: every bar is in group 0.
@@ -299,6 +309,12 @@ class SignalsTable:
             raise LookAheadViolation(msg)
         first_ts = self._frame['timestamp'].min()
         last_ts = self._frame['timestamp'].max()
+        if not isinstance(first_ts, datetime) or not isinstance(last_ts, datetime):
+            msg = (
+                f'SignalsTable.assert_window_covers: timestamp min/max '
+                f'returned non-datetime for {self.decoder_id}.'
+            )
+            raise TypeError(msg)
         from datetime import timedelta
         max_staleness = timedelta(
             seconds=self.bar_seconds * self.label_horizon_bars,
