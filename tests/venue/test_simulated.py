@@ -43,7 +43,7 @@ class _EmptyFeed:
         del symbol, start, end
         return self._empty_frame()
 
-    def _get_trades_for_venue(
+    def get_trades_for_venue(
         self,
         symbol: str,
         start: datetime,
@@ -156,7 +156,7 @@ class _SyntheticImpactFeed:
             (pl.col('time') >= start) & (pl.col('time') < end),
         )
 
-    def _get_trades_for_venue(
+    def get_trades_for_venue(
         self, symbol: str, start: datetime, end: datetime,
         *, venue_lookahead_seconds: int,
     ) -> pl.DataFrame:

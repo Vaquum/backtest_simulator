@@ -14,7 +14,7 @@ class HistoricalFeed(Protocol):
     cheating strategy with a feed reference cannot pass `venue_lookahead_seconds`
     because the parameter is not on the Protocol and not on the
     strategy-side reader at all. Venue-only access goes through
-    `_get_trades_for_venue` on the implementation, which is
+    `get_trades_for_venue` on the implementation, which is
     deliberately not part of this Protocol.
     """
 
@@ -37,7 +37,7 @@ class HistoricalFeed(Protocol):
         Strict strategy-facing path: there is no venue carve-out kwarg
         and the implementation MUST raise `LookAheadViolation` if `end`
         is past the frozen clock. The simulated venue uses a separate
-        bounded-carve-out method (`_get_trades_for_venue`) that is not
+        bounded-carve-out method (`get_trades_for_venue`) that is not
         part of this Protocol — strategies cannot reach it through the
         public Protocol surface.
         """
@@ -50,14 +50,14 @@ class VenueFeed(HistoricalFeed, Protocol):
 
     The simulated venue adapter needs to peek up to its declared
     `trade_window_seconds` past `frozen_now()` to simulate a realistic
-    submit/fill window. That carve-out lives on `_get_trades_for_venue`,
+    submit/fill window. That carve-out lives on `get_trades_for_venue`,
     NOT on `HistoricalFeed`. Adapters type their feed parameter as
     `VenueFeed` so a strategy-only feed (one that satisfies only the
     `HistoricalFeed` Protocol) cannot accidentally be plugged in and
     crash on submit. Codex pinned this contract in slice #17 Task 6.
     """
 
-    def _get_trades_for_venue(
+    def get_trades_for_venue(
         self, symbol: str, start: datetime, end: datetime,
         *, venue_lookahead_seconds: int,
     ) -> pl.DataFrame:

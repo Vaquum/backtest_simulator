@@ -71,7 +71,7 @@ class _TapeFeed:
             (pl.col('time') >= start) & (pl.col('time') <= end),
         )
 
-    def _get_trades_for_venue(
+    def get_trades_for_venue(
         self, symbol: str, start: datetime, end: datetime,
         *, venue_lookahead_seconds: int,
     ) -> pl.DataFrame:
@@ -360,7 +360,7 @@ def test_slippage_uncalibrated_predict_separated_from_excluded_via_live_path() -
                 (pl.col('time') >= start) & (pl.col('time') <= end),
             )
 
-        def _get_trades_for_venue(
+        def get_trades_for_venue(
             self, symbol: str, start: datetime, end: datetime,
             *, venue_lookahead_seconds: int,
         ) -> pl.DataFrame:
@@ -522,7 +522,7 @@ def test_slippage_first_post_submit_fill_is_measured_not_excluded() -> None:
                 (pl.col('time') >= start) & (pl.col('time') <= end),
             )
 
-        def _get_trades_for_venue(
+        def get_trades_for_venue(
             self, symbol: str, start: datetime, end: datetime,
             *, venue_lookahead_seconds: int,
         ) -> pl.DataFrame:
@@ -611,7 +611,7 @@ def test_slippage_n_excluded_separates_no_mid_from_measured_zero() -> None:
                 (pl.col('time') >= start) & (pl.col('time') <= end),
             )
 
-        def _get_trades_for_venue(
+        def get_trades_for_venue(
             self, symbol: str, start: datetime, end: datetime,
             *, venue_lookahead_seconds: int,
         ) -> pl.DataFrame:

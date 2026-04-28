@@ -21,7 +21,7 @@ from backtest_simulator.cli import _run_window
 
 
 class _CapturingFeed:
-    """Feed stub that records every `_get_trades_for_venue` call.
+    """Feed stub that records every `get_trades_for_venue` call.
 
     Returns a deterministic 4-tick slice spanning `[t - window, t]`
     (note: INCLUDES `t`, so the post-`<` filter inside the provider
@@ -46,7 +46,7 @@ class _CapturingFeed:
             'price': [70_000.0, 70_050.0, 70_100.0, 70_500.0],
         }).with_columns(pl.col('time').cast(pl.Datetime('us', 'UTC')))
 
-    def _get_trades_for_venue(
+    def get_trades_for_venue(
         self, symbol: str, start: datetime, end: datetime,
         *, venue_lookahead_seconds: int,
     ) -> pl.DataFrame:
@@ -105,7 +105,7 @@ def test_atr_provider_filters_out_at_decision_tick(
     """Provider must filter `pl.col('time') < t` before computing ATR.
 
     The feed boundary `[t - window, t)` is half-open in INTENT,
-    but `_get_trades_for_venue`'s exact end-inclusive vs
+    but `get_trades_for_venue`'s exact end-inclusive vs
     end-exclusive semantics is venue-implementation-defined.
     The `pl.col('time') < t` filter inside the provider is the
     bts-side BACKSTOP that guarantees no tick AT or AFTER t

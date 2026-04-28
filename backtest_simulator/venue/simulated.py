@@ -153,7 +153,7 @@ class SimulatedVenueAdapter:
         """
         from datetime import timedelta
         now = self._now()
-        trades = self._feed._get_trades_for_venue(
+        trades = self._feed.get_trades_for_venue(
             symbol, now - timedelta(minutes=1), now,
             venue_lookahead_seconds=0,
         )
@@ -188,12 +188,14 @@ class SimulatedVenueAdapter:
             raise KeyError(msg)
         self._history[account_id] = self._accounts.pop(account_id)
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """No-op: the simulator owns no resources that need lifecycle close.
 
         Required by Praxis's `VenueAdapter` protocol — live adapters
         own a websocket and an HTTP client; the simulator's tape is
         a polars DataFrame held by the feed object, which closes itself.
+        Async to match the Protocol's coroutine signature; awaiting it
+        is a no-op.
         """
 
     def _record_slippage(
@@ -497,7 +499,7 @@ class SimulatedVenueAdapter:
             MarketImpactModel,
         )
         bucket = self._market_impact_bucket_minutes
-        raw = self._feed._get_trades_for_venue(
+        raw = self._feed.get_trades_for_venue(
             symbol, submit_time - timedelta(minutes=bucket),
             submit_time,
             venue_lookahead_seconds=0,
@@ -816,7 +818,7 @@ class SimulatedVenueAdapter:
         # The venue carve-out: peek up to `trade_window_seconds` past
         # `frozen_now()` to simulate a realistic submit→fill window.
         # The strategy-facing `get_trades` does not accept a kwarg for
-        # this — `_get_trades_for_venue` is the only path with the
+        # this — `get_trades_for_venue` is the only path with the
         # bounded peek. See `feed/protocol.py` for the rationale.
         #
         # When slippage measurement is active, extend the START of
@@ -857,7 +859,7 @@ class SimulatedVenueAdapter:
                     minutes=self._maker_fill_model.lookback_minutes,
                 ),
             )
-        trades = self._feed._get_trades_for_venue(
+        trades = self._feed.get_trades_for_venue(
             symbol, fetch_start,
             submit_time + _I.window_seconds(self._trade_window_seconds),
             venue_lookahead_seconds=self._trade_window_seconds,

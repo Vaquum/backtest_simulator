@@ -126,7 +126,7 @@ class ClickHouseFeed:
             symbol, start, end, venue_lookahead_seconds=0,
         )
 
-    def _get_trades_for_venue(
+    def get_trades_for_venue(
         self, symbol: str, start: datetime, end: datetime,
         *, venue_lookahead_seconds: int,
     ) -> pl.DataFrame:

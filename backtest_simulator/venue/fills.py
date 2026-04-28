@@ -197,7 +197,7 @@ def _walk_limit(
     model (tests, calls without explicit calibration).
 
     `trades_pre_submit` is the same-fetch pre-submit slice the venue
-    derives from the widened `_get_trades_for_venue` query. It
+    derives from the widened `get_trades_for_venue` query. It
     seeds the maker engine's initial queue position from
     `[submit_time - lookback_minutes, submit_time)`. None falls
     through to the model's stored calibration tape (best-case maker).

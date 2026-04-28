@@ -13,11 +13,12 @@ strategy:
   2. `HistoricalFeed.get_trades(symbol, start, end)` — must refuse
      `end > frozen_now()`. The strategy-facing Protocol has *no*
      `venue_lookahead_seconds` kwarg: the venue carve-out is on the
-     underscore-prefixed `_get_trades_for_venue` method which is not
-     part of `HistoricalFeed`. A cheating strategy with a
-     `HistoricalFeed`-typed reference cannot reach the carve-out;
-     reaching past the underscore (`feed._get_trades_for_venue(...)`)
-     is documented as a bypass and tested below.
+     `get_trades_for_venue` method which is on `VenueFeed` (extends
+     `HistoricalFeed`) but not on `HistoricalFeed`. A cheating
+     strategy with a `HistoricalFeed`-typed reference cannot reach
+     the carve-out; the venue-only name documents the contract and
+     a strategy that types its feed as `VenueFeed` to bypass it
+     is tested below.
   3. `SignalsTable.lookup(t)` — must refuse `t > frozen_now()`. This
      is the path closed in this slice; before Task 6 the lookup
      silently returned the latest pre-existing row at `<= t`, which
@@ -248,9 +249,9 @@ def test_prescient_via_feed_get_trades_has_no_venue_kwarg() -> None:
     `venue_lookahead_seconds=3600` and bypass the strict gate. The
     fix removes the kwarg from the `HistoricalFeed` Protocol and
     the implementation's strategy-facing `get_trades`. The bounded
-    venue carve-out lives on `_get_trades_for_venue` (underscore-
-    prefixed and not on the Protocol). This test pins the contract
-    via the Protocol's signature.
+    venue carve-out lives on `VenueFeed.get_trades_for_venue`
+    (a separate Protocol, not extended by `HistoricalFeed`). This
+    test pins the contract via the Protocol's signature.
     """
     import inspect
     sig = inspect.signature(HistoricalFeed.get_trades)

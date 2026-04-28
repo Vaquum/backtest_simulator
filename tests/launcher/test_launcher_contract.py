@@ -100,7 +100,7 @@ def test_launcher_rejects_both_event_spine_and_db_path() -> None:
         def get_trades(self, *_a: object, **_k: object) -> object:
             import polars as pl
             return pl.DataFrame()
-        def _get_trades_for_venue(self, *_a: object, **_k: object) -> object:
+        def get_trades_for_venue(self, *_a: object, **_k: object) -> object:
             import polars as pl
             return pl.DataFrame()
         def get_window(self, *_a: object, **_k: object) -> object:
@@ -110,7 +110,7 @@ def test_launcher_rejects_both_event_spine_and_db_path() -> None:
     adapter = SimulatedVenueAdapter(
         # `_StubFeed` duck-types VenueFeed — cast names the Protocol
         # boundary explicitly instead of suppressing the assignment
-        # mismatch. The adapter requires `_get_trades_for_venue` for
+        # mismatch. The adapter requires `get_trades_for_venue` for
         # the bounded fill-window peek; a strategy-only `HistoricalFeed`
         # stub would satisfy the wider Protocol but crash on submit,
         # so the stub here implements both methods.
@@ -150,7 +150,7 @@ def _atr_test_launcher(tmp_path: Path) -> BacktestLauncher:
         def get_trades(self, *_a: object, **_k: object) -> object:
             import polars as pl
             return pl.DataFrame()
-        def _get_trades_for_venue(self, *_a: object, **_k: object) -> object:
+        def get_trades_for_venue(self, *_a: object, **_k: object) -> object:
             import polars as pl
             return pl.DataFrame()
         def get_window(self, *_a: object, **_k: object) -> object:

@@ -490,7 +490,7 @@ def _build_atr_gate_and_provider(
 
     def atr_provider(symbol: str, t: datetime) -> Decimal | None:
         from datetime import timedelta
-        raw = feed._get_trades_for_venue(
+        raw = feed.get_trades_for_venue(
             symbol, t - timedelta(seconds=window_seconds), t,
             venue_lookahead_seconds=0,
         )
