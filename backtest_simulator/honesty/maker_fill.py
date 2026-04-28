@@ -29,6 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
+from typing import cast
 
 import polars as pl
 
@@ -198,7 +199,7 @@ class MakerFillModel:
         #     SELL maker fills if trade_price >= limit.
         trade_price = Decimal(str(row['price']))
         trade_qty = Decimal(str(row['quantity']))
-        trade_aggressor = int(row['is_buyer_maker'])
+        trade_aggressor = int(str(row['is_buyer_maker']))
         side_matches = trade_aggressor == aggressor_flag
         price_matches = (
             (order_side == 'BUY' and trade_price <= limit)
@@ -217,7 +218,7 @@ class MakerFillModel:
             queue,
             remaining - fill_qty,
             ImmediateFill(
-                fill_time=row['datetime'],
+                fill_time=cast('datetime', row['datetime']),
                 fill_price=limit,
                 fill_qty=fill_qty,
             ),

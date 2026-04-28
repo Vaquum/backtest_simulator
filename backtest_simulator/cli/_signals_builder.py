@@ -139,7 +139,7 @@ def build_signals_table_for_decoder(
             'kline_size — that is the cadence the launcher uses.'
         )
         raise ValueError(msg)
-    bar_seconds = int(cfg.params['kline_size'])
+    bar_seconds = int(str(cfg.params['kline_size']))
     split_config = (
         int(manifest.split_config[0]),
         int(manifest.split_config[1]),
