@@ -264,6 +264,67 @@ def test_prescient_via_feed_get_trades_has_no_venue_kwarg() -> None:
     )
 
 
+def _scan_for_venue_feed_import(path: Path, repo: Path) -> list[str]:
+    """Return one entry per VenueFeed-import leak found in `path`.
+
+    AST scan — catches `from backtest_simulator.feed.protocol import
+    VenueFeed` (direct), aliased forms (`as Alias`), and the bare
+    `import backtest_simulator.feed.protocol` form (which lets the
+    caller reach VenueFeed via attribute access).
+    """
+    import ast
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    leaks: list[str] = []
+    rel = path.relative_to(repo)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.module == 'backtest_simulator.feed.protocol':
+                for alias in node.names:
+                    if alias.name == 'VenueFeed':
+                        leaks.append(f'{rel}: from {node.module} import VenueFeed')
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == 'backtest_simulator.feed.protocol':
+                    leaks.append(f'{rel}: import {alias.name}')
+    return leaks
+
+
+def test_no_strategy_module_imports_venue_feed() -> None:
+    """Strategy modules MUST NOT import `VenueFeed`.
+
+    Codex post-auditor-4 P1: when `_get_trades_for_venue` was
+    renamed to `get_trades_for_venue` (no underscore) and stayed
+    on the `VenueFeed` Protocol, a cheating strategy could
+    `from backtest_simulator.feed.protocol import VenueFeed` then
+    `cast(VenueFeed, self._feed).get_trades_for_venue(...,
+    venue_lookahead_seconds=3600)` and bypass the strict gate.
+    The honesty signal — "this Protocol is adapter-only" — is
+    preserved at the import-graph level: this test fails if any
+    strategy template / strategy module imports the carve-out
+    Protocol.
+
+    Strategies legitimately type their feed as `HistoricalFeed`
+    (the strategy-facing surface, no carve-out kwarg). A strategy
+    that needs to import `VenueFeed` is — by construction — not a
+    strategy. The static check at this level catches the import
+    before the cheating call site can be written.
+    """
+    repo = Path(__file__).resolve().parents[2]
+    strategy_dirs = (
+        repo / 'backtest_simulator' / 'strategies',
+        repo / 'backtest_simulator' / 'pipeline' / '_strategy_templates',
+    )
+    leaks: list[str] = []
+    for d in strategy_dirs:
+        for path in d.rglob('*.py'):
+            leaks.extend(_scan_for_venue_feed_import(path, repo))
+    assert leaks == [], (
+        'Strategy modules must not import VenueFeed (the venue-only '
+        'carve-out Protocol). The following modules leak the import:\n'
+        + '\n'.join(f'  - {leak}' for leak in leaks)
+    )
+
+
 def test_prescient_via_feed_get_window_returns_only_causal_rows() -> None:
     """`feed.get_window` walks backward from now; cannot reach future bars.
 
