@@ -28,13 +28,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from datetime import time as dtime
 from decimal import Decimal
-from typing import TYPE_CHECKING
-
 import polars as pl
 from scipy.stats import kurtosis, skew
-
-if TYPE_CHECKING:
-    from backtest_simulator.sensors.precompute import SignalsTable
 
 from backtest_simulator.cli._metrics import (
     STARTING_CAPITAL,
@@ -47,27 +42,28 @@ from backtest_simulator.honesty.deflated_sharpe import (
     DeflatedSharpeResult,
     deflated_sharpe,
 )
-from backtest_simulator.honesty.pbo import (
-    PboResult,
-    probability_of_backtest_overfitting,
-)
 from backtest_simulator.honesty.spa import SpaResult, spa_test
 
 
 @dataclass(frozen=True)
 class SweepStats:
-    """Aggregated DSR + PBO + SPA results for a finished sweep.
+    """Aggregated DSR + SPA results for a finished sweep.
 
-    Any of the three may be `None` when the input is too small
-    for the underlying primitive to run honestly (e.g. fewer than
-    2 decoders for PBO/SPA, fewer than 2 days for DSR). Each
-    result carries the primitive's own dataclass; the `bts sweep`
+    Either may be `None` when the input is too small for the
+    underlying primitive to run honestly (e.g. fewer than 2
+    decoders for SPA, fewer than 2 days for DSR). Each result
+    carries the primitive's own dataclass; the `bts sweep`
     summary printer reads them directly.
+
+    Auditor: legacy half-split PBO (`_safe_pbo`) was removed —
+    `sweep cpcv_pbo` is the honest replacement (driven directly
+    by `cpcv_pbo` in this file). Carrying a `pbo` field that
+    nothing prints would maintain a parallel BTS-only statistic
+    against the bts-only-no-ornamentation rule.
     """
 
     dsr: DeflatedSharpeResult | None
     spa: SpaResult | None
-    pbo: PboResult | None
     best_decoder: str | None
     best_sharpe: float | None
     n_decoders: int
@@ -141,10 +137,10 @@ def compute_sweep_stats(
     """
     n_decoders = len(per_decoder_returns)
     if n_decoders == 0:
-        return SweepStats(None, None, None, None, None, 0, 0)
+        return SweepStats(None, None, None, None, 0, 0)
     n_obs = min((len(rs) for rs in per_decoder_returns.values()), default=0)
     if n_obs < 2:
-        return SweepStats(None, None, None, None, None, n_decoders, n_obs)
+        return SweepStats(None, None, None, None, n_decoders, n_obs)
     n_trials = n_search_trials if n_search_trials is not None else n_decoders
     sharpes = {d: _sharpe(rs) for d, rs in per_decoder_returns.items()}
     best_decoder, best_sharpe = max(sharpes.items(), key=lambda kv: kv[1])
@@ -154,9 +150,11 @@ def compute_sweep_stats(
     spa = _safe_spa(
         per_decoder_returns, benchmark_returns, seed, spa_n_bootstrap,
     )
-    pbo = _safe_pbo(per_decoder_returns, n_obs)
+    # Auditor: legacy half-split PBO removed — `sweep cpcv_pbo`
+    # is the honest replacement. Computing `_safe_pbo` here when
+    # nothing reads its result was BTS-only ornamentation.
     return SweepStats(
-        dsr=dsr, spa=spa, pbo=pbo,
+        dsr=dsr, spa=spa,
         best_decoder=best_decoder, best_sharpe=best_sharpe,
         n_decoders=n_decoders, n_observations=n_obs,
     )
@@ -222,16 +220,18 @@ def _safe_spa(
 
 @dataclass(frozen=True)
 class CpcvPboResult:
-    """Bar-level CSCV PBO via `CpcvPaths` + `SignalsTable.lookup`.
+    """Day-level CSCV PBO via `CpcvPaths` + deployed-strategy returns.
 
-    Slice #17 Task 17 CPCV (auditor round-7 fix). Per path, per
-    decoder, walk the runtime tick_timestamps and call
-    `signals.lookup(t, allowed_groups=path.test_groups, ...)` to
-    get OOS preds + same with `allowed_groups=path.train_groups`
-    for IS preds. Multiply pred * bar_return (close-to-next-close)
-    to get strategy returns; compute Sharpe per partition. PBO =
-    fraction of paths where the IS-best decoder underperformed
-    median OOS (López de Prado §11 logit aggregation).
+    Auditor (post-v2.0.1): the previous bar-level implementation
+    ranked decoders on `pred * close_to_next_close_return` —
+    a SIGNAL-RETURN PROXY that ignored stops, maker-fill, pending-
+    order state, realized slippage / impact, and trailing-
+    inventory exclusions. Rewired to consume `per_decoder_returns`
+    directly: the same `daily_return_for_run` output `bts sweep`
+    feeds into DSR/SPA, which IS net PnL / starting capital from
+    the actual closed BUY→SELL pairs of the deployed
+    long_on_signal strategy. Now the PBO surface ranks the
+    DEPLOYED path, not a proxy.
 
     `pbo` is the overfitting proportion. `n_paths` counts paths
     that produced a logit (post per-path tie skip).
@@ -250,68 +250,60 @@ class CpcvPboResult:
 def cpcv_pbo(
     *,
     paths: CpcvPaths,
-    signals_per_decoder: dict[str, SignalsTable],
-    tick_timestamps: list[datetime],
-    klines: pl.DataFrame,
+    per_decoder_returns: dict[str, list[float]],
+    days: list[datetime],
 ) -> CpcvPboResult | None:
-    """Bar-level CSCV PBO using SignalsTable.lookup for path filtering.
+    """Day-level CSCV PBO using deployed-strategy daily returns.
 
     Args:
-        paths: CpcvPaths.build output. Each path's test_groups +
-            train_groups are passed as `allowed_groups` to
-            `SignalsTable.lookup` to filter the per-bar predictions
-            into IS / OOS subsets at lookup time.
-        signals_per_decoder: per-decoder SignalsTables built from
-            per-tick runtime replay (Nexus's exact recipe). The
-            lookup IS the path filter — auditor round-7 fix
-            making both SignalsTable and CpcvPaths load-bearing.
-        tick_timestamps: the runtime tick instants the strategy
-            sees a signal at (epoch-aligned interval boundaries
-            within the operator's replay window). Same list the
-            sweep used for SignalsTable build.
-        klines: pre-fetched klines (BacktestMarketDataPoller's
-            source) used to compute per-bar close-to-next-close
-            returns. The strategy return at tick `t` is
-            `pred(t) * bar_return(t)` — long-flat semantics
-            mirroring `long_on_signal.py`.
+        paths: CpcvPaths.build output. Group indices map to
+            contiguous DAY blocks (not bars) — e.g. with
+            n_groups=4 and 12 days, group 0 covers days 0-2,
+            group 1 covers 3-5, etc. Each path's train_groups +
+            test_groups define which days are IS vs OOS.
+        per_decoder_returns: deployed-strategy daily returns from
+            `daily_return_for_run` — net PnL / starting_capital,
+            already excluding runs with trailing inventory.
+            Length is the count of "clean" days (those where
+            EVERY decoder produced a closed-pair return).
+        days: the clean-day timestamps in time order, parallel
+            to each `per_decoder_returns[d]` list.
+
+    PBO = fraction of paths where the IS-best decoder underperforms
+    the median OOS Sharpe (López de Prado §11 logit aggregation).
 
     Returns None when:
       - <2 decoders or no paths,
-      - all decoder predictions are byte-equal (degenerate),
-      - every path's IS or OOS subset is < 2 bars,
+      - fewer days than n_groups (can't partition contiguously),
+      - all per-decoder series byte-equal (degenerate),
+      - every path's IS or OOS subset is < 2 days,
       - per-path top-2 IS Sharpes tie (no unique best-IS) for
         every path.
     """
-    n_decoders = len(signals_per_decoder)
-    if n_decoders < 2 or len(paths) == 0 or not tick_timestamps:
+    n_decoders = len(per_decoder_returns)
+    if n_decoders < 2 or len(paths) == 0 or not days:
         return None
-    decoder_ids = list(signals_per_decoder.keys())
-    # Derive n_groups from path partitions (CpcvPaths.build already
-    # validates 2 <= n_test_groups < n_groups).
+    decoder_ids = list(per_decoder_returns.keys())
+    n_days = len(days)
     n_groups = max(
         max(p.train_groups + p.test_groups) for p in paths
     ) + 1
-    if n_groups < 2:
+    if n_groups < 2 or n_days < n_groups:
         return None
-    # Per-bar returns from klines: (close[next] - close[this]) /
-    # close[this]. Build a tick → bar_return dict for fast lookup.
-    bar_returns = _bar_returns_at_ticks(klines, tick_timestamps)
-    if not bar_returns:
-        return None
-    # Pairwise-identical guard. Look at the predictions across all
-    # ticks for each decoder; if all decoders produce identical
-    # pred sequences, the rank logic below would fabricate a
-    # zero-PBO via deterministic max().
-    pred_sequences: dict[str, tuple[int, ...]] = {}
-    for did, signals in signals_per_decoder.items():
-        seq: list[int] = []
-        for t in tick_timestamps:
-            row = signals.lookup(t)
-            seq.append(int(row.pred) if row is not None else 0)
-        pred_sequences[did] = tuple(seq)
-    sequences = list(pred_sequences.values())
+    # Pairwise-identical guard: if every decoder produced the
+    # SAME deployed-strategy returns across all clean days, max()
+    # below would deterministically pick the first key and
+    # fabricate a zero-PBO. Skip cleanly.
+    sequences = [tuple(per_decoder_returns[d]) for d in decoder_ids]
     if all(s == sequences[0] for s in sequences[1:]):
         return None
+    # Map day_index -> group_index. Contiguous blocks: day i goes
+    # to floor(i * n_groups / n_days). Equivalent to dividing the
+    # n_days into n_groups roughly-equal chunks.
+    group_of_day = [
+        min(i * n_groups // n_days, n_groups - 1)
+        for i in range(n_days)
+    ]
     first_path = paths.paths()[0]
     purge_seconds = first_path.purge_seconds
     embargo_seconds = first_path.embargo_seconds
@@ -319,42 +311,33 @@ def cpcv_pbo(
     logits: list[float] = []
     n_paths_skipped = 0
     for path in paths:
-        is_sharpes: dict[str, float] = {}
-        oos_sharpes: dict[str, float] = {}
-        too_thin = False
-        for did, signals in signals_per_decoder.items():
-            is_returns: list[float] = []
-            oos_returns: list[float] = []
-            for t in tick_timestamps:
-                bret = bar_returns.get(t)
-                if bret is None:
-                    continue
-                is_row = signals.lookup(
-                    t,
-                    allowed_groups=path.train_groups,
-                    n_groups=n_groups,
-                    purge_seconds=purge_seconds,
-                    embargo_seconds=embargo_seconds,
-                )
-                if is_row is not None:
-                    is_returns.append(int(is_row.pred) * bret)
-                oos_row = signals.lookup(
-                    t,
-                    allowed_groups=path.test_groups,
-                    n_groups=n_groups,
-                    purge_seconds=purge_seconds,
-                    embargo_seconds=embargo_seconds,
-                )
-                if oos_row is not None:
-                    oos_returns.append(int(oos_row.pred) * bret)
-            if len(is_returns) < 2 or len(oos_returns) < 2:
-                too_thin = True
-                break
-            is_sharpes[did] = _sharpe(is_returns)
-            oos_sharpes[did] = _sharpe(oos_returns)
-        if too_thin:
+        is_idx = [
+            i for i in range(n_days)
+            if group_of_day[i] in path.train_groups
+        ]
+        oos_idx = [
+            i for i in range(n_days)
+            if group_of_day[i] in path.test_groups
+        ]
+        # Purge: drop train days within `purge_seconds` of any
+        # test-group boundary (both sides). Embargo: drop train
+        # days that come AFTER each test block within
+        # `embargo_seconds` (López de Prado direction).
+        if purge_seconds > 0 or embargo_seconds > 0:
+            is_idx = _apply_purge_embargo(
+                is_idx, oos_idx, days,
+                purge_seconds=purge_seconds,
+                embargo_seconds=embargo_seconds,
+            )
+        if len(is_idx) < 2 or len(oos_idx) < 2:
             n_paths_skipped += 1
             continue
+        is_sharpes: dict[str, float] = {}
+        oos_sharpes: dict[str, float] = {}
+        for did in decoder_ids:
+            series = per_decoder_returns[did]
+            is_sharpes[did] = _sharpe([series[i] for i in is_idx])
+            oos_sharpes[did] = _sharpe([series[i] for i in oos_idx])
         # Per-path tie skip: top-2 IS Sharpes equal -> no unique
         # best-IS, max() deterministic ordering would fabricate.
         is_values_sorted = sorted(is_sharpes.values(), reverse=True)
@@ -387,77 +370,38 @@ def cpcv_pbo(
     )
 
 
-def _bar_returns_at_ticks(
-    klines: pl.DataFrame, tick_timestamps: list[datetime],
-) -> dict[datetime, float]:
-    """Per-tick close-to-next-close return, keyed by tick timestamp.
+def _apply_purge_embargo(
+    is_idx: list[int], oos_idx: list[int],
+    days: list[datetime],
+    *, purge_seconds: int, embargo_seconds: int,
+) -> list[int]:
+    """Drop is_idx days too close to oos_idx days (purge + embargo).
 
-    For each tick t, finds the latest kline at or before t and the
-    next kline. `bar_return(t) = (next.close - tick.close) /
-    tick.close`. Ticks for which either side is missing (last
-    kline, or tick falls outside klines coverage) are omitted —
-    the caller treats them as "no bar data here".
+    Purge: |t_train - t_test| <= purge_seconds for ANY test day
+        -> drop the train day (both directions).
+    Embargo: 0 < (t_train - t_test) <= embargo_seconds for ANY
+        test day -> drop the train day (test FIRST, train AFTER).
+
+    Operator-side defaults are typically 0 / 0; the implementation
+    falls through unchanged when both are zero.
     """
-    if klines.is_empty() or 'datetime' not in klines.columns:
-        return {}
-    sorted_klines = klines.sort('datetime')
-    timestamps = sorted_klines['datetime'].to_list()
-    closes = sorted_klines['close'].to_list()
-    out: dict[datetime, float] = {}
-    for t in tick_timestamps:
-        # Find the LATEST kline with datetime <= t
-        idx_at_or_before = -1
-        for i, kt in enumerate(timestamps):
-            if kt <= t:
-                idx_at_or_before = i
-            else:
+    if purge_seconds == 0 and embargo_seconds == 0:
+        return is_idx
+    out: list[int] = []
+    for i in is_idx:
+        t_i = days[i]
+        keep = True
+        for j in oos_idx:
+            t_j = days[j]
+            delta = (t_i - t_j).total_seconds()
+            if abs(delta) <= purge_seconds:
+                keep = False
                 break
-        if idx_at_or_before < 0 or idx_at_or_before >= len(timestamps) - 1:
-            continue
-        this_close = float(closes[idx_at_or_before])
-        next_close = float(closes[idx_at_or_before + 1])
-        if this_close <= 0:
-            continue
-        out[t] = (next_close - this_close) / this_close
+            if 0 < delta <= embargo_seconds:
+                keep = False
+                break
+        if keep:
+            out.append(i)
     return out
 
 
-def _safe_pbo(
-    per_decoder_returns: dict[str, list[float]], n_obs: int,
-) -> PboResult | None:
-    """PBO across decoders with first-half/second-half IS/OOS split.
-
-    Skipped when fewer than 2 decoders, fewer than 4 observations
-    (n_groups=2 needs 2 IS + 2 OOS), or when all decoder return
-    series are pairwise identical (codex round 1 P1: ties yield
-    deterministic primitive ordering, so all-zero sweeps report
-    `pbo=0.0` — falsely "no overfitting signal" — instead of
-    skipping). The minimum non-trivial sweep is 2 decoders by 4
-    days with at least one decoder differing.
-    """
-    n_decoders = len(per_decoder_returns)
-    if n_decoders < 2:
-        return None
-    if n_obs < 4:
-        return None
-    series = list(per_decoder_returns.values())
-    if all(s == series[0] for s in series[1:]):
-        # Degenerate: all candidates are the same return series →
-        # combinatorial-symmetric ranking is deterministic and
-        # uninformative.
-        return None
-    half = n_obs // 2
-    n_groups = min(half, 4)
-    if n_groups % 2 == 1:
-        n_groups -= 1
-    if n_groups < 2:
-        return None
-    is_data = pl.DataFrame({
-        d: rs[:half] for d, rs in per_decoder_returns.items()
-    })
-    oos_data = pl.DataFrame({
-        d: rs[half:half * 2] for d, rs in per_decoder_returns.items()
-    })
-    return probability_of_backtest_overfitting(
-        in_sample_pnl=is_data, out_of_sample_pnl=oos_data, n_groups=n_groups,
-    )

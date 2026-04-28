@@ -1,3 +1,37 @@
+# v2.0.2
+
+Auditor batch (post-v2.0.1) — 1 P0 + 4 P1 + 2 P2.
+
+## P0 — `bts run --decoder-id` could train wrong-size experiment
+
+`commands/run.py:_resolve_decoder` passed `args.n_decoders` (default 1) as the `n_permutations` argument to `ensure_trained_from_exp_code`, so `bts run --decoder-id 7` without `--experiment-dir` would train 1 permutation and fail with "id 7 not found". New `--n-permutations` CLI arg (default 30, parallel with `bts sweep`) makes the operator's request internally coherent: `--decoder-id N` against `--n-permutations M` is satisfiable iff `N < M`. Both code paths (explicit `--decoder-id` AND the `pick_decoders` fallback) now thread `args.n_permutations` correctly.
+
+## P1 — Legacy half-split PBO deleted (was dead code)
+
+`compute_sweep_stats` was still computing `_safe_pbo` (legacy first-half / second-half PBO) into `SweepStats.pbo`, but the sweep summary no longer printed it (replaced by `sweep cpcv_pbo`). Per "bts or it didn't happen", removed the field, the `_safe_pbo` function (~40 lines), the `PboResult` import, and 2 obsolete tests. `SweepStats` now carries only `dsr`/`spa`/`best_decoder`/`best_sharpe`/`n_decoders`/`n_observations`.
+
+## P1 — `sweep cpcv_pbo` now ranks DEPLOYED strategy returns, not a proxy
+
+The auditor round-7 implementation ranked decoders on `pred * close_to_next_close_return` — a signal-return proxy that ignored stops, maker-fill behavior, pending-order state, realized slippage/impact, and trailing-inventory exclusions that the real sweep path models. Rewired to consume `per_decoder_returns` directly (the same `daily_return_for_run` output `bts sweep` feeds into DSR/SPA — net PnL / starting capital from the actual closed BUY→SELL pairs of the deployed `long_on_signal` strategy). New CPCV signature: day-level partitioning of `clean_days` into `n_groups` contiguous blocks; per path, IS = `train_groups` days, OOS = `test_groups` days; per-day purge + embargo via `_apply_purge_embargo`. PBO unchanged (López de Prado §11 logit aggregation). 5 cpcv tests rewritten to use synthetic per-decoder daily returns.
+
+## P1 — ATR floor (`atr_k`, `atr_window_seconds`) surfaced in run/sweep artifact
+
+The subprocess payload carried `atr_k` + `atr_window_seconds` but `_run_window`'s result dict did not echo them back. Now `'atr_k'` + `'atr_window_seconds'` flow through the result and into both: (a) `bts run --output-format json` (alongside `n_atr_rejected`/`n_atr_uncalibrated`), and (b) the `sweep atr` summary line, which now ALWAYS prints (was: only on rejection activity) so two sweeps with different floors are visually comparable. `--atr-k 0` is annotated `(gate disabled)` to distinguish "0 rejections with gate ON" from "0 rejections with gate OFF".
+
+## P1 — Strict-causal ATR provider seam pinned by mutation-proof tests
+
+New `tests/cli/test_run_window_atr_provider.py`. Two tests:
+- `test_atr_provider_fetches_strict_causal_window`: a `_CapturingFeed` records the kwargs of every `_get_trades_for_venue` call. Asserts the provider fetches `[t - window_seconds, t)` with `venue_lookahead_seconds=0`. Mutation: changing the start to `t - 2*window` or dropping `venue_lookahead_seconds=0` flips assertions.
+- `test_atr_provider_filters_out_at_decision_tick`: feed returns 4 ticks (one AT `t`); patches `compute_atr_from_tape` to capture `trades_pre_decision`; asserts the at-decision tick was filtered out. Mutation: changing `pl.col('time') < t` to `<= t` makes 4 rows reach the ATR fn instead of 3.
+
+## P2 — ATR CLI help text now describes Wilder true-range (was mean-of-1-min-ranges)
+
+`bts run --atr-window-seconds` help text described the pre-fix formula. Updated to reflect the actual implementation: per-1-min bucket TR = max(H-L, |H-prev_C|, |L-prev_C|), averaged across buckets.
+
+## P2 — `sweep signals` line now diagnostic, not just reassuring
+
+The summary printed only `avg/min/max bars`. Since `tick_timestamps` is known up front (the PredictLoop fires at every interval boundary), now also prints `expected_bars=N` + `coverage=X% (min=A% max=B%)`. Operator sees how much of the planned replay actually produced predictions; warmup/causal-gap skips become visible.
+
 # v2.0.1
 
 - **Auditor-found P0 fix**: `ensure_trained_from_exp_code` cache-hit path was too permissive. The round-7 v2.0.0 code returned on `(cache_dir / 'results.csv').is_file()` alone, so a stale `cache_dir` from an earlier buggy build (one whose `metadata['sfd_module']` is the bare operator stem rather than `_bts_op_<sha16>`) would silently re-serve broken semantics — drifting bts back onto old non-reimportable manifests with no loud signal. The per-decoder retrain path (`train_single_decoder`) already validated metadata + snapshot existence under a per-sub_dir `fcntl.LOCK_EX`; the fresh-cache path lacked parity.

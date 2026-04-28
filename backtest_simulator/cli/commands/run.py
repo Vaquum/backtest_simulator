@@ -68,6 +68,23 @@ def register(sub: argparse._SubParsersAction) -> None:
                    help='Permutation id to use; default picks #1 from filter.')
     p.add_argument('--n-decoders', type=int, default=1,
                    help='When --decoder-id is omitted, pick top-N (default 1).')
+    # Auditor P0: `bts run --decoder-id N` without --experiment-dir
+    # must train ENOUGH permutations to make the request satisfiable.
+    # The prior code passed `args.n_decoders` (default 1) as the
+    # n_permutations argument, so `bts run --decoder-id 7` without
+    # --experiment-dir would train 1 permutation and fail with "id 7
+    # not found". Make `--n-permutations` explicit so the operator
+    # supplies the exact Limen model size every time. Default
+    # matches `bts sweep`'s 30 for consistency. Ignored when
+    # --experiment-dir is supplied (the operator points at a
+    # pre-existing one).
+    p.add_argument('--n-permutations', type=int, default=30,
+                   help=(
+                       'Number of UEL permutations to train when '
+                       'auto-training the experiment dir. Ignored '
+                       'when --experiment-dir is supplied. Default '
+                       'matches bts sweep (30).'
+                   ))
     p.add_argument('--experiment-dir', type=Path, default=None,
                    help='Override experiment dir (default: package cache).')
     p.add_argument('--input-from-file', type=str, default=None,
@@ -101,8 +118,11 @@ def register(sub: argparse._SubParsersAction) -> None:
                    ))
     p.add_argument('--atr-window-seconds', type=int, default=900,
                    help=(
-                       'ATR window in seconds (mean of per-1-min '
-                       'ranges). Default: 900s (14-period ATR).'
+                       'ATR window in seconds. Wilder true-range ATR: '
+                       'per-1-min bucket TR = max(H-L, |H-prev_C|, '
+                       '|L-prev_C|), then averaged across buckets. '
+                       'Default: 900s (15 buckets, classic 14-period '
+                       'ATR shape).'
                    ))
     # Slice #17 Task 18 — ledger-parity gate. The bts side dumps
     # event_spine.jsonl on every run regardless. With
@@ -245,6 +265,11 @@ def _run(args: argparse.Namespace) -> int:
                 'market_impact_n_rejected', 0,
             ),
             # ATR R-denominator gameability gate (slice #17 Task 29).
+            # Auditor: surface the FLOOR (k + window) alongside the
+            # counts so the JSON artifact is self-describing for
+            # later cross-run comparison.
+            'atr_k': result.get('atr_k', '0.5'),
+            'atr_window_seconds': result.get('atr_window_seconds', 900),
             'n_atr_rejected': result.get('n_atr_rejected', 0),
             'n_atr_uncalibrated': result.get('n_atr_uncalibrated', 0),
             # Slice #17 Task 18 ledger parity. The bts spine is
@@ -383,12 +408,19 @@ def _resolve_decoder(args: argparse.Namespace) -> tuple[int, Decimal, Path, int]
     if args.decoder_id is not None:
         # Explicit decoder by id — use the experiment_dir produced
         # by the operator's exp-code file (or args.experiment_dir
-        # if they want to point at a pre-existing one).
+        # if they want to point at a pre-existing one). Auditor P0:
+        # the auto-train path uses `args.n_permutations` (the
+        # Limen model size), NOT `args.n_decoders` (the pick-pool
+        # size). Asking for `--decoder-id 7` against a 1-permutation
+        # cache raises an "id not found" loud error from
+        # `_kelly_for_decoder`; ensuring the cache holds at least
+        # `n_permutations` rows means decoder ids in [0, n) are
+        # satisfiable.
         if args.experiment_dir is not None:
             exp_dir = args.experiment_dir
         else:
             exp_dir = ensure_trained_from_exp_code(
-                exp_code_path, args.n_decoders,
+                exp_code_path, args.n_permutations,
             )
         return (
             args.decoder_id,
@@ -398,7 +430,7 @@ def _resolve_decoder(args: argparse.Namespace) -> tuple[int, Decimal, Path, int]
     picks, _ = pick_decoders(
         args.n_decoders,
         exp_code_path=exp_code_path,
-        n_permutations=args.n_decoders,
+        n_permutations=args.n_permutations,
         input_from_file=args.input_from_file,
     )
     perm_id, kelly, exp_dir, display_id = picks[0]

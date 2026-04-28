@@ -292,6 +292,14 @@ def run_window_in_process(
         # `n_atr_uncalibrated` counts denials where the ATR
         # provider returned None (empty pre-decision tape) —
         # the operator's "warmup" signal.
+        # Auditor: surface the floor that PRODUCED these counts
+        # so two sweeps with different `--atr-k` /
+        # `--atr-window-seconds` don't show different rejection
+        # counts without showing what threshold each one used.
+        # The bts artifact must be self-describing for later
+        # comparison.
+        'atr_k': str(atr_k),
+        'atr_window_seconds': int(atr_window_seconds),
         'n_atr_rejected': launcher.n_atr_rejected,
         'n_atr_uncalibrated': launcher.n_atr_uncalibrated,
         'event_spine_jsonl': str(spine_jsonl),

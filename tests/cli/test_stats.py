@@ -1,10 +1,11 @@
 """`bts sweep` post-sweep stats — slice #17 Task 17 wiring tests.
 
 Pins the contract that `compute_sweep_stats` produces a
-`SweepStats` whose DSR / SPA / PBO fields are exercised on a
-3-decoder × 8-day synthetic sweep. Mutation-proof: switching the
-helper's IS/OOS slicing or wiring the wrong decoder's returns
-flips the assertions.
+`SweepStats` whose DSR / SPA fields are exercised on a synthetic
+sweep, and that `cpcv_pbo` consumes deployed-strategy daily
+returns directly (auditor post-v2.0.1 fix). Mutation-proof:
+switching the helper's IS/OOS slicing or wiring the wrong
+decoder's returns flips the assertions.
 """
 from __future__ import annotations
 
@@ -12,18 +13,11 @@ import math
 from datetime import UTC, datetime, timedelta, time as dtime
 from decimal import Decimal
 
-import numpy as np
-import polars as pl
-
 from backtest_simulator.cli._metrics import Trade
 from backtest_simulator.cli._stats import (
     compute_sweep_stats,
     daily_return_for_run,
     fetch_buy_hold_benchmark,
-)
-from backtest_simulator.sensors.precompute import (
-    PredictionsInput,
-    SignalsTable,
 )
 
 
@@ -63,14 +57,13 @@ def test_daily_return_for_run_trailing_inventory_returns_none() -> None:
 
 
 def test_compute_sweep_stats_too_few_obs_returns_none() -> None:
-    """Single-day sweep cannot fit DSR / SPA / PBO — all None."""
+    """Single-day sweep cannot fit DSR / SPA — all None."""
     stats = compute_sweep_stats(
         per_decoder_returns={'d1': [0.01], 'd2': [-0.01]},
         benchmark_returns=[0.005],
     )
     assert stats.dsr is None
     assert stats.spa is None
-    assert stats.pbo is None
 
 
 def test_compute_sweep_stats_dsr_skips_on_constant_returns() -> None:
@@ -94,7 +87,13 @@ def test_compute_sweep_stats_dsr_skips_on_constant_returns() -> None:
 
 
 def test_compute_sweep_stats_dsr_runs_on_two_decoders_two_days() -> None:
-    """DSR runs as soon as n_obs >= 2; SPA too; PBO needs >= 4 obs."""
+    """DSR runs as soon as n_obs >= 2; SPA too.
+
+    Auditor: legacy half-split PBO (`_safe_pbo`) was removed —
+    only `sweep cpcv_pbo` is the PBO surface now (driven by
+    `cpcv_pbo` in the same module, exercised in `bts sweep`).
+    `SweepStats` no longer carries a `.pbo` field.
+    """
     stats = compute_sweep_stats(
         per_decoder_returns={
             'd1': [0.01, 0.02], 'd2': [-0.01, 0.005],
@@ -103,46 +102,8 @@ def test_compute_sweep_stats_dsr_runs_on_two_decoders_two_days() -> None:
     )
     assert stats.dsr is not None
     assert stats.spa is not None
-    assert stats.pbo is None  # n_obs=2 < 4
     assert stats.best_decoder == 'd1'  # higher mean / non-negative variance
     assert stats.dsr.n_trials == 2
-
-
-def test_compute_sweep_stats_pbo_runs_on_four_obs_two_decoders() -> None:
-    """PBO unlocks at n_obs >= 4 + n_decoders >= 2 + non-tied returns."""
-    stats = compute_sweep_stats(
-        per_decoder_returns={
-            'd1': [0.01, 0.02, 0.005, 0.015],
-            'd2': [-0.01, 0.005, 0.0, 0.01],
-        },
-        benchmark_returns=[0.005, 0.005, 0.005, 0.005],
-    )
-    assert stats.pbo is not None
-    assert stats.pbo.n_strategies == 2
-    # n_obs=4, half=2, n_groups=2 → C(2,1)=2 splits
-    assert stats.pbo.n_splits == 2
-
-
-def test_compute_sweep_stats_pbo_skips_on_pairwise_identical_returns() -> None:
-    """PBO returns None when all decoders share the same return series.
-
-    Codex round 1 P1: ties yield deterministic primitive ordering,
-    so an all-zero (or all-identical) sweep would report
-    `pbo=0.000` — a false "no overfitting" signal. The wrapper
-    skips with `None` instead.
-
-    Mutation proof: removing the pairwise-identical check makes
-    PBO fire and `assert stats.pbo is None` fails.
-    """
-    stats = compute_sweep_stats(
-        per_decoder_returns={
-            'd1': [0.0, 0.0, 0.0, 0.0],
-            'd2': [0.0, 0.0, 0.0, 0.0],
-        },
-        benchmark_returns=[0.0, 0.0, 0.0, 0.0],
-        spa_n_bootstrap=10,
-    )
-    assert stats.pbo is None
 
 
 def test_compute_sweep_stats_n_search_trials_overrides_decoder_count() -> None:
@@ -219,65 +180,33 @@ def test_fetch_buy_hold_benchmark_two_days() -> None:
     assert math.isclose(bench[1], -0.01, abs_tol=1e-12)
 
 
-def _build_cpcv_fixture(
+def _cpcv_fixture(
     *,
-    preds_d1: list[int],
-    preds_d2: list[int],
-    n_ticks: int = 8,
-    bar_seconds: int = 60,
-) -> tuple[list[datetime], pl.DataFrame, dict[str, SignalsTable]]:
-    """Build (tick_timestamps, klines, signals_per_decoder) for cpcv_pbo tests.
+    returns_d1: list[float],
+    returns_d2: list[float],
+    n_days: int | None = None,
+) -> tuple[list[datetime], dict[str, list[float]]]:
+    """Build (days, per_decoder_returns) for cpcv_pbo tests.
 
-    Auditor round-7 fix: cpcv_pbo now consumes SignalsTable +
-    klines + tick_timestamps. Test fixtures construct synthetic
-    versions of all three so the bar-level CSCV math is exercised
-    without spinning up Trainer / HistoricalData.
+    Auditor (post-v2.0.1): cpcv_pbo now consumes deployed-strategy
+    daily returns (`per_decoder_returns`) directly, NOT bar-level
+    SignalsTable + klines. The fixture builds a synthetic
+    contiguous-day timeline + per-decoder daily return series.
     """
+    if n_days is None:
+        n_days = max(len(returns_d1), len(returns_d2))
     base = datetime(2026, 4, 20, 0, 0, tzinfo=UTC)
-    ticks = [
-        base + timedelta(seconds=i * bar_seconds) for i in range(n_ticks)
-    ]
-    # klines need one extra row past the last tick so close-to-
-    # next-close exists for every tick. Synthetic close walk gives
-    # a non-zero bar_return at every tick.
-    closes = [100.0 + i * 0.5 for i in range(n_ticks + 1)]
-    kline_ts = [
-        base + timedelta(seconds=i * bar_seconds) for i in range(n_ticks + 1)
-    ]
-    klines = pl.DataFrame({
-        'datetime': kline_ts,
-        'close': closes,
-    }).with_columns(
-        pl.col('datetime').dt.replace_time_zone('UTC'),
-    )
-
-    def _build(decoder: str, preds: list[int]) -> SignalsTable:
-        return SignalsTable.from_predictions(
-            decoder_id=decoder,
-            split_config=(70, 15, 15),
-            predictions=PredictionsInput(
-                timestamps=ticks,
-                probs=np.array([0.5 + 0.01 * i for i in range(n_ticks)]),
-                preds=np.array(preds, dtype=np.int64),
-                label_horizon_bars=1,
-                bar_seconds=bar_seconds,
-            ),
-        )
-
-    return (
-        ticks,
-        klines,
-        {'d1': _build('d1', preds_d1), 'd2': _build('d2', preds_d2)},
-    )
+    days = [base + timedelta(days=i) for i in range(n_days)]
+    return days, {'d1': returns_d1, 'd2': returns_d2}
 
 
 def test_cpcv_pbo_runs_on_min_paths() -> None:
-    """CPCV PBO runs on minimal CSCV: 4 groups x 8 ticks x 2 decoders.
+    """CPCV PBO runs on minimal CSCV: 4 groups x 8 days x 2 decoders.
 
     `CpcvPaths.build(n_groups=4, n_test_groups=2)` produces C(4,2)=6
-    paths. Each path: 2 IS-group ticks + 2 OOS-group ticks (in this
-    fixture). With 2 decoders + non-tied predictions, paths that
-    have enough IS+OOS data + non-tied IS Sharpes produce logits.
+    paths. With 8 days, each group has 2 days; each path partitions
+    into 4 IS days + 4 OOS days. 2 non-tied per-decoder daily return
+    series produce per-path Sharpes; surviving paths emit logits.
     """
     from backtest_simulator.cli._stats import cpcv_pbo
     from backtest_simulator.honesty.cpcv import CpcvPaths
@@ -285,13 +214,14 @@ def test_cpcv_pbo_runs_on_min_paths() -> None:
         n_groups=4, n_test_groups=2,
         purge_seconds=0, embargo_seconds=0,
     )
-    ticks, klines, signals = _build_cpcv_fixture(
-        preds_d1=[1, 0, 1, 1, 0, 1, 0, 1],
-        preds_d2=[0, 1, 0, 1, 1, 0, 1, 0],
+    days, per_decoder = _cpcv_fixture(
+        returns_d1=[0.01, -0.005, 0.02, -0.01, 0.015, -0.008, 0.012, -0.003],
+        returns_d2=[-0.01, 0.008, -0.015, 0.005, -0.012, 0.01, -0.008, 0.005],
     )
     result = cpcv_pbo(
-        paths=paths, signals_per_decoder=signals,
-        tick_timestamps=ticks, klines=klines,
+        paths=paths,
+        per_decoder_returns=per_decoder,
+        days=days,
     )
     assert result is not None
     assert result.n_decoders == 2
@@ -308,29 +238,28 @@ def test_cpcv_pbo_skips_when_insufficient_decoders() -> None:
         n_groups=4, n_test_groups=2,
         purge_seconds=0, embargo_seconds=0,
     )
-    ticks, klines, signals = _build_cpcv_fixture(
-        preds_d1=[1, 0, 1, 1, 0, 1, 0, 1],
-        preds_d2=[0, 1, 0, 1, 1, 0, 1, 0],
+    days, per_decoder = _cpcv_fixture(
+        returns_d1=[0.01, -0.005, 0.02, -0.01, 0.015, -0.008, 0.012, -0.003],
+        returns_d2=[-0.01, 0.008, -0.015, 0.005, -0.012, 0.01, -0.008, 0.005],
     )
     result = cpcv_pbo(
         paths=paths,
-        signals_per_decoder={'d1': signals['d1']},  # only 1 decoder
-        tick_timestamps=ticks, klines=klines,
+        per_decoder_returns={'d1': per_decoder['d1']},  # only 1 decoder
+        days=days,
     )
     assert result is None
 
 
-def test_cpcv_pbo_skips_on_pairwise_identical_predictions() -> None:
-    """All-equal decoder predictions -> None (auditor round 7 fix).
+def test_cpcv_pbo_skips_on_pairwise_identical_returns() -> None:
+    """All-equal decoder per-day return series -> None.
 
-    Without the pairwise-identical guard at the prediction-sequence
-    level, every path picks the same first decoder via `max`
-    deterministic tie ordering, producing fake `pbo=0.000`. The
-    guard checks predictions across all ticks and returns None so
-    sweep skips with reason.
+    Without the pairwise-identical guard, every path picks the same
+    first decoder via `max` deterministic tie ordering, producing
+    fake `pbo=0.000`. The guard returns None so sweep skips with
+    reason.
 
-    Mutation proof: removing the prediction pairwise-identical
-    check makes the result non-None.
+    Mutation proof: removing the pairwise-identical check at the
+    series level makes the result non-None.
     """
     from backtest_simulator.cli._stats import cpcv_pbo
     from backtest_simulator.honesty.cpcv import CpcvPaths
@@ -338,91 +267,98 @@ def test_cpcv_pbo_skips_on_pairwise_identical_predictions() -> None:
         n_groups=4, n_test_groups=2,
         purge_seconds=0, embargo_seconds=0,
     )
-    same_preds = [1, 0, 1, 1, 0, 1, 0, 1]
-    ticks, klines, signals = _build_cpcv_fixture(
-        preds_d1=same_preds, preds_d2=same_preds,
+    same_returns = [0.01, -0.005, 0.02, -0.01, 0.015, -0.008, 0.012, -0.003]
+    days, per_decoder = _cpcv_fixture(
+        returns_d1=same_returns, returns_d2=list(same_returns),
     )
     result = cpcv_pbo(
-        paths=paths, signals_per_decoder=signals,
-        tick_timestamps=ticks, klines=klines,
+        paths=paths,
+        per_decoder_returns=per_decoder,
+        days=days,
     )
     assert result is None
 
 
-def test_cpcv_pbo_uses_signals_table_lookup_for_path_filtering() -> None:
-    """SignalsTable.lookup with allowed_groups is the load-bearing accessor.
+def test_cpcv_pbo_uses_deployed_strategy_returns_not_proxy() -> None:
+    """cpcv_pbo's input IS the deployed-strategy returns dict.
 
-    Auditor round 7 P1: cpcv_pbo previously consumed only daily
-    returns; the SignalsTable build was ornamental. This test pins
-    that cpcv_pbo now goes through `signals.lookup(allowed_groups
-    =path.train_groups, ...)` and `signals.lookup(allowed_groups
-    =path.test_groups, ...)` per tick, per path, per decoder. If
-    we mock the lookup to return None for everything, cpcv_pbo
-    returns None (no paths produce logits because IS+OOS data is
-    empty).
+    Auditor (post-v2.0.1): the prior bar-level implementation
+    ranked decoders on `pred * close_to_next_close_return` — a
+    signal-return proxy that ignored stops, slippage, impact,
+    maker-fill, and trailing-inventory exclusions. The new
+    function takes `per_decoder_returns` directly: the same
+    `daily_return_for_run` output that already drives DSR/SPA.
 
-    Mutation proof: if cpcv_pbo bypassed the lookup and read
-    predictions directly off the table's `_frame`, this assert
-    would fail.
+    This test pins the input shape — `cpcv_pbo` accepts a
+    `dict[str, list[float]]` keyed by decoder_id, with each
+    value being net PnL fractions per clean day. Mutation proof:
+    if `cpcv_pbo` reverts to taking `signals_per_decoder /
+    klines / tick_timestamps`, calling it with the new arg names
+    raises TypeError and this test fires.
     """
-    from unittest.mock import patch
     from backtest_simulator.cli._stats import cpcv_pbo
     from backtest_simulator.honesty.cpcv import CpcvPaths
     paths = CpcvPaths.build(
         n_groups=4, n_test_groups=2,
         purge_seconds=0, embargo_seconds=0,
     )
-    ticks, klines, signals = _build_cpcv_fixture(
-        preds_d1=[1, 0, 1, 1, 0, 1, 0, 1],
-        preds_d2=[0, 1, 0, 1, 1, 0, 1, 0],
+    days, per_decoder = _cpcv_fixture(
+        returns_d1=[0.01, -0.005, 0.02, -0.01, 0.015, -0.008, 0.012, -0.003],
+        returns_d2=[-0.01, 0.008, -0.015, 0.005, -0.012, 0.01, -0.008, 0.005],
     )
-    # Patch lookup so it ALWAYS returns None for path-filtered calls
-    # (anything passing allowed_groups). Non-filtered calls (used by
-    # the pairwise-identical guard) still pass through.
-    original_lookup = signals['d1'].__class__.lookup
-
-    def filtered_lookup(self, t, *, allowed_groups=None, **kw):  # type: ignore[no-untyped-def]
-        if allowed_groups is not None:
-            return None
-        return original_lookup(self, t, allowed_groups=None, **kw)
-
-    with patch.object(
-        signals['d1'].__class__, 'lookup', filtered_lookup,
-    ):
-        result = cpcv_pbo(
-            paths=paths, signals_per_decoder=signals,
-            tick_timestamps=ticks, klines=klines,
+    # Calling with the new kwargs MUST type-check; calling with
+    # old kwargs (signals_per_decoder, tick_timestamps, klines)
+    # MUST raise TypeError. Verify the latter as a contract pin.
+    import pytest
+    with pytest.raises(TypeError):
+        cpcv_pbo(  # type: ignore[call-arg]
+            paths=paths,
+            signals_per_decoder={},
+            tick_timestamps=days,
+            klines=None,
         )
-    # No path-filtered lookup ever returned a row -> every path's IS
-    # and OOS are empty -> result is None.
-    assert result is None
+    # And the new signature works.
+    result = cpcv_pbo(
+        paths=paths,
+        per_decoder_returns=per_decoder,
+        days=days,
+    )
+    assert result is not None
 
 
-def test_cpcv_pbo_purge_seconds_passed_through_to_lookup() -> None:
-    """`purge_seconds` from path is plumbed to `signals.lookup`.
+def test_cpcv_pbo_purge_seconds_recorded_in_result() -> None:
+    """`purge_seconds` and `embargo_seconds` flow from path to result.
 
-    The auditor round-7 cpcv_pbo passes path.purge_seconds and
-    path.embargo_seconds into each lookup call. This test pins the
-    contract that the result reports the same seconds the operator
-    supplied.
+    The result echoes the seconds the operator configured. With
+    purge=86400 + embargo=86400 on a 12-day fixture, train days
+    adjacent to test days are dropped; surviving paths still
+    record the supplied seconds.
     """
     from backtest_simulator.cli._stats import cpcv_pbo
     from backtest_simulator.honesty.cpcv import CpcvPaths
     paths = CpcvPaths.build(
         n_groups=4, n_test_groups=2,
-        purge_seconds=120, embargo_seconds=60,
+        purge_seconds=86400, embargo_seconds=86400,
     )
-    ticks, klines, signals = _build_cpcv_fixture(
-        preds_d1=[1, 0, 1, 1, 0, 1, 0, 1],
-        preds_d2=[0, 1, 0, 1, 1, 0, 1, 0],
+    # 12 days so post-purge IS still has >=2 days per path.
+    days, per_decoder = _cpcv_fixture(
+        returns_d1=[
+            0.01, -0.005, 0.02, -0.01, 0.015, -0.008,
+            0.012, -0.003, 0.018, -0.011, 0.014, -0.006,
+        ],
+        returns_d2=[
+            -0.01, 0.008, -0.015, 0.005, -0.012, 0.01,
+            -0.008, 0.005, -0.013, 0.009, -0.011, 0.004,
+        ],
     )
     result = cpcv_pbo(
-        paths=paths, signals_per_decoder=signals,
-        tick_timestamps=ticks, klines=klines,
+        paths=paths,
+        per_decoder_returns=per_decoder,
+        days=days,
     )
     if result is not None:
-        assert result.purge_seconds == 120
-        assert result.embargo_seconds == 60
+        assert result.purge_seconds == 86400
+        assert result.embargo_seconds == 86400
 
 
 def test_compute_sweep_stats_spa_consistent_with_synthetic_signal() -> None:

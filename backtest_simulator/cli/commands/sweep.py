@@ -237,7 +237,9 @@ def _run(args: argparse.Namespace) -> int:
         picks, tick_timestamps=tick_timestamps,
         replay_start=replay_start, replay_end=replay_end,
     )
-    _print_sweep_signals_summary(signals_per_decoder)
+    _print_sweep_signals_summary(
+        signals_per_decoder, tick_timestamps=tick_timestamps,
+    )
     t_total = time.perf_counter()
     # Accumulators for the sweep-level slippage summary printed
     # after all runs finish. The per-run cost_bps is the
@@ -480,6 +482,8 @@ def _run(args: argparse.Namespace) -> int:
     )
     _print_sweep_atr_summary(
         sweep_atr_n_rejected_total, sweep_atr_n_uncalibrated_total,
+        atr_k=str(getattr(args, 'atr_k', '0.5')),
+        atr_window_seconds=int(getattr(args, 'atr_window_seconds', 900)),
     )
     _print_sweep_book_gap_summary(
         max_seconds=sweep_book_gap_max_seconds,
@@ -514,9 +518,8 @@ def _run(args: argparse.Namespace) -> int:
         n_runs_with_trailing_inventory=n_runs_with_trailing_inventory,
     )
     _print_cpcv_pbo_summary(
-        signals_per_decoder=signals_per_decoder,
-        klines=signals_klines,
-        tick_timestamps=tick_timestamps,
+        per_decoder_returns=per_decoder_returns,
+        days=clean_days,
         n_groups=int(args.cpcv_n_groups),
         n_test_groups=int(args.cpcv_n_test_groups),
         purge_seconds=int(args.cpcv_purge_seconds),
@@ -608,8 +611,25 @@ def _build_and_save_signals_tables(
 
 def _print_sweep_signals_summary(
     tables: dict[str, SignalsTable],
+    *, tick_timestamps: list[datetime],
 ) -> None:
-    """One-line confirmation that SignalsTables built + saved + gated."""
+    """One-line confirmation that SignalsTables built + saved + gated.
+
+    Auditor: SignalsTable build can honestly skip ticks when the
+    causal window is empty or feature warmup hasn't filled.
+    Reporting bar counts alone is reassuring but not diagnostic
+    — two decoders with the same bar count but different
+    warmup windows would print identically. Surface the
+    expected-vs-realized rows AND a coverage percentage so the
+    operator sees how much of the planned replay actually
+    produced predictions.
+
+    `expected = len(tick_timestamps)` is known up front (the
+    PredictLoop fires at every interval boundary); `actual` is
+    `t._frame.height`. Coverage < 100% means warmup or causal-
+    gap skips are eating bars; 100% means every tick produced a
+    prediction.
+    """
     if not tables:
         print('sweep signals    skipped: no SignalsTables built')
         return
@@ -617,43 +637,62 @@ def _print_sweep_signals_summary(
         t._frame.height
         for t in tables.values()
     ]
+    expected = len(tick_timestamps)
     avg_bars = sum(bar_counts) // max(1, len(bar_counts))
+    if expected > 0:
+        # Coverage = realized / expected, rendered per-decoder
+        # min/max so the operator sees if any single decoder
+        # under-built. Average is included for a quick pulse.
+        coverages = [c / expected for c in bar_counts]
+        cov_min = min(coverages)
+        cov_max = max(coverages)
+        cov_avg = sum(coverages) / len(coverages)
+        cov_str = (
+            f'  coverage={cov_avg * 100:.1f}% '
+            f'(min={cov_min * 100:.1f}% max={cov_max * 100:.1f}%)'
+        )
+    else:
+        cov_str = '  coverage=n/a (zero ticks scheduled)'
     print(
         f'sweep signals    n_decoders={len(tables)}  '
+        f'expected_bars={expected}  '
         f'avg_bars_per_decoder={avg_bars}  '
-        f'min_bars={min(bar_counts)}  max_bars={max(bar_counts)}',
+        f'min_bars={min(bar_counts)}  '
+        f'max_bars={max(bar_counts)}'
+        f'{cov_str}',
     )
 
 
 def _print_cpcv_pbo_summary(
     *,
-    signals_per_decoder: dict[str, SignalsTable],
-    klines: pl.DataFrame,
-    tick_timestamps: list[datetime],
+    per_decoder_returns: dict[str, list[float]],
+    days: list[datetime],
     n_groups: int,
     n_test_groups: int,
     purge_seconds: int,
     embargo_seconds: int,
 ) -> None:
-    """Slice #17 Task 17 — bar-level CSCV PBO via CpcvPaths + SignalsTable.
+    """Slice #17 Task 17 — day-level CSCV PBO over deployed-strategy returns.
 
     Lopez de Prado §11 directly: each path picks `n_test_groups`
-    of `n_groups` as OOS, the rest as IS. cpcv_pbo walks each
-    runtime tick, calling `signals.lookup(allowed_groups=path.
-    test_groups)` for OOS bars and `signals.lookup(allowed_groups
-    =path.train_groups)` for IS bars; multiplies pred * bar_return
-    (close-to-next-close from `klines`) to get strategy returns;
-    Sharpe per partition, logit, PBO. SignalsTable + CpcvPaths
-    are both load-bearing — this is what auditor round 7 P1
-    addressed (previously cpcv_pbo took daily returns, leaving
-    SignalsTable build ornamental).
+    of `n_groups` as OOS, the rest as IS. The deployed-strategy
+    daily returns (`daily_return_for_run` output, already
+    feeding DSR/SPA) are partitioned by group and Sharpe is
+    computed per IS / OOS subset.
+
+    Auditor (post-v2.0.1): the prior bar-level implementation
+    used `pred * close_to_next_close_return` — a signal-return
+    proxy that ignored stops, slippage, impact, maker-fill, and
+    trailing-inventory exclusions. `per_decoder_returns` IS the
+    deployed strategy path, so the PBO surface ranks what
+    `bts sweep` actually trades.
 
     Skips with reason when the input shape is too thin.
     """
-    if not signals_per_decoder or len(signals_per_decoder) < 2:
+    if not per_decoder_returns or len(per_decoder_returns) < 2:
         print(
             f'sweep cpcv_pbo   skipped: need >=2 decoders, have '
-            f'{len(signals_per_decoder)}',
+            f'{len(per_decoder_returns)}',
         )
         return
     try:
@@ -665,8 +704,9 @@ def _print_cpcv_pbo_summary(
         print(f'sweep cpcv_pbo   skipped: {exc}')
         return
     result = cpcv_pbo(
-        paths=paths, signals_per_decoder=signals_per_decoder,
-        tick_timestamps=tick_timestamps, klines=klines,
+        paths=paths,
+        per_decoder_returns=per_decoder_returns,
+        days=days,
     )
     if result is None:
         print(
@@ -790,18 +830,27 @@ def _print_sweep_book_gap_summary(
 
 def _print_sweep_atr_summary(
     n_rejected_total: int, n_uncalibrated_total: int,
+    atr_k: str, atr_window_seconds: int,
 ) -> None:
     """Sweep-level ATR R-denominator gate summary (slice #17 Task 29).
 
-    Surfaces only when at least one rejection or uncalibrated
-    submit fired across the sweep. Healthy runs where the
-    strategy's stops sit comfortably above `k*ATR(window)` see
-    no line at all — same shape as the per-run `atr_*` segment.
+    Auditor: always surface the FLOOR that produced the counts
+    (`atr_k`, `atr_window_seconds`), even when zero rejections /
+    uncalibrated. Two sweeps with different `--atr-k` /
+    `--atr-window-seconds` would otherwise show different
+    counts with no visible threshold — the bts artifact would
+    not be self-describing for later comparison. Now the line
+    always prints.
+
+    `--atr-k 0` (gate disabled) is annotated explicitly so the
+    operator distinguishes a healthy 0-rejection run with the
+    gate ON from a 0-rejection run with the gate OFF.
     """
-    if n_rejected_total == 0 and n_uncalibrated_total == 0:
-        return
+    gate_state = ' (gate disabled)' if atr_k.strip() in {'0', '0.0'} else ''
     print(
-        f'sweep atr        rejected={n_rejected_total}  '
+        f'sweep atr        k={atr_k}{gate_state}  '
+        f'window={atr_window_seconds}s  '
+        f'rejected={n_rejected_total}  '
         f'uncalibrated={n_uncalibrated_total}',
     )
 
