@@ -21,7 +21,10 @@ import sys
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict, cast
+
+if TYPE_CHECKING:
+    from backtest_simulator.feed.protocol import VenueFeed
 
 from backtest_simulator.cli._pipeline import (
     SYMBOL,
@@ -449,7 +452,7 @@ def run_window_in_process(
 
 
 def _build_atr_gate_and_provider(
-    feed: object, *, k: Decimal, window_seconds: int,
+    feed: VenueFeed, *, k: Decimal, window_seconds: int,
 ) -> tuple[object, object]:
     """Construct the ATR sanity gate + per-submit provider.
 
@@ -483,7 +486,7 @@ def _build_atr_gate_and_provider(
 
 
 def _calibrate_slippage(
-    feed: object,
+    feed: VenueFeed,
     window_start: datetime,
 ) -> object | None:
     """Fit a SlippageModel on the 30 minutes of trades before `window_start`.
@@ -539,7 +542,7 @@ def _calibrate_slippage(
 
 
 def _calibrate_maker_fill(
-    feed: object,
+    feed: VenueFeed,
     window_start: datetime,
 ) -> object:
     """Build a MakerFillModel from the 30 minutes preceding `window_start`.
