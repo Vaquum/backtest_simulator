@@ -68,7 +68,7 @@ def _silence_tqdm_and_structlog(level: int) -> None:
     `make_filtering_bound_logger(ERROR)` for all verbosity<3,
     which left Praxis/Nexus/Limen structlog suppressed at `-v`
     (INFO) and `-vv` (DEBUG) — contradicting both the module
-    docstring and docs/cli.md. Now `level` tracks stdlib so
+    docstring and docs/CLI.md. Now `level` tracks stdlib so
     structlog mirrors the operator-requested verbosity.
     """
     import structlog
