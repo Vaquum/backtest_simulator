@@ -28,11 +28,16 @@ from nexus.core.validator.pipeline_models import (
     ValidationRequestContext,
 )
 from nexus.infrastructure.manifest import load_manifest
+
+# Use module-qualified import to keep pyright's symbol table from
+# binding the bare name `TradeOutcome` to nexus's class. The override
+# variance check on `_run_nexus_instance` was misresolving the
+# parameter to nexus when both imports landed in the same scope.
+from nexus.infrastructure.praxis_connector import (
+    trade_outcome as _nexus_trade_outcome_mod,
+)
 from nexus.infrastructure.praxis_connector.praxis_inbound import PraxisInbound
 from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
-from nexus.infrastructure.praxis_connector.trade_outcome import (
-    TradeOutcome as NexusTradeOutcome,
-)
 from nexus.infrastructure.state_store import StateStore
 from nexus.instance_config import InstanceConfig as NexusInstanceConfig
 from nexus.startup.sequencer import StartupSequencer, WiredSensor
@@ -62,6 +67,8 @@ from backtest_simulator.launcher.action_submitter import (
 )
 from backtest_simulator.launcher.clock import accelerated_clock
 from backtest_simulator.launcher.poller import BacktestMarketDataPoller
+
+NexusTradeOutcome = _nexus_trade_outcome_mod.TradeOutcome
 
 _log = logging.getLogger(__name__)
 
