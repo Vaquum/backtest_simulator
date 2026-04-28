@@ -36,7 +36,7 @@ from backtest_simulator.cli._run_window import run_window_in_subprocess
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
 
 
-def register(sub: argparse._SubParsersAction) -> None:
+def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     p = sub.add_parser(
         'run',
         help='Run one backtest window for one decoder.',

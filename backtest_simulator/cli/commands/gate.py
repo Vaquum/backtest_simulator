@@ -88,7 +88,7 @@ _ALL_GATES: Final[tuple[str, ...]] = (
 )
 
 
-def register(sub: argparse._SubParsersAction) -> None:
+def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     p = sub.add_parser('gate', help='Run a specific CI gate locally.')
     p.add_argument('name', choices=[*_ALL_GATES, 'all'],
                    help='Gate name. `all` runs every gate sequentially '

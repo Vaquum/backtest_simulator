@@ -22,7 +22,7 @@ _FORMAT_TO_NBCONVERT: Final[dict[str, list[str]]] = {
 }
 
 
-def register(sub: argparse._SubParsersAction) -> None:
+def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     p = sub.add_parser('notebook', help='Execute / convert a Jupyter notebook.')
     p.add_argument('--path', required=True, type=Path,
                    help='Path to the .ipynb file.')

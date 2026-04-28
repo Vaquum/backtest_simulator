@@ -114,7 +114,7 @@ def _runtime_tick_timestamps(
     return ticks
 
 
-def register(sub: argparse._SubParsersAction) -> None:
+def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     p = sub.add_parser(
         'sweep',
         help='Run the backtest pipeline over N decoders x M days.',

@@ -6,7 +6,7 @@ import importlib.metadata
 import sys
 
 
-def register(sub: argparse._SubParsersAction) -> None:
+def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     p = sub.add_parser('version', help='Print the bts version.')
     p.set_defaults(func=_run)
 

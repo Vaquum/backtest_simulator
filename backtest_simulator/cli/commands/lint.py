@@ -17,7 +17,7 @@ _DEFAULT_PATHS: Final[tuple[str, ...]] = (
 )
 
 
-def register(sub: argparse._SubParsersAction) -> None:
+def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     p = sub.add_parser('lint', help='Run ruff check.')
     p.add_argument('--paths', nargs='*', type=Path, default=None,
                    help='Override paths (default: backtest_simulator tools tests scripts).')

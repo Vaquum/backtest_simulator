@@ -15,7 +15,7 @@ from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
 _DEFAULT_PATHS: Final[tuple[str, ...]] = ('backtest_simulator',)
 
 
-def register(sub: argparse._SubParsersAction) -> None:
+def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     p = sub.add_parser('typecheck', help='Run pyright strict.')
     p.add_argument('--paths', nargs='*', type=Path, default=None,
                    help='Override paths (default: backtest_simulator).')

@@ -13,7 +13,7 @@ from pathlib import Path
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
 
 
-def register(sub: argparse._SubParsersAction) -> None:
+def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     p = sub.add_parser('test', help='Run pytest under bts.')
     p.add_argument('-k', dest='pattern', type=str, default=None,
                    help='pytest -k pattern.')
