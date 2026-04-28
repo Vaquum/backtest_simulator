@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from datetime import time as dtime
 from decimal import Decimal
+
 import polars as pl
 from scipy.stats import kurtosis, skew
 

@@ -1,3 +1,24 @@
+# v2.0.3
+
+Auditor batch (post-v2.0.2) — 3 P1 findings.
+
+## P1 — `SignalsTable` replay made REAL: parity assertion vs runtime predictions
+
+After v2.0.2 moved CPCV PBO to deployed daily returns, the SignalsTable replay was no longer consumed by any decision metric — only "sweep signals" printed bar counts, and `signals_klines` was unused (RUF059). Per the Five Principles, that's mandatory sweep-time ornamentation. **Fix: turn it into a real parity assertion.**
+
+- `_run_window.run_window_in_process` now wraps Nexus's `produce_signal` (the only path `Sensor.predict` reaches at runtime) and captures `(timestamp, _preds)` per call. The hook installs / restores the wrapper around `launcher.run_window(...)`. `signal.timestamp` is `datetime.now(UTC)` evaluated INSIDE `accelerated_clock`, which freezegun pins to the simulated tick boundary — same instant the sweep used to build SignalsTable. Captured list returned in the result dict as `runtime_predictions`.
+- New `_signals_builder.assert_signals_parity(decoder_id, table, runtime_predictions, tick_timestamps)`. For every captured `(t, pred)` whose `t` is in `tick_timestamps`, `SignalsTable.lookup(t).pred` MUST equal `pred`. Mismatch raises `ParityViolation` (HonestyViolation subclass; the no-swallowed-violations gate forbids catching it). Out-of-grid ticks (warmup pre-window, post-window) are silently skipped — the table doesn't claim coverage there. The explicit `tick_timestamps` allowlist is the precise gate (lookup forward-fills past the last covered row, so `lookup is None` alone would let post-window ticks slip through).
+- Sweep wires the assertion: every per-window result's `runtime_predictions` is checked against `signals_per_decoder[display_id]`. New `sweep signals parity OK n_compared=N` line at the end (or "no comparisons made" when PredictLoop didn't fire — explicit so the operator distinguishes "ran + matched" from "didn't run"). 6 mutation-proof tests in `tests/cli/test_signals_parity.py`.
+- `signals_klines` removed from `_build_and_save_signals_tables` return value (was only consumed by the old bar-level CPCV that v2.0.2 dropped). RUF059 closed.
+
+## P1 — `_signals_builder` module docstring fixed
+
+The module docstring still claimed it "feeds CPCV PBO" — stale post-v2.0.2 — and spanned 17 lines (the `check_module_docstrings.py` gate requires single-line). Updated to single-line + multi-line context comment block. Now describes the parity-reference role accurately.
+
+## P1 — `ParityViolation` catch removed (no-swallowed-violations gate now PASS)
+
+`commands/run.py:_maybe_assert_parity` caught `ParityViolation`, printed a failure, and returned 1. The repo's `check_no_swallowed_violations.py` gate forbids any honesty-violation catch in production code (HonestyViolation subclasses must reach the test boundary unswallowed). Removed the try/except — `assert_ledger_parity` now propagates directly; CLI exits with a Python traceback on divergence (operator sees the violation directly). The existing `test_maybe_assert_parity_violation_returns_one` test was rewritten to `test_maybe_assert_parity_violation_propagates` (uses `pytest.raises(ParityViolation)`).
+
 # v2.0.2
 
 Auditor batch (post-v2.0.1) — 1 P0 + 4 P1 + 2 P2.

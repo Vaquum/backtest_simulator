@@ -48,12 +48,20 @@ def test_maybe_assert_parity_pass_returns_zero(tmp_path: Path) -> None:
     assert rc == 0
 
 
-def test_maybe_assert_parity_violation_returns_one(tmp_path: Path) -> None:
-    """Mismatched files + STRICT -> ParityViolation -> exit 1.
+def test_maybe_assert_parity_violation_propagates(tmp_path: Path) -> None:
+    """Mismatched files + STRICT -> ParityViolation propagates.
 
-    The CLI must propagate ParityViolation as a non-zero exit so
-    CI / shell scripts can gate on the parity check.
+    Auditor (post-v2.0.2): the CLI no longer catches ParityViolation
+    — `check_no_swallowed_violations.py` forbids swallowing honesty
+    violations in production code. The exception bubbles up, so the
+    CLI exits with a Python traceback (operator sees the violation
+    directly + non-zero exit by virtue of the unhandled raise).
+
+    Mutation proof: re-introducing the `try: ... except
+    ParityViolation: return 1` swallow makes
+    `pytest.raises(ParityViolation)` fail.
     """
+    from backtest_simulator.exceptions import ParityViolation
     spine = tmp_path / 'spine.jsonl'
     ref = tmp_path / 'ref.jsonl'
     spine.write_text(
@@ -68,8 +76,8 @@ def test_maybe_assert_parity_violation_returns_one(tmp_path: Path) -> None:
         'event_spine_jsonl': str(spine),
         'event_spine_n_events': 1,
     }
-    rc = _maybe_assert_parity(_args(check=ref), result)
-    assert rc == 1
+    with pytest.raises(ParityViolation):
+        _maybe_assert_parity(_args(check=ref), result)
 
 
 def test_maybe_assert_parity_missing_spine_with_check_fails_loud(

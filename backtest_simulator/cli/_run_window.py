@@ -37,6 +37,52 @@ from backtest_simulator.cli._pipeline import (
 RUN_WINDOW_INTERVAL_SECONDS: int = 3600
 
 
+def capture_runtime_prediction(
+    *, wired: object, signal: object, sink: list[dict[str, object]],
+) -> None:
+    """Append `(sensor_id, timestamp, pred)` to `sink` if `signal` carries a `_preds` int.
+
+    Auditor (post-v2.0.2) "make it real": this is the per-call
+    capture predicate inside `run_window_in_process`'s wrapped
+    `produce_signal`. Extracted to module level so the
+    MappingProxyType / non-int / missing-attr edge cases are
+    testable without spinning up a real `BacktestLauncher`.
+
+    Codex (post-auditor-3 P1): real Nexus emits `Signal.values` as
+    a `types.MappingProxyType` (read-only dict view). The earlier
+    `isinstance(values_obj, dict)` check silently dropped every
+    real-runtime prediction — sweep parity printed "no comparisons
+    made" forever. Accept `collections.abc.Mapping` instead.
+
+    Silently no-ops on:
+      - `signal.values` is not a `Mapping`
+      - `_preds` key is absent
+      - `_preds` value is not an `int`
+      - `signal.timestamp` is not a `datetime`
+
+    Each silent skip is a real "missing data" signal — the wrapper
+    cannot synthesize a valid (t, pred) pair from the absence. The
+    sweep counts captures via `len(sink)` per window.
+    """
+    from collections.abc import Mapping
+    from typing import cast
+    values_obj = getattr(signal, 'values', None)
+    if not isinstance(values_obj, Mapping):
+        return
+    values = cast('Mapping[str, object]', values_obj)
+    pred_val = values.get('_preds')
+    if not isinstance(pred_val, int):
+        return
+    ts_obj = getattr(signal, 'timestamp', None)
+    if not isinstance(ts_obj, datetime):
+        return
+    sink.append({
+        'sensor_id': str(getattr(wired, 'sensor_id', '')),
+        'timestamp': ts_obj.isoformat(),
+        'pred': pred_val,
+    })
+
+
 def _fresh_work_dir(suffix: str) -> Path:
     d = WORK_DIR / suffix
     if d.exists():
@@ -172,7 +218,37 @@ def run_window_in_process(
         atr_gate=atr_gate,
         atr_provider=atr_provider,
     )
-    launcher.run_window(window_start, window_end)
+    # Auditor (post-v2.0.2) "make it real": capture per-tick runtime
+    # predictions so the sweep can assert SignalsTable parity AGAINST
+    # the deployed strategy's actual decisions. The hook wraps Nexus's
+    # `produce_signal` (the only path Sensor.predict reaches at
+    # runtime) and records (timestamp, _preds) per call. The
+    # `signal.timestamp` is `datetime.now(UTC)` evaluated INSIDE
+    # `accelerated_clock`, which freezegun pins to the simulated tick
+    # boundary — same instant the sweep used to build SignalsTable.
+    # CPython list.append is atomic under GIL, safe from PredictLoop's
+    # threading.Timer.
+    runtime_predictions: list[dict[str, object]] = []
+    import nexus.strategy.predict_loop as _predict_loop_mod
+    # Nexus's `produce_signal(wired, market_data) -> Signal` is
+    # untyped at the package boundary; saved reference captured
+    # BEFORE we overwrite the module attribute.
+    _real_produce_signal = _predict_loop_mod.produce_signal
+
+    def _capturing_produce_signal(
+        wired: object, market_data: object,
+    ) -> object:
+        signal = _real_produce_signal(wired, market_data)
+        capture_runtime_prediction(
+            wired=wired, signal=signal, sink=runtime_predictions,
+        )
+        return signal
+
+    _predict_loop_mod.produce_signal = _capturing_produce_signal
+    try:
+        launcher.run_window(window_start, window_end)
+    finally:
+        _predict_loop_mod.produce_signal = _real_produce_signal
     # Slice #17 Task 18: dump the run's EventSpine to JSONL for
     # ledger-parity comparison. Always-dump (codex round 1 #4): the
     # operator gets a comparable artifact regardless of whether
@@ -315,6 +391,14 @@ def run_window_in_process(
         'book_gap_max_seconds': float(book_gap.max_stop_cross_to_trade_seconds),
         'book_gap_n_observed': int(book_gap.n_stops_observed),
         'book_gap_p95_seconds': float(book_gap.p95_stop_cross_to_trade_seconds),
+        # Auditor (post-v2.0.2) "make it real": list of per-tick
+        # runtime predictions captured from the wrapped
+        # `produce_signal`. Each entry: `{sensor_id, timestamp,
+        # pred}`. Sweep parent compares this against the
+        # SignalsTable for the matching decoder; mismatch raises
+        # `ParityViolation`. Empty when no PredictLoop tick fired
+        # in the window (e.g. window shorter than interval_seconds).
+        'runtime_predictions': runtime_predictions,
     }
 
 

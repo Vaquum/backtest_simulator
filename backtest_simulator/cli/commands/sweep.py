@@ -16,8 +16,6 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Final
 
-import polars as pl
-
 from backtest_simulator.cli._metrics import Trade, print_run
 from backtest_simulator.cli._pipeline import (
     pick_decoders,
@@ -29,6 +27,7 @@ from backtest_simulator.cli._run_window import (
     run_window_in_subprocess,
 )
 from backtest_simulator.cli._signals_builder import (
+    assert_signals_parity,
     build_signals_table_for_decoder,
 )
 from backtest_simulator.cli._stats import (
@@ -233,7 +232,7 @@ def _run(args: argparse.Namespace) -> int:
         days=days, hours_start=hours_start, hours_end=hours_end,
         interval_seconds=RUN_WINDOW_INTERVAL_SECONDS,
     )
-    signals_per_decoder, signals_klines = _build_and_save_signals_tables(
+    signals_per_decoder = _build_and_save_signals_tables(
         picks, tick_timestamps=tick_timestamps,
         replay_start=replay_start, replay_end=replay_end,
     )
@@ -283,6 +282,14 @@ def _run(args: argparse.Namespace) -> int:
     # raw samples or a mergeable histogram (codex round 1).
     sweep_book_gap_max_seconds = 0.0
     sweep_book_gap_total_stops = 0
+    # Auditor (post-v2.0.2) "make it real": running tally of how
+    # many runtime-vs-SignalsTable per-tick comparisons succeeded
+    # across the whole sweep. The actual mismatch detection is
+    # `assert_signals_parity` raising `ParityViolation` per-window;
+    # this counter gives the operator a positive indicator that
+    # the parity check WAS exercised (vs zero comparisons silently
+    # because the runtime never produced predictions).
+    sweep_signals_parity_total = 0
     # Slice #17 Task 17 (DSR + PBO + SPA portion). Per-decoder
     # daily-return scalars feed `compute_sweep_stats` after the
     # sweep finishes. Stored per (decoder, day_idx) so day-aligned
@@ -370,6 +377,27 @@ def _run(args: argparse.Namespace) -> int:
             ))
             atr_rejected = int(result.get('n_atr_rejected', 0))
             atr_uncal = int(result.get('n_atr_uncalibrated', 0))
+            # Auditor (post-v2.0.2) "make it real": SignalsTable
+            # is now a sweep-time PARITY REFERENCE — for every
+            # per-window run, compare runtime per-tick predictions
+            # against `signals_per_decoder[display_id]`. Any
+            # mismatch raises `ParityViolation` (HonestyViolation
+            # subclass; check_no_swallowed_violations.py forbids
+            # catching it). The runtime predictions list comes from
+            # `_run_window`'s wrapped `produce_signal` hook — empty
+            # for windows where no PredictLoop tick fired.
+            runtime_preds_raw = result.get('runtime_predictions', [])
+            if isinstance(runtime_preds_raw, list) and runtime_preds_raw:
+                decoder_key = str(display_id)
+                table = signals_per_decoder.get(decoder_key)
+                if table is not None:
+                    n_signals_compared = assert_signals_parity(
+                        decoder_id=decoder_key,
+                        table=table,
+                        runtime_predictions=runtime_preds_raw,
+                        tick_timestamps=tick_timestamps,
+                    )
+                    sweep_signals_parity_total += n_signals_compared
             print_run(
                 display_id, day_label, trades, declared_stops,
                 slippage_cost_bps=slip_cost,
@@ -489,6 +517,26 @@ def _run(args: argparse.Namespace) -> int:
         max_seconds=sweep_book_gap_max_seconds,
         total_stops=sweep_book_gap_total_stops,
     )
+    # Auditor (post-v2.0.2) "make it real": positive indicator
+    # that the SignalsTable parity check ran. Mismatches raise
+    # ParityViolation per-window during the loop; reaching this
+    # line means every per-tick comparison passed across the
+    # sweep. Zero comparisons (e.g. when PredictLoop never fired
+    # because the window is shorter than interval_seconds) is
+    # surfaced explicitly so the operator distinguishes "parity
+    # checked + matched" from "parity check did not run".
+    if sweep_signals_parity_total > 0:
+        print(
+            f'sweep signals parity  '
+            f'OK n_compared={sweep_signals_parity_total} '
+            f'(runtime Sensor.predict matches SignalsTable per-tick)',
+        )
+    else:
+        print(
+            'sweep signals parity  '
+            'no comparisons made (runtime never produced predictions; '
+            'window may be shorter than interval_seconds)',
+        )
     # Align decoders by day: drop any day where ANY decoder had
     # trailing inventory. This guarantees DSR/PBO/SPA see same-
     # date returns for every decoder (codex round 2 P1).
@@ -533,27 +581,24 @@ def _build_and_save_signals_tables(
     *,
     tick_timestamps: list[datetime],
     replay_start: datetime, replay_end: datetime,
-) -> tuple[dict[str, SignalsTable], pl.DataFrame]:
+) -> dict[str, SignalsTable]:
     """Build + save SignalsTable per picked decoder.
 
     Slice #17 Task 16. Walks each picked decoder's experiment dir
     via Limen `Trainer`, retrains the Pass-2 (1,0,0) Sensor (the
     runtime predictor), fetches klines via the same source the
     launcher's poller uses (`HistoricalData.get_spot_klines`), and
-    runs per-bar replay over the sweep's replay window. The
-    SignalsTable saved next to each experiment_dir is THEN gated
-    by `assert_split_alignment` (split label == manifest's split)
-    and `assert_window_covers` (the table actually covers the
-    replay window) — both load-bearing.
+    runs per-bar replay over the sweep's replay window.
 
     Trainer init is amortised per `exp_dir` so the ~20 s ClickHouse
     fetch only happens once per experiment, not per decoder.
 
-    Returns (tables, klines). The klines are the SAME slice fed to
-    SignalsTable build — bar-level CSCV PBO downstream can reuse
-    them for `(close[next] - close[t]) / close[t]` per-bar returns
-    without a second fetch (auditor round-7 fix making the
-    SignalsTable load-bearing for the CPCV statistic).
+    Auditor (post-v2.0.2): now returns ONLY the tables (klines were
+    a residual return value from the bar-level CPCV that v2.0.2
+    replaced with day-level deployed-strategy returns). The tables
+    are the sweep-time PARITY REFERENCE for runtime predictions —
+    `assert_signals_parity` in `_signals_builder.py` checks them
+    against the captured `produce_signal` outputs per window.
     """
     from limen import HistoricalData, Trainer
     by_exp_dir: dict[Path, list[tuple[int, int]]] = {}
@@ -561,7 +606,6 @@ def _build_and_save_signals_tables(
         by_exp_dir.setdefault(exp_dir, []).append((perm_id, display_id))
     historical = HistoricalData()
     tables: dict[str, SignalsTable] = {}
-    last_klines: pl.DataFrame | None = None
     for exp_dir, decoders in by_exp_dir.items():
         trainer = Trainer(exp_dir)
         manifest = trainer._manifest
@@ -583,7 +627,6 @@ def _build_and_save_signals_tables(
             kline_size=kline_size,
             start_date_limit=DEFAULT_START_DATE_LIMIT,
         )
-        last_klines = klines
         sensors = trainer.train([pid for pid, _ in decoders])
         for (perm_id, display_id), sensor in zip(decoders, sensors, strict=True):
             round_params = dict(
@@ -600,13 +643,7 @@ def _build_and_save_signals_tables(
             table.assert_window_covers(replay_start, replay_end)
             table.save(exp_dir / 'signals_tables')
             tables[decoder_id] = table
-    if last_klines is None:
-        msg = (
-            'sweep signals: no klines were fetched (picks is empty?). '
-            'Cannot proceed to CPCV PBO without bar-return data.'
-        )
-        raise ValueError(msg)
-    return tables, last_klines
+    return tables
 
 
 def _print_sweep_signals_summary(

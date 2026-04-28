@@ -367,26 +367,23 @@ def _maybe_assert_parity(
             )
         return 0
     reference = Path(args.check_parity_vs)
-    from backtest_simulator.exceptions import ParityViolation
     from backtest_simulator.honesty.ledger_parity import (
         ParityTolerance,
         assert_ledger_parity,
     )
     tolerance = ParityTolerance[args.parity_tolerance.upper()]
-    try:
-        assert_ledger_parity(
-            backtest_event_spine=spine_path,
-            paper_event_spine=reference,
-            tolerance=tolerance,
-        )
-    except ParityViolation as exc:
-        if emit_human:
-            print(
-                f'bts run         parity FAIL  vs={reference}  '
-                f'tolerance={args.parity_tolerance}  n_events={n_events}',
-            )
-        sys.stderr.write(f'{exc}\n')
-        return 1
+    # Auditor: do NOT catch ParityViolation. The repo's
+    # `check_no_swallowed_violations.py` gate forbids any honesty-
+    # violation catch in production code — they must reach the test
+    # boundary unswallowed. Letting the exception propagate makes
+    # `bts run --check-parity-vs` exit with a Python traceback on
+    # divergence (operator sees the violation directly), and the
+    # gate stays clean.
+    assert_ledger_parity(
+        backtest_event_spine=spine_path,
+        paper_event_spine=reference,
+        tolerance=tolerance,
+    )
     if emit_human:
         print(
             f'bts run         parity PASS  vs={reference}  '

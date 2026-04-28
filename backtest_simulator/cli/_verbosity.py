@@ -63,8 +63,8 @@ def _silence_tqdm_and_structlog() -> None:
     here — if either is absent, the bts venv is misconfigured and
     we want a loud ImportError, not a silent no-op.
     """
-    import tqdm as _tqdm
     import structlog
+    import tqdm as _tqdm
     _tqdm.tqdm = lambda iterable=None, *_a, **_kw: iterable if iterable is not None else iter(())
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR),
