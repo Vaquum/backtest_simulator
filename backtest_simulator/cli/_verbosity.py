@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import logging
 import warnings
+from collections.abc import Callable, Iterable, Iterator
 from typing import Final
 
 _VERBOSITY_TO_LEVEL: Final[dict[int, int]] = {
@@ -66,6 +67,9 @@ def _silence_tqdm_and_structlog() -> None:
     import structlog
     import tqdm as _tqdm
 
+    def _noop(*_a: object, **_kw: object) -> None:
+        return None
+
     class _NoopTqdm:
         # zero-bang post-auditor-4 P1: replaces a bare `iter(())`
         # passthrough that broke tqdm's manual-mode API
@@ -73,16 +77,19 @@ def _silence_tqdm_and_structlog() -> None:
         # any other attribute (.update, .set_description, .close,
         # .refresh, etc.) returns a no-op via __getattr__. Also a
         # no-op context manager.
-        def __init__(self, iterable: object = None, *_a: object, **_kw: object) -> None:
-            self._iterable = iterable
+        def __init__(
+            self, iterable: Iterable[object] | None = None,
+            *_a: object, **_kw: object,
+        ) -> None:
+            self._iterable: Iterable[object] = iterable if iterable is not None else ()
 
-        def __iter__(self) -> object:
-            return iter(self._iterable) if self._iterable is not None else iter(())
+        def __iter__(self) -> Iterator[object]:
+            return iter(self._iterable)
 
-        def __getattr__(self, _name: str) -> object:
-            return lambda *_a, **_kw: None
+        def __getattr__(self, _name: str) -> Callable[..., None]:
+            return _noop
 
-        def __enter__(self) -> object:
+        def __enter__(self) -> _NoopTqdm:
             return self
 
         def __exit__(self, *_args: object) -> None:
