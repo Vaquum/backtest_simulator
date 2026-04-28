@@ -181,8 +181,6 @@ def _run(args: argparse.Namespace) -> int:
     )
     trades_raw = result['trades']
     stops_raw = result['declared_stops']
-    assert isinstance(trades_raw, list)
-    assert isinstance(stops_raw, dict)
     if args.output_format == 'json':
         report = {
             'decoder_id': display_id,
@@ -284,7 +282,7 @@ def _run(args: argparse.Namespace) -> int:
         # + stderr only (no extra stdout lines).
         return _maybe_assert_parity(args, result, emit_human=False)
     trades = [Trade(*row) for row in trades_raw]
-    declared_stops = {k: Decimal(str(v)) for k, v in stops_raw.items()}
+    declared_stops = {k: Decimal(v) for k, v in stops_raw.items()}
     slip_raw = result.get('slippage_realised_cost_bps')
     slip_cost = None if slip_raw is None else Decimal(str(slip_raw))
     impact_raw = result.get('market_impact_realised_bps')
@@ -293,28 +291,22 @@ def _run(args: argparse.Namespace) -> int:
         display_id, window_start.date().isoformat(), trades,
         declared_stops,
         slippage_cost_bps=slip_cost,
-        slippage_n_samples=int(result.get('slippage_n_samples', 0)),
-        slippage_n_excluded=int(result.get('slippage_n_excluded', 0)),
+        slippage_n_samples=result['slippage_n_samples'],
+        slippage_n_excluded=result['slippage_n_excluded'],
         market_impact_realised_bps=impact_bps,
-        market_impact_n_samples=int(result.get(
-            'market_impact_n_samples', 0,
-        )),
-        market_impact_n_flagged=int(result.get(
-            'market_impact_n_flagged', 0,
-        )),
-        market_impact_n_uncalibrated=int(result.get(
-            'market_impact_n_uncalibrated', 0,
-        )),
+        market_impact_n_samples=result['market_impact_n_samples'],
+        market_impact_n_flagged=result['market_impact_n_flagged'],
+        market_impact_n_uncalibrated=result['market_impact_n_uncalibrated'],
     )
     # Slice #17 Task 11 — book-gap one-liner. Surface ONLY when at
     # least one STOP/TP fired (codex round 1: skip noise on quiet
     # runs). The line lives after print_run's cost-metric line so
     # operators don't have to grep for it.
-    book_gap_n = int(result.get('book_gap_n_observed', 0))
+    book_gap_n = result['book_gap_n_observed']
     if book_gap_n > 0:
         print(
-            f'   book_gap   max={result.get("book_gap_max_seconds", 0.0):.3f}s  '
-            f'p95={result.get("book_gap_p95_seconds", 0.0):.3f}s  '
+            f'   book_gap   max={result["book_gap_max_seconds"]:.3f}s  '
+            f'p95={result["book_gap_p95_seconds"]:.3f}s  '
             f'n_stops={book_gap_n}',
         )
     return _maybe_assert_parity(args, result)
@@ -338,7 +330,8 @@ def _maybe_assert_parity(
     round-5 P1).
     """
     spine_path_raw = result.get('event_spine_jsonl')
-    n_events = int(result.get('event_spine_n_events', 0))
+    n_events_raw = result.get('event_spine_n_events', 0)
+    n_events = n_events_raw if isinstance(n_events_raw, int) else 0
     if not isinstance(spine_path_raw, str):
         if args.check_parity_vs is not None:
             sys.stderr.write(
