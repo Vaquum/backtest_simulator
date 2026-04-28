@@ -1066,7 +1066,23 @@ class BacktestLauncher(Launcher):
         """Ask `launch()` to return. Outer harness uses this at window end."""
         self._stop_event.set()
 
-    def _run_nexus_instance(
+    def _start_nexus_instances(self) -> None:
+        # Spawn at this level (instead of overriding _run_nexus_instance)
+        # to avoid pyright's false-positive invariance check on
+        # Queue[TradeOutcome] at the cross-module override site.
+        if self._trading is None or self._loop is None:
+            msg = 'trading not started'
+            raise RuntimeError(msg)
+        for inst in self._instances:
+            t = threading.Thread(
+                target=self._run_my_nexus_instance,
+                args=(inst, self._outcome_queues[inst.account_id]),
+                daemon=True, name=f'nexus-{inst.account_id}',
+            )
+            self._nexus_threads.append(t)
+            t.start()
+
+    def _run_my_nexus_instance(
         self, inst: InstanceConfig, outcome_queue: queue.Queue[TradeOutcome],
     ) -> None:
         """Mirror praxis.Launcher._run_nexus_instance but wire `action_submit`.
