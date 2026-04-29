@@ -263,7 +263,8 @@ def _run_buy_hold_on_tape(
     )
     submit = None
     if outbound is not None:
-        pipeline, _controller, capital_state = build_validation_pipeline(
+        pipeline, controller, capital_state = build_validation_pipeline(
+            nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
             capital_pool=_INITIAL_CAPITAL,
         )
         bindings = SubmitterBindings(
@@ -273,6 +274,7 @@ def _run_buy_hold_on_tape(
             state=InstanceState(capital=capital_state),
             praxis_outbound=cast(PraxisOutbound, outbound),
             validation_pipeline=pipeline,
+            capital_controller=controller,
             strategy_budget=_INITIAL_CAPITAL,
         )
         submit = build_action_submitter(bindings)

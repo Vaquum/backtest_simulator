@@ -1,3 +1,55 @@
+# v2.0.6
+
+Validator-parity slice — five Nexus pipeline stages that were `_allow`
+stubs now run real `validate_*_stage` calls, mirroring Praxis paper-
+trade's `_build_validation_pipeline` with MMVP-lenient defaults
+(`RiskStageLimits()`, `PlatformLimitsStageLimits()`, `HealthStagePolicy()`,
+`PriceStageLimits` derived from `nexus_config`). Operator-supplied
+limits dial in real denial behavior — same dials Praxis exposes, no
+bts-specific knobs invented.
+
+## Real validators wired
+
+`backtest_simulator/honesty/capital.py::build_validation_pipeline`
+deletes `_allow_stage` and binds:
+
+- INTAKE → `validate_intake_stage(context, build_default_intake_hooks(nexus_config))`
+- RISK → `validate_risk_stage(context, RiskStageLimits())`
+- PRICE → `validate_price_stage(context, build_price_stage_limits_from_config(nexus_config), price_snapshot_provider())`
+- CAPITAL → unchanged (already real)
+- HEALTH → `validate_health_stage(context, health_snapshot_provider(), HealthStagePolicy())`
+- PLATFORM_LIMITS → `validate_platform_limits_stage(context, PlatformLimitsStageLimits(), platform_snapshot_provider())`
+
+The signature gains `nexus_config: InstanceConfig` (required), plus
+keyword-only `risk_limits`, `health_policy`, `platform_limits`, and
+three snapshot providers — same shape as Praxis.
+
+## Documented divergence (carried forward)
+
+Two parity gaps remain explicit-in-source rather than stubbed:
+
+1. `_check_declared_stop` and `_check_atr_sanity` continue to run as
+   bts-side INTAKE pre-hooks because `ValidationRequestContext` does
+   not expose `action.execution_params['stop_price']`. Their
+   docstrings now cite the closure path (Nexus PR extending the
+   context).
+2. The SELL close fast-path in `action_submitter._submit_translated`
+   stays in place because (a) the long-only strategy template does
+   not propagate `Action.trade_id` from BUY to SELL, and (b)
+   `CapitalController` has no `close_position` primitive. Both
+   resolutions are upstream Nexus/strategy work; the source comment
+   spells out the debt explicitly.
+
+## Test surface
+
+`tests/honesty/test_validation_parity.py` adds 11 tests:
+- `_allow_stage` AST-absent
+- All 6 stages bound to non-`_allow_stage` callables
+- Per-stage end-to-end denials (INTAKE × 2, PRICE, RISK, HEALTH,
+  PLATFORM_LIMITS) via `nexus_config` / limits / snapshot providers
+- INTAKE pre-hook docstrings cite parity divergence
+- SELL fast-path divergence documented in source
+
 # v2.0.5
 
 Package-cleanup slice — no functional change. Drops operator-local

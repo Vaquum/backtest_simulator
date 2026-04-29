@@ -21,6 +21,7 @@ from nexus.core.validator.pipeline_models import (
     ValidationRequestContext,
     ValidationStage,
 )
+from nexus.instance_config import InstanceConfig as NexusInstanceConfig
 
 from backtest_simulator.honesty import (
     CapitalLifecycleTracker,
@@ -63,6 +64,7 @@ def _ctx(
 
 def test_build_pipeline_has_all_six_stages() -> None:
     pipeline, _controller, _state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     stages = set(pipeline.stage_order)
@@ -80,6 +82,7 @@ def test_pipeline_accepts_affordable_enter() -> None:
     # Affordable: notional well under budget, CAPITAL approves,
     # other stages are _allow passes. Decision carries a reservation.
     pipeline, _controller, state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     # Reuse the pipeline's CapitalState — that's what CAPITAL reads.
@@ -106,6 +109,7 @@ def test_pipeline_denies_per_trade_limit_breach() -> None:
     # 15% per-trade cap: a 20k notional against a 100k budget is
     # 20% and must be denied at CAPITAL.
     pipeline, _controller, state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     ctx = _ctx(notional=Decimal('20000'), fees=Decimal('0'), budget=Decimal('100000'))
@@ -130,6 +134,7 @@ def _instance_state_sharing(capital_state):
 def test_lifecycle_happy_path() -> None:
     # Walk the 4-step lifecycle end-to-end: reserve → send → ack → fill.
     pipeline, controller, state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = CapitalLifecycleTracker(controller)
@@ -163,6 +168,7 @@ def test_lifecycle_happy_path() -> None:
 
 def test_lifecycle_fail_loud_on_skip_reservation() -> None:
     _pipeline, controller, _state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = CapitalLifecycleTracker(controller)
@@ -173,6 +179,7 @@ def test_lifecycle_fail_loud_on_skip_reservation() -> None:
 
 def test_lifecycle_fail_loud_on_fill_before_send() -> None:
     pipeline, controller, state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = CapitalLifecycleTracker(controller)
@@ -203,6 +210,7 @@ def test_lifecycle_fail_loud_on_fill_before_send() -> None:
 
 def test_declared_stop_lookup_roundtrip() -> None:
     _pipeline, controller, _state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = CapitalLifecycleTracker(controller)
@@ -220,11 +228,12 @@ def test_declared_stop_lookup_roundtrip() -> None:
 
 def test_record_rejection_releases_reservation() -> None:
     _pipeline, controller, state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = CapitalLifecycleTracker(controller)
     # Reserve via pipeline so the controller has the reservation.
-    _pipeline, _, _ = build_validation_pipeline(capital_pool=Decimal('100000'))
+    _pipeline, _, _ = build_validation_pipeline(nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'), capital_pool=Decimal('100000'))
     # Use the same controller for the tracker's pipeline.
     # (build_validation_pipeline creates a fresh controller each call.)
     ctx = _ctx()
@@ -262,6 +271,7 @@ def test_mutation_fill_without_pending_raises() -> None:
     # Injected bug: a hypothetical path calls record_ack_and_fill
     # without a prior record_reservation. Must not silently no-op.
     _pipeline, controller, _state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = CapitalLifecycleTracker(controller)
@@ -276,6 +286,7 @@ def test_mutation_double_fill_raises() -> None:
     # Injected bug: record_ack_and_fill called twice on the same
     # command_id. The second call must fail because pending is popped.
     pipeline, controller, state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = CapitalLifecycleTracker(controller)

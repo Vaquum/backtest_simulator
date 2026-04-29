@@ -12,6 +12,7 @@ from enum import Enum
 from types import SimpleNamespace
 from typing import cast
 
+from nexus.core.capital_controller.capital_controller import CapitalController
 from nexus.core.domain.enums import OrderSide
 from nexus.core.domain.instance_state import InstanceState
 from nexus.core.domain.order_types import ExecutionMode as _NexusExecutionMode
@@ -112,6 +113,8 @@ _ACTION_TYPE_TO_VALIDATION_ACTION: dict[ActionType, ValidationAction] = {
     ActionType.MODIFY: ValidationAction.MODIFY,
     ActionType.ABORT: ValidationAction.ABORT,
 }
+
+
 
 
 # --- Nexus -> Praxis enum converters ----------------------------------------
@@ -291,6 +294,16 @@ class SubmitterBindings:
     state: InstanceState
     praxis_outbound: PraxisOutbound
     validation_pipeline: ValidationPipeline
+    # Slice #28 — pipeline.validate's CAPITAL stage runs before
+    # HEALTH/PLATFORM_LIMITS, so a denial from a later stage carries
+    # the reservation forward (per nexus pipeline_executor). Without
+    # explicit release, available capital leaks. The action_submitter
+    # uses this controller to release reservations attached to denied
+    # decisions; the launcher constructs both pipeline + controller
+    # from the same `build_validation_pipeline` call so they share
+    # state. REQUIRED — making it optional would let a caller silently
+    # regress to the leak shape (slice-#28 audit, finding 5).
+    capital_controller: CapitalController
     strategy_budget: Decimal
     touch_provider: Callable[[str], Decimal | None] | None = None
     tick_provider: Callable[[str], Decimal] | None = None
@@ -335,10 +348,16 @@ def build_action_submitter(
         calls can tie back to the original reservation.
       - `on_submit` is the pre-existing drain hook the clock loop uses.
 
-    The only stage this pipeline actually enforces in Part 2 is CAPITAL;
-    INTAKE / RISK / PRICE / HEALTH / PLATFORM_LIMITS are `_allow` stubs
-    as documented in `backtest_simulator.honesty.capital`. ABORT flows
-    through `praxis_outbound.send_abort` unchanged.
+    Slice #28: every Nexus pipeline stage runs a real `validate_*_stage`
+    call. INTAKE / RISK / PRICE / CAPITAL / HEALTH / PLATFORM_LIMITS are
+    all backed by their respective Nexus validators with MMVP-lenient
+    defaults; operator-supplied limits + snapshot providers in
+    `backtest_simulator.honesty.capital.build_validation_pipeline` dial
+    in real denial behavior. CAPITAL runs before HEALTH/PLATFORM_LIMITS
+    in stage order, so a late-stage denial that carries the reservation
+    forward triggers an explicit `capital_controller.release_reservation`
+    in `_submit_translated`. ABORT flows through `praxis_outbound.send_abort`
+    unchanged.
     """
     def _submit(actions: list[Action], strategy_id: str) -> None:
         for raw_action in actions:
@@ -430,14 +449,14 @@ def _submit_translated(
         strategy_id=strategy_id, action=action,
         strategy_budget=bindings.strategy_budget,
     )
-    # Part 2 INTAKE hook: declared-stop enforcement. Long-only strategy
-    # convention — BUY opens a long (requires protective stop), SELL
-    # closes a long (is itself the exit, no new stop). The hook runs
-    # BEFORE `validation_pipeline.validate` because the pipeline's
-    # INTAKE stage is `_allow` in Part 2 and the stop is carried on
-    # `action.execution_params`, which isn't accessible from within a
-    # `StageValidator`. Slice #17 Task 29 layers the ATR sanity check
-    # on top: stop must be ≥ `gate.k * ATR(window)` from entry.
+    # BTS-side INTAKE pre-hook supplementing the real Nexus INTAKE stage.
+    # Slice #28 lit up the pipeline's INTAKE with real
+    # `validate_intake_stage(...)` checks; these two hooks layer on top
+    # because the data they need (`execution_params['stop_price']`) is
+    # not on `ValidationRequestContext`. Closure path: a Nexus PR
+    # extending `ValidationRequestContext.execution_params`. Long-only
+    # strategy convention — BUY opens a long (requires protective stop),
+    # SELL closes a long (is itself the exit, no new stop).
     intake_decision = _check_declared_stop(action, context)
     if intake_decision is None:
         intake_decision = _check_atr_sanity(
@@ -455,25 +474,23 @@ def _submit_translated(
             context.command_id,
         )
         return None
-    # SELL ENTER in our long-only strategy is the EXIT LEG of an
-    # already-open long — it reduces an existing position rather than
-    # opening a new one. The action_submitter fast-path skips
-    # `validation_pipeline.validate` (and therefore the CAPITAL
-    # reservation) — see TODO Task 27 for the architectural
-    # decision: `CapitalController` has no `close_position`
-    # primitive, so routing the SELL through `validate` would
-    # either over-reserve (CAPITAL.check_and_reserve always
-    # adds claim) or no-op (the current skip), neither of which
-    # is the canonical close lifecycle. Instead the close lands
-    # in the launcher's adapter wrapper post-fill via
-    # `CapitalLifecycleTracker.record_close_position`, which
-    # mirrors `CapitalController.order_fill` exactly: releases
+    # SELL fast-path: long-only convention treats `SELL+ENTER` as the
+    # close of an open long. The fast-path bypasses
+    # `validation_pipeline.validate` because (a) the bts long-only
+    # strategy template emits SELLs without propagating the BUY's
+    # `trade_id`, so `make_reference_integrity_hook` would deny every
+    # close with `INTAKE_TRADE_REFERENCE_INVALID`; (b) `CapitalController`
+    # has no `close_position` primitive, so a real CAPITAL stage on
+    # SELL would over-reserve. Closure path: a Nexus PR adding
+    # `close_position` AND a strategy-template change to propagate
+    # `trade_id` from BUY to SELL. Both upstream; tracked as
+    # follow-up. The bts-side close accounting still lands in the
+    # launcher's adapter wrapper via
+    # `CapitalLifecycleTracker.record_close_position`, which mirrors
+    # `CapitalController.order_fill` exactly: releases
     # `cost_basis + entry_fees` from `position_notional` and
-    # decrements `per_strategy_deployed[strategy_id]` by the
-    # same amount. `capital_pool` stays untouched (immutable
-    # strategy budget; SELL proceeds are realized PnL, not new
-    # budget). Realized PnL surfaces on the lifecycle log line
-    # and as the trade-pair PnL in `cli/_metrics.print_run`.
+    # decrements `per_strategy_deployed[strategy_id]`. `capital_pool`
+    # stays untouched.
     if action.direction == OrderSide.SELL:
         decision = ValidationDecision(allowed=True)
         cmd = translate_to_trade_command(
@@ -482,7 +499,7 @@ def _submit_translated(
         cmd = _to_praxis_enums(cmd)
         command_id = bindings.praxis_outbound.send_command(cmd)
         _log.info(
-            'backtest action submitted (SELL close — CAPITAL skipped)',
+            'backtest action submitted (SELL close — pipeline bypassed)',
             extra={
                 'strategy_id': strategy_id,
                 'action_type': action.action_type.value,
@@ -492,6 +509,34 @@ def _submit_translated(
         return command_id, decision, context
     decision = bindings.validation_pipeline.validate(context)
     if not decision.allowed:
+        # Slice #28: CAPITAL is stage 4 of 6, so HEALTH/PLATFORM_LIMITS
+        # denials carry the CAPITAL-stage reservation forward in the
+        # denied decision (nexus pipeline_executor preserves it). The
+        # action is dropped without reaching Praxis, so no fill / no
+        # `order_ack` / no `order_fill` will retire the reservation.
+        # Release it explicitly so available capital is not leaked.
+        if decision.reservation is not None:
+            release_result = bindings.capital_controller.release_reservation(
+                decision.reservation.reservation_id,
+            )
+            if not release_result.success:
+                # Fail loud — the reservation was just minted by the same
+                # pipeline.validate() call on the same controller; any
+                # non-success here is a wiring/state bug (controller
+                # mismatch, concurrent release, lost reservation), not an
+                # expected race. Mirrors `CapitalLifecycleTracker.record_rejection`'s
+                # pattern at honesty/capital.py:461. Letting the bug
+                # through with a warning would silently re-introduce
+                # the very leak this branch exists to prevent
+                # (bit-mis no-defects-conviction P1).
+                msg = (
+                    f'pipeline-denied reservation release failed: '
+                    f'reservation_id={decision.reservation.reservation_id} '
+                    f'failed_stage={decision.failed_stage} '
+                    f'reason={release_result.reason!r} '
+                    f'category={release_result.category}'
+                )
+                raise RuntimeError(msg)
         _log.warning(
             'validation denied: stage=%s reason_code=%s message=%s command_id=%s',
             decision.failed_stage.value if decision.failed_stage else None,
@@ -611,6 +656,15 @@ def _check_declared_stop(
 ) -> ValidationDecision | None:
     """Deny BUY-ENTER that lacks a declared stop_price.
 
+    BTS-side pre-hook supplementing the real Nexus INTAKE stage.
+    Slice #28 lit up `validate_intake_stage` (order-rate, duplicate-
+    window, reference-integrity, mode, notional, budget). This hook
+    runs in addition because `ValidationRequestContext` does not carry
+    `action.execution_params['stop_price']` and the stop check needs
+    that field. Closure path: a Nexus PR extending
+    `ValidationRequestContext.execution_params` lets this hook
+    collapse into the pipeline's INTAKE stage.
+
     The long-only strategy template writes stop_price onto
     `execution_params['stop_price']` for BUYs only (SELLs close an
     open long and are themselves the exit). A missing stop on a BUY
@@ -650,6 +704,14 @@ def _check_atr_sanity(
 ) -> ValidationDecision | None:
     """Reject ENTER+BUY whose declared stop is closer than `k * ATR(window)`.
 
+    BTS-side pre-hook supplementing the real Nexus INTAKE stage. The
+    pipeline's INTAKE runs `validate_intake_stage` with the standard
+    Praxis hooks; this ATR-floor hook runs in addition because the
+    data it needs (`execution_params['stop_price']` plus the symbol's
+    pre-decision ATR window) is not on `ValidationRequestContext`.
+    Closure path: a Nexus PR extending `ValidationRequestContext` so
+    this floor lands inside `validate_intake_stage` itself.
+
     Slice #17 Task 29 closes the R-denominator gameability vector
     `_check_declared_stop` only half-blocks: a 1 bp stop reaches
     Praxis untouched and the R̄ in `bts sweep` becomes a knob the
@@ -658,24 +720,12 @@ def _check_atr_sanity(
     missing (caller already handled), or when ATR allows. Else
     returns a denial with reason_code prefixed `ATR_`.
 
-    BTS-ONLY contract — accepted divergence vs paper/live. Audit
-    round 2 P1 flagged this: the gate runs in action_submitter
-    BEFORE `validation_pipeline.validate()` and BEFORE any
-    command reaches Praxis, so a backtest can deny an entry that
-    paper/live would still take. The asymmetry is accepted because
-    the gate is bts-measurement-protection, not paper/live
-    behavior modeling — paper/live measures realized PnL, bts
-    measures R-multiples on R̄, and only the latter is
-    gameable by tightening stops. The same shape applies to
-    `_check_declared_stop` (which also runs as a bts-side
-    INTAKE shim, since Nexus's `ValidationRequestContext` does
-    not expose `execution_params['stop_price']` to a
-    `StageValidator`). Upstreaming this floor to paper/live
-    requires either (a) extending `ValidationRequestContext` so
-    Nexus's pipeline can read `stop_price` (Nexus PR), or (b)
-    moving the floor into the strategy template itself so it
-    runs upstream of any deployment. Either is out of slice
-    scope; tracked as a follow-up.
+    BTS-only floor — paper/live measures realized PnL, bts measures
+    R-multiples on R̄, and only the latter is gameable by tightening
+    stops. Upstreaming this floor to paper/live requires either (a)
+    the Nexus context extension above, or (b) moving the floor into
+    the strategy template itself so it runs upstream of any
+    deployment. Both are out of slice scope.
 
     Entry-price proxy priority (codex round 1 P1: must match the
     R-denominator's actual entry — a stale seed price drifts vs

@@ -29,6 +29,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from nexus.core.domain.operational_mode import OperationalMode
+from nexus.instance_config import InstanceConfig as NexusInstanceConfig
 from nexus.strategy.context import StrategyContext
 from nexus.strategy.params import StrategyParams
 from nexus.strategy.signal import Signal
@@ -120,7 +121,6 @@ def test_sanity_zero_trade_through_real_action_submitter() -> None:
 
     from nexus.core.validator.pipeline_models import InstanceState
     from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
-    from nexus.instance_config import InstanceConfig as NexusInstanceConfig
 
     from backtest_simulator.honesty import (
         assert_conservation,
@@ -145,6 +145,7 @@ def test_sanity_zero_trade_through_real_action_submitter() -> None:
 
     initial_pool = Decimal('100000')
     pipeline, controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=initial_pool,
     )
 
@@ -173,6 +174,7 @@ def test_sanity_zero_trade_through_real_action_submitter() -> None:
         state=InstanceState(capital=capital_state),
         praxis_outbound=cast(PraxisOutbound, outbound),
         validation_pipeline=pipeline,
+            capital_controller=controller,
         strategy_budget=Decimal('100000'),
     )
     submit = build_action_submitter(bindings)

@@ -308,7 +308,8 @@ def _run_production_path(seed: int, trades: pl.DataFrame, signal_times: list[dat
     in Tasks 2/3/4. Returns the outbound command count for assertion
     by the caller against the strategy's emitted action count.
     """
-    pipeline, _controller, capital_state = build_validation_pipeline(
+    pipeline, controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=_INITIAL_CAPITAL,
     )
     outbound = _OutboundCapture()
@@ -320,6 +321,7 @@ def _run_production_path(seed: int, trades: pl.DataFrame, signal_times: list[dat
         state=InstanceState(capital=capital_state),
         praxis_outbound=cast(PraxisOutbound, outbound),
         validation_pipeline=pipeline,
+            capital_controller=controller,
         strategy_budget=_INITIAL_CAPITAL,
     )
     submit = build_action_submitter(bindings)

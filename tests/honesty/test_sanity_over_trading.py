@@ -211,7 +211,8 @@ def test_sanity_over_trading() -> None:
     n_signals = 20  # 10 BUY + 10 SELL = 10 round-trip pairs
     trades, signal_times = _paired_zero_gross_tape(n_signals)
     initial_pool = Decimal('100000')
-    pipeline, _controller, capital_state = build_validation_pipeline(
+    pipeline, controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=initial_pool,
     )
     outbound = _OutboundCapture()
@@ -223,6 +224,7 @@ def test_sanity_over_trading() -> None:
         state=InstanceState(capital=capital_state),
         praxis_outbound=cast(PraxisOutbound, outbound),
         validation_pipeline=pipeline,
+            capital_controller=controller,
         strategy_budget=initial_pool,
     )
     submit = build_action_submitter(bindings)

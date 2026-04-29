@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "backtest_simulator"
-version = "2.0.5"
+version = "2.0.6"
 description = "Honest, gate-enforced backtester for unmodified Nexus strategies against unmodified Praxis."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -188,6 +188,15 @@ max-statements = 50
 # VenueAdapter Protocol signature (10 args). A helper-extraction
 # refactor would break the runtime_checkable isinstance() check.
 "backtest_simulator/venue/simulated.py" = ["PLR0913"]
+# `build_validation_pipeline` mirrors Praxis's `_build_validation_pipeline`
+# parameter shape (slice #28). The 9 kwargs (`nexus_config`,
+# `capital_pool`, `reservation_ttl_seconds`, three optional
+# limits/policy injection points, three snapshot providers) are the
+# real parity surface — collapsing them into a config bundle would
+# diverge from the Praxis reference and lose the per-stage knob
+# clarity. Same posture as `launcher.py`'s VenueAdapter Protocol
+# exemption above: the parameter count is the contract.
+"backtest_simulator/honesty/capital.py" = ["PLR0913"]
 # launcher.py's `wrapped_submit` mirrors the 9-param Praxis Protocol
 # signature (it wraps SimulatedVenueAdapter.submit_order without
 # changing arity).

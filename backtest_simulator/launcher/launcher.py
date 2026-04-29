@@ -1126,6 +1126,7 @@ class BacktestLauncher(Launcher):
         manifest = load_manifest(inst.manifest_path)
         allocated_capital = manifest.allocated_capital
         pipeline, controller, capital_state = build_validation_pipeline(
+            nexus_config=nexus_config,
             capital_pool=allocated_capital,
         )
         state = InstanceState(capital=capital_state)
@@ -1159,6 +1160,7 @@ class BacktestLauncher(Launcher):
                 nexus_config=nexus_config, state=state,
                 praxis_outbound=praxis_outbound,
                 validation_pipeline=pipeline,
+                capital_controller=controller,
                 strategy_budget=allocated_capital,
                 touch_provider=touch_provider,
                 tick_provider=tick_provider,

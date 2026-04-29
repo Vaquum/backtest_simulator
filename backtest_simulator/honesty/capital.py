@@ -1,22 +1,22 @@
-"""Real-CAPITAL ValidationPipeline + 4-step CapitalController lifecycle driver."""
+"""Real six-stage ValidationPipeline + 4-step CapitalController lifecycle driver."""
 from __future__ import annotations
 
-# Part 2 invariant: every ENTER/EXIT action that reaches the venue
-# adapter must have first cleared the real Nexus CAPITAL validator AND
-# must pass through `check_and_reserve → send_order → order_ack →
-# order_fill` on a shared `CapitalController`. The other five validator
-# stages (INTAKE / RISK / PRICE / HEALTH / PLATFORM_LIMITS) are wired to
-# an `_allow` stub because Part 2 scope is "CAPITAL real, others _allow"
-# per `TODO.md`; they will land as real checks in a follow-up slice.
+# Slice #28 (validator parity): every Nexus pipeline stage runs a real
+# `validate_*_stage` call; no `_allow` stubs. The wiring mirrors the
+# Praxis paper-trade reference at `praxis/launcher.py::_build_validation_pipeline`
+# — same intake-hook-built-once pattern, same MMVP-lenient defaults
+# (`RiskStageLimits()`, `PlatformLimitsStageLimits()`, `HealthStagePolicy()`,
+# `PriceStageLimits` from config). Operator-supplied limits dial in
+# real validator behavior by passing a configured `nexus_config` and
+# richer snapshot providers; no new bts-specific knobs are invented.
 #
-# `build_validation_pipeline` returns the configured
-# `nexus.core.validator.ValidationPipeline` plus its `CapitalController`.
-# The controller is the SHARED instance the action-submitter and the
-# venue-fill bridge both drive — the pipeline's CAPITAL stage calls
-# `check_and_reserve` during validation, and the `CapitalLifecycleTracker`
-# feeds `send_order`, `order_ack`, and `order_fill` back in as Praxis's
-# event spine produces `CommandAccepted`, `OrderSubmitted`, and
-# `FillReceived` events.
+# `build_validation_pipeline` returns the configured pipeline plus its
+# `CapitalController`. The controller is the SHARED instance the
+# action-submitter and the venue-fill bridge both drive — the
+# pipeline's CAPITAL stage calls `check_and_reserve` during validation,
+# and the `CapitalLifecycleTracker` feeds `send_order`, `order_ack`,
+# and `order_fill` back in as Praxis's event spine produces
+# `CommandAccepted`, `OrderSubmitted`, and `FillReceived` events.
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,37 +27,97 @@ from nexus.core.capital_controller.capital_controller import CapitalController
 from nexus.core.domain.capital_state import CapitalState
 from nexus.core.validator import ValidationPipeline
 from nexus.core.validator.capital_stage import validate_capital_stage
+from nexus.core.validator.health_stage import (
+    HealthStagePolicy,
+    HealthStageSnapshot,
+    validate_health_stage,
+)
+from nexus.core.validator.intake_stage import (
+    build_default_intake_hooks,
+    validate_intake_stage,
+)
 from nexus.core.validator.pipeline_models import (
     ValidationDecision,
     ValidationRequestContext,
     ValidationStage,
 )
+from nexus.core.validator.platform_limits_stage import (
+    PlatformLimitsStageLimits,
+    PlatformLimitsStageSnapshot,
+    validate_platform_limits_stage,
+)
+from nexus.core.validator.price_stage import (
+    PriceCheckSnapshot,
+    build_price_stage_limits_from_config,
+    validate_price_stage,
+)
+from nexus.core.validator.risk_stage import RiskStageLimits, validate_risk_stage
+from nexus.instance_config import InstanceConfig
 
 _log = logging.getLogger(__name__)
 
 
-def _allow_stage(_ctx: ValidationRequestContext) -> ValidationDecision:
-    """`_allow` stub: unconditionally pass.
+def _default_health_snapshot() -> HealthStageSnapshot:
+    """Return a neutral-healthy `HealthStageSnapshot` for MMVP-lenient health.
 
-    Used for the Part 2 stages we deliberately leave open (INTAKE,
-    RISK, PRICE, HEALTH, PLATFORM_LIMITS). The backtest is not a
-    production intake; all of those checks are gate-only-at-live
-    concerns (order_rate, book staleness, etc.) that would reject
-    honest historical hypotheses.
+    Mirrors `praxis/launcher.py::_default_health_snapshot`. With
+    `HealthStagePolicy()`'s thresholds all-None this snapshot allows
+    every action; only operator-supplied policy + snapshot pair fires
+    a denial.
     """
-    return ValidationDecision(allowed=True)
+    return HealthStageSnapshot(
+        latency_ms=Decimal(0),
+        consecutive_failures=Decimal(0),
+        failure_rate=Decimal(0),
+        rate_limit_headroom=Decimal(1),
+        clock_drift_ms=Decimal(0),
+    )
+
+
+def _default_platform_snapshot() -> PlatformLimitsStageSnapshot:
+    """Return an empty `PlatformLimitsStageSnapshot` for MMVP defaults."""
+    return PlatformLimitsStageSnapshot()
+
+
+def _default_price_snapshot() -> PriceCheckSnapshot | None:
+    """Return `None`; MMVP `PriceStageLimits` are all-unset by default.
+
+    Operator-supplied `nexus_config.max_spread_bps` together with a
+    real-tape-backed snapshot provider produces real PRICE denials.
+    A future tape-backed provider must NEVER paper over missing data
+    (e.g. by returning `Decimal('inf')` for `spread_bps`); a stale or
+    incomplete snapshot has to surface as a normal denial via
+    `PRICE_SYSTEM_DATA_UNAVAILABLE` so the operator sees the gap
+    rather than every BUY being silently rejected. Returning `None`
+    from this default keeps the gate disabled until a real provider
+    is wired.
+    """
+    return None
 
 
 def build_validation_pipeline(
     *,
+    nexus_config: InstanceConfig,
     capital_pool: Decimal,
     reservation_ttl_seconds: int = 86_400,
+    risk_limits: RiskStageLimits | None = None,
+    health_policy: HealthStagePolicy | None = None,
+    platform_limits: PlatformLimitsStageLimits | None = None,
+    health_snapshot_provider: Callable[[], HealthStageSnapshot] = _default_health_snapshot,
+    platform_snapshot_provider: Callable[[], PlatformLimitsStageSnapshot] = _default_platform_snapshot,
+    price_snapshot_provider: Callable[[], PriceCheckSnapshot | None] = _default_price_snapshot,
 ) -> tuple[ValidationPipeline, CapitalController, CapitalState]:
-    """Construct the Part 2 validator stack: CAPITAL real, others _allow.
+    """Build the six-stage validator pipeline that runs every backtest action.
 
-    Returns the pipeline, the `CapitalController` (the backtest
-    launcher drives its 4-step lifecycle), and the `CapitalState`
-    snapshot for conservation assertions.
+    Each stage closure captures stage-specific configuration derived
+    once from `nexus_config`; mutable runtime state (health snapshot,
+    platform snapshot, price snapshot) is read on every call via the
+    supplied providers. MMVP defaults are deliberately lenient — same
+    posture Praxis paper-trade ships (`RiskStageLimits()`,
+    `PlatformLimitsStageLimits()`, `HealthStagePolicy()` all
+    threshold-None; `PriceStageLimits` derived from config which
+    inherits the all-unset posture). Operator-supplied limits + a
+    configured `nexus_config` dial in real denial behavior.
 
     `reservation_ttl_seconds` defaults to 86_400 (one day) because
     backtest submission-to-fill spans frozen-minute main ticks that
@@ -70,18 +130,50 @@ def build_validation_pipeline(
     state = CapitalState(capital_pool=capital_pool)
     controller = CapitalController(state)
 
-    def capital_validator(context: ValidationRequestContext) -> ValidationDecision:
+    intake_hooks = build_default_intake_hooks(nexus_config)
+    resolved_risk_limits = risk_limits if risk_limits is not None else RiskStageLimits()
+    resolved_health_policy = (
+        health_policy if health_policy is not None else HealthStagePolicy()
+    )
+    resolved_platform_limits = (
+        platform_limits if platform_limits is not None
+        else PlatformLimitsStageLimits()
+    )
+    price_limits = build_price_stage_limits_from_config(nexus_config)
+
+    def intake(context: ValidationRequestContext) -> ValidationDecision:
+        return validate_intake_stage(context, hooks=intake_hooks)
+
+    def risk(context: ValidationRequestContext) -> ValidationDecision:
+        return validate_risk_stage(context, resolved_risk_limits)
+
+    def price(context: ValidationRequestContext) -> ValidationDecision:
+        return validate_price_stage(
+            context, price_limits, price_snapshot_provider(),
+        )
+
+    def capital(context: ValidationRequestContext) -> ValidationDecision:
         return validate_capital_stage(
             context, controller, ttl_seconds=reservation_ttl_seconds,
         )
 
+    def health(context: ValidationRequestContext) -> ValidationDecision:
+        return validate_health_stage(
+            context, health_snapshot_provider(), resolved_health_policy,
+        )
+
+    def platform(context: ValidationRequestContext) -> ValidationDecision:
+        return validate_platform_limits_stage(
+            context, resolved_platform_limits, platform_snapshot_provider(),
+        )
+
     validators: dict[ValidationStage, Callable[[ValidationRequestContext], ValidationDecision]] = {
-        ValidationStage.INTAKE: _allow_stage,
-        ValidationStage.RISK: _allow_stage,
-        ValidationStage.PRICE: _allow_stage,
-        ValidationStage.CAPITAL: capital_validator,
-        ValidationStage.HEALTH: _allow_stage,
-        ValidationStage.PLATFORM_LIMITS: _allow_stage,
+        ValidationStage.INTAKE: intake,
+        ValidationStage.RISK: risk,
+        ValidationStage.PRICE: price,
+        ValidationStage.CAPITAL: capital,
+        ValidationStage.HEALTH: health,
+        ValidationStage.PLATFORM_LIMITS: platform,
     }
     pipeline = ValidationPipeline(validators)
     return pipeline, controller, state

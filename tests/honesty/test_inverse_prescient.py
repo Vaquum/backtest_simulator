@@ -194,7 +194,8 @@ def _next_bar_label(prices: list[Decimal], i: int) -> int:
 def test_inverse_prescient_loses_catastrophically() -> None:
     """Sign-flipped prescient on alternating tape: per-pair PnL < 0, total <-1%."""
     trades, signal_times, prices = _alternating_tape()
-    pipeline, _controller, capital_state = build_validation_pipeline(
+    pipeline, controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=_INITIAL_CAPITAL,
     )
     outbound = _OutboundCapture()
@@ -206,6 +207,7 @@ def test_inverse_prescient_loses_catastrophically() -> None:
         state=InstanceState(capital=capital_state),
         praxis_outbound=cast(PraxisOutbound, outbound),
         validation_pipeline=pipeline,
+            capital_controller=controller,
         strategy_budget=_INITIAL_CAPITAL,
     )
     submit = build_action_submitter(bindings)

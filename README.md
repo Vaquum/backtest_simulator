@@ -40,7 +40,7 @@ In the wider Vaquum architecture, Origo sits upstream as the data layer; Limen p
 
 - One-symbol historical backtest with strict no-look-ahead and per-fill measurement against the trade tape
 - Real Praxis `VenueAdapter` Protocol implementation backed by historical trades (`SimulatedVenueAdapter`)
-- Real Nexus runtime — `BacktestLauncher` is a Praxis `Launcher` subclass; the wired `action_submit` path is the same six-stage `ValidationPipeline` the live system uses
+- Real Nexus runtime — `BacktestLauncher` is a Praxis `Launcher` subclass; the wired `action_submit` path is the same six-stage `ValidationPipeline` the live system uses, with each stage running the real `validate_*_stage` from `nexus.core.validator` (MMVP-lenient defaults — operator-supplied `nexus_config` / limits / snapshot providers dial in real denial behavior, same dials Praxis paper-trade exposes)
 - Slippage, market-impact, and maker-fill models calibrated on the same tape, measured per fill (not adjusted on `fill_price` — the audit rejected the double-counting design)
 - ATR R-denominator gameability gate: stop-distance must clear `k * ATR(window)` from entry or the order is rejected pre-fill
 - Book-gap instrumentation: `(trigger_time - prev_sub_stop_time)` recorded per STOP/TP fill, surfaced on `bts run --output-format json`

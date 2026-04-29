@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 from nexus.core.domain.capital_state import CapitalState
 from nexus.core.domain.enums import OrderSide
+from nexus.instance_config import InstanceConfig as NexusInstanceConfig
 
 from backtest_simulator.honesty import (
     CapitalLifecycleTracker,
@@ -78,6 +79,7 @@ def _tracker_with_pending(
 
 def test_overshoot_raises_capital_overshoot_error() -> None:
     _pipeline, _controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = _tracker_with_pending(capital_state, notional=Decimal('1000'))
@@ -124,6 +126,7 @@ def test_partially_filled_releases_residual_reservation() -> None:
     This test pins the expected-post-state invariants.
     """
     _pipeline, _controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = _tracker_with_pending(capital_state, notional=Decimal('1000'))
@@ -187,6 +190,7 @@ def test_expired_zero_fill_releases_reservation() -> None:
     (b) capital_state.reservation_notional != 0 (lock leaked).
     """
     _pipeline, _controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = _tracker_with_pending(capital_state, notional=Decimal('1000'))
@@ -240,6 +244,7 @@ def test_unmatched_buy_raises_runtime_error() -> None:
     # No pending reservation → a BUY that reaches the wrapper has
     # bypassed the CAPITAL gate. Must fail loud.
     _pipeline, _controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = CapitalLifecycleTracker(_controller)  # empty tracker
@@ -265,6 +270,7 @@ def test_unmatched_sell_is_accepted() -> None:
     # SELL-as-close has no pending reservation by design; the wrapper
     # must NOT raise for SELL.
     _pipeline, _controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = CapitalLifecycleTracker(_controller)
@@ -332,6 +338,7 @@ def test_buy_fill_records_open_position_through_wrapper() -> None:
     BUY side surfaces with a precise message.
     """
     _pipeline, _controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = _tracker_with_pending(capital_state, notional=Decimal('1000'))
@@ -384,6 +391,7 @@ def test_buy_then_sell_close_releases_position_and_attribution() -> None:
     over-deployment or silently double-books.
     """
     _pipeline, _controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = _tracker_with_pending(capital_state, notional=Decimal('1000'))
@@ -462,6 +470,7 @@ def test_partial_sell_close_shrinks_head_keeps_residual() -> None:
     in the ledger for the next SELL to finish.
     """
     _pipeline, _controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     tracker = _tracker_with_pending(capital_state, notional=Decimal('1000'))
@@ -530,6 +539,7 @@ def test_sell_close_without_open_position_raises() -> None:
     machine bug rather than silently corrupting capital.
     """
     _pipeline, _controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     from nexus.core.validator.capital_stage import CapitalController

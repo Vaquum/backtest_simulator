@@ -72,6 +72,11 @@ EXPECTED_RUFF_POLICY: Final[dict[str, object]] = {
         # signature exactly so it can replace the adapter's method
         # via setattr without breaking the Protocol.
         'backtest_simulator/launcher/launcher.py': ['PLR0913'],
+        # Slice #28: build_validation_pipeline mirrors Praxis's
+        # _build_validation_pipeline parameter shape. The 9 kwargs are
+        # the parity surface; collapsing them would diverge from
+        # Praxis and lose per-stage knob clarity.
+        'backtest_simulator/honesty/capital.py': ['PLR0913'],
         # M2 Task 1 (slice #17): the CLI subcommand modules
         # legitimately print() per-run summaries to stdout (the
         # operator's debug surface) and the sweep / run / pipeline
