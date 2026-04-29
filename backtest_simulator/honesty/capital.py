@@ -80,7 +80,18 @@ def _default_platform_snapshot() -> PlatformLimitsStageSnapshot:
 
 
 def _default_price_snapshot() -> PriceCheckSnapshot | None:
-    """Return `None`; MMVP `PriceStageLimits` are all-unset by default."""
+    """Return `None`; MMVP `PriceStageLimits` are all-unset by default.
+
+    Operator-supplied `nexus_config.max_spread_bps` together with a
+    real-tape-backed snapshot provider produces real PRICE denials.
+    A future tape-backed provider must NEVER paper over missing data
+    (e.g. by returning `Decimal('inf')` for `spread_bps`); a stale or
+    incomplete snapshot has to surface as a normal denial via
+    `PRICE_SYSTEM_DATA_UNAVAILABLE` so the operator sees the gap
+    rather than every BUY being silently rejected. Returning `None`
+    from this default keeps the gate disabled until a real provider
+    is wired.
+    """
     return None
 
 
