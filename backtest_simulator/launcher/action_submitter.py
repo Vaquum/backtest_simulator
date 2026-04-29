@@ -294,7 +294,6 @@ class SubmitterBindings:
     state: InstanceState
     praxis_outbound: PraxisOutbound
     validation_pipeline: ValidationPipeline
-    strategy_budget: Decimal
     # Slice #28 — pipeline.validate's CAPITAL stage runs before
     # HEALTH/PLATFORM_LIMITS, so a denial from a later stage carries
     # the reservation forward (per nexus pipeline_executor). Without
@@ -302,9 +301,10 @@ class SubmitterBindings:
     # uses this controller to release reservations attached to denied
     # decisions; the launcher constructs both pipeline + controller
     # from the same `build_validation_pipeline` call so they share
-    # state. Default-None for tests that don't care (a denied
-    # decision with reservation=None is a no-op release path).
-    capital_controller: CapitalController | None = None
+    # state. REQUIRED — making it optional would let a caller silently
+    # regress to the leak shape (slice-#28 audit, finding 5).
+    capital_controller: CapitalController
+    strategy_budget: Decimal
     touch_provider: Callable[[str], Decimal | None] | None = None
     tick_provider: Callable[[str], Decimal] | None = None
     # Slice #17 Task 29 — ATR R-denominator gameability gate.
@@ -515,7 +515,7 @@ def _submit_translated(
         # action is dropped without reaching Praxis, so no fill / no
         # `order_ack` / no `order_fill` will retire the reservation.
         # Release it explicitly so available capital is not leaked.
-        if decision.reservation is not None and bindings.capital_controller is not None:
+        if decision.reservation is not None:
             release_result = bindings.capital_controller.release_reservation(
                 decision.reservation.reservation_id,
             )

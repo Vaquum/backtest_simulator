@@ -152,7 +152,7 @@ def test_sanity_buy_hold() -> None:
     """Buy at first signal, hold, sell at last; return within ±5 bps of reference."""
     trades = _trades_dataframe()
     initial_pool = Decimal('100000')
-    pipeline, _controller, capital_state = build_validation_pipeline(
+    pipeline, controller, capital_state = build_validation_pipeline(
         nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=initial_pool,
     )
@@ -165,6 +165,7 @@ def test_sanity_buy_hold() -> None:
         state=InstanceState(capital=capital_state),
         praxis_outbound=cast(PraxisOutbound, outbound),
         validation_pipeline=pipeline,
+            capital_controller=controller,
         strategy_budget=Decimal('100000'),
     )
     submit = build_action_submitter(bindings)

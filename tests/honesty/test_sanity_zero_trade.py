@@ -174,6 +174,7 @@ def test_sanity_zero_trade_through_real_action_submitter() -> None:
         state=InstanceState(capital=capital_state),
         praxis_outbound=cast(PraxisOutbound, outbound),
         validation_pipeline=pipeline,
+            capital_controller=controller,
         strategy_budget=Decimal('100000'),
     )
     submit = build_action_submitter(bindings)

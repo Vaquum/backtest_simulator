@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import cast
 
 import pytest
+from nexus.core.capital_controller.capital_controller import CapitalController
 from nexus.core.domain.enums import OrderSide
 from nexus.core.domain.order_types import ExecutionMode, OrderType
 from nexus.core.validator import ValidationPipeline
@@ -52,26 +53,28 @@ def _nexus_config() -> NexusInstanceConfig:
 def _make_bindings(
     outbound: _OutboundStub,
     pipeline: ValidationPipeline,
+    controller: CapitalController,
     state: InstanceState,
 ) -> SubmitterBindings:
     return SubmitterBindings(
         nexus_config=_nexus_config(), state=state,
         praxis_outbound=cast(PraxisOutbound, outbound),
         validation_pipeline=pipeline,
+        capital_controller=controller,
         strategy_budget=Decimal('100000'),
     )
 
 
-def _pipeline_and_state() -> tuple[ValidationPipeline, InstanceState]:
+def _pipeline_and_state() -> tuple[ValidationPipeline, CapitalController, InstanceState]:
     # Build a Part 2-shaped pipeline that shares the same CapitalState
     # the InstanceState carries — that's the invariant the real
     # launcher enforces and what the CAPITAL validator reads from.
-    pipeline, _controller, capital_state = build_validation_pipeline(
+    pipeline, controller, capital_state = build_validation_pipeline(
         nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     state = InstanceState(capital=capital_state)
-    return pipeline, state
+    return pipeline, controller, state
 
 
 def _enter_action() -> Action:
@@ -114,15 +117,15 @@ def _sell_action() -> Action:
 
 def test_builder_returns_callable() -> None:
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
-    submit = build_action_submitter(_make_bindings(outbound, pipeline, state))
+    pipeline, controller, state = _pipeline_and_state()
+    submit = build_action_submitter(_make_bindings(outbound, pipeline, controller, state))
     assert callable(submit)
 
 
 def test_enter_with_declared_stop_passes_validation_and_sends() -> None:
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
-    submit = build_action_submitter(_make_bindings(outbound, pipeline, state))
+    pipeline, controller, state = _pipeline_and_state()
+    submit = build_action_submitter(_make_bindings(outbound, pipeline, controller, state))
     submit([_enter_action()], 'long_on_signal')
     assert len(outbound.commands) == 1
     cmd = outbound.commands[0]
@@ -137,8 +140,8 @@ def test_enter_with_declared_stop_passes_validation_and_sends() -> None:
 def test_buy_entry_without_declared_stop_is_rejected_by_intake() -> None:
     # Part 2 INTAKE gate — no stop, no entry.
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
-    submit = build_action_submitter(_make_bindings(outbound, pipeline, state))
+    pipeline, controller, state = _pipeline_and_state()
+    submit = build_action_submitter(_make_bindings(outbound, pipeline, controller, state))
     action_no_stop = Action(
         action_type=ActionType.ENTER,
         direction=OrderSide.BUY,
@@ -159,8 +162,8 @@ def test_sell_exit_without_stop_is_accepted() -> None:
     # Long-only convention — SELL closes an existing long and is itself
     # the risk close, so no stop_price is required.
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
-    submit = build_action_submitter(_make_bindings(outbound, pipeline, state))
+    pipeline, controller, state = _pipeline_and_state()
+    submit = build_action_submitter(_make_bindings(outbound, pipeline, controller, state))
     submit([_sell_action()], 'long_on_signal')
     assert len(outbound.commands) == 1
     # `_to_praxis_enums` converts side to Praxis OrderSide; compare by name.
@@ -169,8 +172,8 @@ def test_sell_exit_without_stop_is_accepted() -> None:
 
 def test_abort_action_routed_to_send_abort() -> None:
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
-    submit = build_action_submitter(_make_bindings(outbound, pipeline, state))
+    pipeline, controller, state = _pipeline_and_state()
+    submit = build_action_submitter(_make_bindings(outbound, pipeline, controller, state))
     abort = Action(
         action_type=ActionType.ABORT,
         direction=None, size=None, execution_mode=None, order_type=None,
@@ -194,8 +197,8 @@ def test_submission_propagates_per_action_errors() -> None:
         def send_command(self, cmd: object) -> str:
             raise RuntimeError('injected')
     outbound = _RaisingOutbound()
-    pipeline, state = _pipeline_and_state()
-    submit = build_action_submitter(_make_bindings(outbound, pipeline, state))
+    pipeline, controller, state = _pipeline_and_state()
+    submit = build_action_submitter(_make_bindings(outbound, pipeline, controller, state))
     with pytest.raises(RuntimeError, match='injected'):
         submit([_enter_action()], 'long_on_signal')
     # No command got through; the capture happens inside the outbound
@@ -210,7 +213,7 @@ def test_on_reservation_hook_receives_decision_with_reservation() -> None:
     # decision to carry a `reservation` so downstream send_order/ack
     # calls can reference it.
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
+    pipeline, controller, state = _pipeline_and_state()
     captured: list[tuple[str, object, object, Action]] = []
 
     def on_reservation(
@@ -219,7 +222,7 @@ def test_on_reservation_hook_receives_decision_with_reservation() -> None:
         captured.append((command_id, decision, context, action))
 
     submit = build_action_submitter(
-        _make_bindings(outbound, pipeline, state),
+        _make_bindings(outbound, pipeline, controller, state),
         on_reservation=on_reservation,
     )
     submit([_enter_action()], 'long_on_signal')
@@ -237,10 +240,10 @@ def test_on_submit_hook_fires_with_command_id() -> None:
     # `submitted_commands` counter for the synchronous drain. It
     # must fire exactly once per action that reached Praxis.
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
+    pipeline, controller, state = _pipeline_and_state()
     submitted: list[str] = []
     submit = build_action_submitter(
-        _make_bindings(outbound, pipeline, state),
+        _make_bindings(outbound, pipeline, controller, state),
         on_submit=submitted.append,
     )
     submit([_enter_action(), _sell_action()], 'long_on_signal')
@@ -258,11 +261,12 @@ def test_maybe_refresh_limit_to_touch_buy_biases_below() -> None:
     instead of the touch-biased `49999.99`.
     """
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
+    pipeline, controller, state = _pipeline_and_state()
     bindings = SubmitterBindings(
         nexus_config=_nexus_config(), state=state,
         praxis_outbound=cast(PraxisOutbound, outbound),
         validation_pipeline=pipeline,
+        capital_controller=controller,
         strategy_budget=Decimal('100000'),
         touch_provider=lambda _sym: Decimal('50000'),
         tick_provider=lambda _sym: Decimal('0.01'),
@@ -303,11 +307,12 @@ def test_maybe_refresh_limit_to_touch_buy_biases_below() -> None:
 def test_maybe_refresh_limit_to_touch_sell_biases_above() -> None:
     """LIMIT SELL action's price gets rewritten to `touch + tick`."""
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
+    pipeline, controller, state = _pipeline_and_state()
     bindings = SubmitterBindings(
         nexus_config=_nexus_config(), state=state,
         praxis_outbound=cast(PraxisOutbound, outbound),
         validation_pipeline=pipeline,
+        capital_controller=controller,
         strategy_budget=Decimal('100000'),
         touch_provider=lambda _sym: Decimal('50000'),
         tick_provider=lambda _sym: Decimal('0.01'),
@@ -337,6 +342,7 @@ def test_maybe_refresh_limit_to_touch_sell_biases_above() -> None:
 def _atr_bindings(
     outbound: _OutboundStub,
     pipeline: ValidationPipeline,
+    controller: CapitalController,
     state: InstanceState,
     *,
     atr: Decimal | None = Decimal('300'),
@@ -357,6 +363,7 @@ def _atr_bindings(
         nexus_config=_nexus_config(), state=state,
         praxis_outbound=cast(PraxisOutbound, outbound),
         validation_pipeline=pipeline,
+        capital_controller=controller,
         strategy_budget=Decimal('100000'),
         atr_gate=gate, atr_provider=_provider,
     )
@@ -374,8 +381,8 @@ def test_atr_sanity_rejects_tight_stop_buy_entry() -> None:
     let the command flow to outbound and break this test.
     """
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
-    bindings = _atr_bindings(outbound, pipeline, state)
+    pipeline, controller, state = _pipeline_and_state()
+    bindings = _atr_bindings(outbound, pipeline, controller, state)
     rejected: list[ValidationDecision] = []
     submit = build_action_submitter(
         bindings,
@@ -409,8 +416,8 @@ def test_atr_sanity_allows_sane_stop_buy_entry() -> None:
     shape on BTCUSDT, so production runs do NOT trigger the gate.
     """
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
-    bindings = _atr_bindings(outbound, pipeline, state)
+    pipeline, controller, state = _pipeline_and_state()
+    bindings = _atr_bindings(outbound, pipeline, controller, state)
     rejected: list[ValidationDecision] = []
     submit = build_action_submitter(
         bindings,
@@ -433,8 +440,8 @@ def test_atr_sanity_uncalibrated_denies() -> None:
     can tell warm-up gaps apart from gameability rejections.
     """
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
-    bindings = _atr_bindings(outbound, pipeline, state, atr=None)
+    pipeline, controller, state = _pipeline_and_state()
+    bindings = _atr_bindings(outbound, pipeline, controller, state, atr=None)
     rejected: list[ValidationDecision] = []
     submit = build_action_submitter(
         bindings,
@@ -464,8 +471,8 @@ def test_atr_sanity_uses_limit_price_over_seed_for_entry() -> None:
     order; this test would fail.
     """
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
-    bindings = _atr_bindings(outbound, pipeline, state)
+    pipeline, controller, state = _pipeline_and_state()
+    bindings = _atr_bindings(outbound, pipeline, controller, state)
     rejected: list[ValidationDecision] = []
     submit = build_action_submitter(
         bindings,
@@ -508,7 +515,7 @@ def test_atr_sanity_uses_touch_provider_when_available() -> None:
     `reference_price` and ALLOWS the order; this test would fail.
     """
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
+    pipeline, controller, state = _pipeline_and_state()
     rejected: list[ValidationDecision] = []
     from backtest_simulator.honesty.atr import AtrSanityGate
     gate = AtrSanityGate(atr_window_seconds=300, k=Decimal('0.5'))
@@ -522,6 +529,7 @@ def test_atr_sanity_uses_touch_provider_when_available() -> None:
         nexus_config=_nexus_config(), state=state,
         praxis_outbound=cast(PraxisOutbound, outbound),
         validation_pipeline=pipeline,
+        capital_controller=controller,
         strategy_budget=Decimal('100000'),
         touch_provider=_touch,
         atr_gate=gate, atr_provider=_atr,
@@ -564,7 +572,7 @@ def test_atr_sanity_k_zero_disables_gate_even_on_uncalibrated() -> None:
     uncalibrated path and `n_rejected/uncal` rises.
     """
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
+    pipeline, controller, state = _pipeline_and_state()
     rejected: list[ValidationDecision] = []
     from backtest_simulator.honesty.atr import AtrSanityGate
     gate = AtrSanityGate(atr_window_seconds=300, k=Decimal('0'))
@@ -575,6 +583,7 @@ def test_atr_sanity_k_zero_disables_gate_even_on_uncalibrated() -> None:
         nexus_config=_nexus_config(), state=state,
         praxis_outbound=cast(PraxisOutbound, outbound),
         validation_pipeline=pipeline,
+        capital_controller=controller,
         strategy_budget=Decimal('100000'),
         atr_gate=gate, atr_provider=_atr_returns_none,
     )
@@ -600,8 +609,8 @@ def test_atr_sanity_skips_sell_exit() -> None:
     long; gating it would leave the strategy holding risk.
     """
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
-    bindings = _atr_bindings(outbound, pipeline, state)
+    pipeline, controller, state = _pipeline_and_state()
+    bindings = _atr_bindings(outbound, pipeline, controller, state)
     rejected: list[ValidationDecision] = []
     submit = build_action_submitter(
         bindings,
@@ -626,7 +635,7 @@ def test_maybe_refresh_limit_to_touch_skips_market_orders() -> None:
     Praxis SingleShotParams).
     """
     outbound = _OutboundStub()
-    pipeline, state = _pipeline_and_state()
+    pipeline, controller, state = _pipeline_and_state()
     refresh_calls: list[str] = []
 
     def _spying_touch(symbol: str) -> Decimal | None:
@@ -637,6 +646,7 @@ def test_maybe_refresh_limit_to_touch_skips_market_orders() -> None:
         nexus_config=_nexus_config(), state=state,
         praxis_outbound=cast(PraxisOutbound, outbound),
         validation_pipeline=pipeline,
+        capital_controller=controller,
         strategy_budget=Decimal('100000'),
         touch_provider=_spying_touch,
         tick_provider=lambda _sym: Decimal('0.01'),

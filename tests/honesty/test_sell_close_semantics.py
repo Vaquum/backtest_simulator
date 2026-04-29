@@ -63,7 +63,7 @@ def test_sell_close_does_not_reserve_capital() -> None:
     # After a SELL close, reservation_notional MUST still be zero (no
     # double-commit).
     outbound = _OutboundStub()
-    pipeline, _controller, capital_state = build_validation_pipeline(
+    pipeline, controller, capital_state = build_validation_pipeline(
         nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
@@ -84,6 +84,7 @@ def test_sell_close_does_not_reserve_capital() -> None:
             state=state,
             praxis_outbound=cast(PraxisOutbound, outbound),
             validation_pipeline=pipeline,
+            capital_controller=controller,
             strategy_budget=Decimal('100000'),
         ),
         on_reservation=on_reservation,
@@ -107,7 +108,7 @@ def test_sell_close_still_fires_on_submit() -> None:
     # drain counter is how we know the venue fill completed. Skipping
     # the drain for SELL would hang the clock.
     outbound = _OutboundStub()
-    pipeline, _controller, capital_state = build_validation_pipeline(
+    pipeline, controller, capital_state = build_validation_pipeline(
         nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
@@ -121,6 +122,7 @@ def test_sell_close_still_fires_on_submit() -> None:
             state=state,
             praxis_outbound=cast(PraxisOutbound, outbound),
             validation_pipeline=pipeline,
+            capital_controller=controller,
             strategy_budget=Decimal('100000'),
         ),
         on_submit=submitted.append,
