@@ -337,6 +337,80 @@ def test_late_stage_denial_releases_capital_reservation() -> None:
     )
 
 
+# ---- Fail-loud on release_reservation failure -----------------------------
+
+
+def test_release_reservation_failure_fails_loud() -> None:
+    """`release_reservation` returning success=False raises RuntimeError.
+
+    Bit-mis no-defects-conviction P1: the reservation being released
+    was just minted by the same `pipeline.validate()` call on the same
+    controller, so any non-success means a wiring/state bug — not an
+    expected race. Mirrors `CapitalLifecycleTracker.record_rejection`'s
+    raise-on-failure pattern. Letting the bug through with a warning
+    would silently re-introduce the leak the branch exists to prevent.
+    """
+    cfg = InstanceConfig(account_id='bts-test', venue='binance_spot_simulated')
+    policy = HealthStagePolicy(
+        latency_ms=HealthMetricThresholds(breach=Decimal('10')),
+    )
+
+    def hot_snapshot() -> HealthStageSnapshot:
+        return HealthStageSnapshot(
+            latency_ms=Decimal('100'), consecutive_failures=Decimal('0'),
+            failure_rate=Decimal('0'), rate_limit_headroom=Decimal('1'),
+            clock_drift_ms=Decimal('0'),
+        )
+
+    pipeline, controller, capital_state = build_validation_pipeline(
+        nexus_config=cfg, capital_pool=Decimal('100000'),
+        health_policy=policy, health_snapshot_provider=hot_snapshot,
+    )
+
+    # Wrap the real controller so `release_reservation` returns a
+    # success=False LifecycleResult — simulating the wiring bug
+    # bit-mis flagged. Every other method delegates to the real one
+    # so the pipeline's CAPITAL stage still produces a real reservation.
+    class _FailingReleaseController:
+        def __init__(self, real: object) -> None:
+            self._real = real
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._real, name)
+
+        def release_reservation(self, _reservation_id: str) -> object:
+            from nexus.core.capital_controller.capital_controller import (
+                LifecycleResult,
+            )
+            return LifecycleResult(
+                success=False, reason='simulated-wiring-bug',
+                category=None,
+            )
+
+    failing_controller = _FailingReleaseController(controller)
+    outbound = _OutboundStub()
+    submit = build_action_submitter(SubmitterBindings(
+        nexus_config=cfg,
+        state=InstanceState(capital=capital_state),
+        praxis_outbound=cast(PraxisOutbound, outbound),
+        validation_pipeline=pipeline,
+        capital_controller=cast(object, failing_controller),  # type: ignore[arg-type]
+        strategy_budget=Decimal('100000'),
+    ))
+    action = Action(
+        action_type=ActionType.ENTER, direction=OrderSide.BUY,
+        size=Decimal('0.001'), execution_mode=ExecutionMode.SINGLE_SHOT,
+        order_type=OrderType.MARKET,
+        execution_params={'symbol': 'BTCUSDT', 'stop_price': '49750'},
+        deadline=60, trade_id=None,
+        command_id='cmd-fail-loud',
+        maker_preference=None, reference_price=Decimal('50000'),
+    )
+    import pytest
+    with pytest.raises(RuntimeError, match='pipeline-denied reservation release failed'):
+        submit([action], 'long_on_signal')
+
+
 # ---- SELL fast-path divergence is documented in source --------------------
 
 

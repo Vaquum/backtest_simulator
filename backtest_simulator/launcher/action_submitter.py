@@ -520,13 +520,23 @@ def _submit_translated(
                 decision.reservation.reservation_id,
             )
             if not release_result.success:
-                _log.warning(
-                    'pipeline-denied reservation release failed: '
-                    'reservation_id=%s reason=%s category=%s',
-                    decision.reservation.reservation_id,
-                    release_result.reason,
-                    release_result.category,
+                # Fail loud — the reservation was just minted by the same
+                # pipeline.validate() call on the same controller; any
+                # non-success here is a wiring/state bug (controller
+                # mismatch, concurrent release, lost reservation), not an
+                # expected race. Mirrors `CapitalLifecycleTracker.record_rejection`'s
+                # pattern at honesty/capital.py:461. Letting the bug
+                # through with a warning would silently re-introduce
+                # the very leak this branch exists to prevent
+                # (bit-mis no-defects-conviction P1).
+                msg = (
+                    f'pipeline-denied reservation release failed: '
+                    f'reservation_id={decision.reservation.reservation_id} '
+                    f'failed_stage={decision.failed_stage} '
+                    f'reason={release_result.reason!r} '
+                    f'category={release_result.category}'
                 )
+                raise RuntimeError(msg)
         _log.warning(
             'validation denied: stage=%s reason_code=%s message=%s command_id=%s',
             decision.failed_stage.value if decision.failed_stage else None,
