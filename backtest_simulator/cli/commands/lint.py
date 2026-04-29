@@ -13,12 +13,7 @@ from typing import Final
 
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
 
-# Tracks the same path set CI runs at .github/workflows/pr_checks_lint.yml
-# (line 101): `pytest tests/ -q` AND `ruff check backtest_simulator tools tests`.
-# `scripts/` was retired in PR #21 (merged into `tools/`); leaving it in the
-# default would make `bts lint` E902 with "No such file or directory: scripts"
-# while `bts gate lint` and CI both pass — exactly the local-vs-CI divergence
-# the CLI-first contract is meant to prevent.
+# Same path set CI runs (.github/workflows/pr_checks_lint.yml).
 _DEFAULT_PATHS: Final[tuple[str, ...]] = (
     'backtest_simulator', 'tools', 'tests',
 )

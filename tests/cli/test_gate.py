@@ -35,10 +35,6 @@ def test_gate_honesty() -> None:
 def test_gate_typing() -> None:
     from backtest_simulator.cli.commands.gate import _build_command
     cmd = _build_command('typing', REPO_ROOT)
-    # Slice #34 extracted the typing-gate logic to a runner module so
-    # the conditional base-budget oracle is readable Python rather than
-    # a dense one-liner. The runner does the actual pyright call;
-    # gate.py just shells out to it.
-    assert cmd[1:] == ['-m', 'backtest_simulator.cli._typing_runner'], (
-        f'`bts gate typing` must invoke the runner module. cmd[1:]={cmd[1:]!r}'
+    assert cmd[1:] == ['tools/local_typing_gate.py'], (
+        f'`bts gate typing` must invoke tools/local_typing_gate.py. cmd[1:]={cmd[1:]!r}'
     )

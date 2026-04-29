@@ -18,20 +18,29 @@ and CI both passed.
 
 ## Fix 2 — `bts gate typing` matches CI byte-for-byte
 
-`backtest_simulator/cli/commands/gate.py::_build_command('typing')`
-now plants PEP 561 `py.typed` markers in `nexus / praxis / limen /
-clickhouse_connect` before invoking pyright (mirroring the
-`pr_checks_typing` workflow's "Plant py.typed markers in sibling
-libraries" step), and passes `--pythonpath sys.executable` so pyright
-finds the venv's site-packages. Without these, local pyright reported
-~2300 errors (reportMissingImports, reportUnknownMemberType) for code
-CI saw cleanly.
+`bts gate typing` now shells out to `tools/local_typing_gate.py` —
+a small script that mirrors `pr_checks_typing.yml` step-for-step:
+
+- Plants PEP 561 `py.typed` markers in `nexus / praxis / limen / clickhouse_connect`
+  (skip-if-present, matching CI's `if not os.path.exists` shape).
+- Runs pyright with `--pythonpath sys.executable` so the venv's
+  site-packages is discovered (CI uses system Python where auto-
+  detection works).
+- Resolves the base-budget oracle from `origin/main:.github/typing_budget.json`;
+  bootstraps only when HEAD adds the file; fails loud otherwise.
+  Never silently falls back to `HEAD:`.
+
+Without these mirrors, local pyright reported ~2300 errors
+(reportMissingImports, reportUnknownMemberType) for code CI saw
+cleanly, and a stale base-budget could let a local PR pass while CI
+rejected.
 
 ## Test surface
 
-`tests/cli/test_bts_lint_paths.py` and
-`tests/cli/test_bts_gate_typing_parity.py` lock both fixes — a
-regression in either restores the divergence and breaks the test.
+`tests/cli/test_bts_lint_paths.py` (4) and
+`tests/cli/test_bts_gate_typing_parity.py` (7) — 11 tests total —
+lock both fixes; a regression in either restores the divergence and
+breaks the test.
 
 # v2.0.6
 

@@ -55,7 +55,6 @@
   "backtest_simulator/cli/__init__.py": 80,
   "backtest_simulator/cli/__main__.py": 20,
   "backtest_simulator/cli/_verbosity.py": 80,
-  "backtest_simulator/cli/_typing_runner.py": 130,
   "backtest_simulator/cli/_pipeline.py": 720,
   "backtest_simulator/cli/_metrics.py": 220,
   "backtest_simulator/cli/_run_window.py": 530,

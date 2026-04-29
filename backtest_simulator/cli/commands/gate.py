@@ -39,20 +39,7 @@ def _build_command(name: str, repo_root: Path) -> list[str]:
         return [sys.executable, '-m', 'ruff', 'check',
                 'backtest_simulator', 'tools', 'tests']
     if name == 'typing':
-        # Mirror `pr_checks_typing.yml` byte-for-byte: plant PEP 561
-        # `py.typed` markers in sibling libs (CI's "Plant py.typed
-        # markers in sibling libraries" step), invoke pyright with
-        # `--pythonpath sys.executable` so the venv's site-packages
-        # is discovered (CI uses system Python where auto-detection
-        # works), and resolve the base-budget oracle with the same
-        # bootstrap-or-fail-loud conditional CI uses (origin/main +
-        # HEAD-introduces-file check, never silent fallback).
-        #
-        # Implementation lives in `backtest_simulator.cli._typing_runner`
-        # so the conditional is readable Python rather than a dense
-        # one-liner string. Each step there has a docstring naming the
-        # workflow step it mirrors.
-        return [sys.executable, '-m', 'backtest_simulator.cli._typing_runner']
+        return [sys.executable, 'tools/local_typing_gate.py']
     if name == 'honesty':
         return [sys.executable, '-m', 'pytest', *_honesty_paths(repo_root),
                 '-v', '--tb=short']

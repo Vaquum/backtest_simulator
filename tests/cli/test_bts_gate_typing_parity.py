@@ -1,52 +1,25 @@
-"""`bts gate typing` must produce the same pass/fail state as CI.
-
-Slice for issue #31. Two prior divergences:
-
-1. CI plants PEP 561 `py.typed` markers in nexus / praxis / limen /
-   clickhouse_connect via the `pr_checks_typing.yml` step "Plant
-   py.typed markers in sibling libraries" before pyright runs.
-   Without those markers locally, pyright emits ~80
-   `reportMissingTypeStubs` + cascading reportUnknown* errors.
-
-2. CI runs pyright against system Python (where everything is
-   `pip install --system`-ed); pyright auto-detects that interpreter.
-   Locally, pyright invoked via `python -m pyright` does NOT pick the
-   `.venv/` interpreter automatically and reports ~145
-   reportMissingImports for polars / numpy / nexus / praxis.
-
-Both gaps are closed by `backtest_simulator.cli._typing_runner`,
-which `bts gate typing` shells out to. The runner mirrors
-`pr_checks_typing.yml`'s steps: plant markers, run pyright with
-`--pythonpath sys.executable`, then resolve the base-budget oracle
-with the same bootstrap-or-fail-loud conditional CI uses (NOT a
-silent fallback to `HEAD:` — codex post-auditor-2 P1 caught the
-prior shape).
-
-This test reads the runner's source by symbol so a refactor that
-keeps the contract still passes.
-"""
+"""`bts gate typing` mirrors CI's `pr_checks_typing.yml`."""
 from __future__ import annotations
 
-import inspect
 from pathlib import Path
 
-from backtest_simulator.cli import _typing_runner
 from backtest_simulator.cli.commands import gate as gate_cmd
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TYPING_WORKFLOW = REPO_ROOT / '.github/workflows/pr_checks_typing.yml'
+LOCAL_GATE = REPO_ROOT / 'tools/local_typing_gate.py'
 
 
 def _runner_source() -> str:
-    """Return the runner module's source — the readable parity surface."""
-    return inspect.getsource(_typing_runner)
+    """Return the local typing-gate script's source — the readable parity surface."""
+    return LOCAL_GATE.read_text(encoding='utf-8')
 
 
-def test_gate_command_invokes_typing_runner() -> None:
-    """`bts gate typing` shells out to `backtest_simulator.cli._typing_runner`."""
+def test_gate_command_invokes_local_typing_gate() -> None:
+    """`bts gate typing` shells out to `tools/local_typing_gate.py`."""
     cmd = gate_cmd._build_command('typing', REPO_ROOT)
-    assert cmd[1:] == ['-m', 'backtest_simulator.cli._typing_runner'], (
-        f'gate.py must shell out to the typing runner module. Got cmd[1:]={cmd[1:]!r}.'
+    assert cmd[1:] == ['tools/local_typing_gate.py'], (
+        f'gate.py must shell out to the local typing-gate script. Got cmd[1:]={cmd[1:]!r}.'
     )
 
 
@@ -64,25 +37,22 @@ def test_command_plants_pytyped_markers_for_each_sibling() -> None:
     assert "'py.typed'" in src, (
         '`bts gate typing` must plant a literal `py.typed` file at '
         'each sibling package root (PEP 561). Look for the marker '
-        "string in `backtest_simulator.cli._typing_runner`."
+        "string in `tools/local_typing_gate.py`."
     )
 
 
-def test_pytyped_planting_is_idempotent_skip_when_present() -> None:
-    """Skip planting when the marker exists — codex post-auditor-2 P2.
+def test_pytyped_planting_skips_when_marker_already_present() -> None:
+    """Planting is skip-if-present, not unconditional touch.
 
-    `open(..., 'a').close()` is content-idempotent but not
-    behavior-equivalent to CI: it touches the file even when present,
-    requiring write permission. CI's shape is
-    `if not os.path.exists(marker): with open(marker, 'w'): pass`.
-    The runner mirrors that.
+    CI's shape is `if not os.path.exists(marker): with open(marker, 'w'): pass`.
+    `open(..., 'a').close()` would touch a read-only filesystem
+    unnecessarily and is not byte-equivalent to CI.
     """
     src = _runner_source()
     assert 'if not os.path.exists(marker):' in src, (
         'py.typed planting must skip-if-present rather than '
-        'unconditionally `open(..., "a").close()`. The latter touches '
-        'a read-only filesystem unnecessarily. Codex post-auditor-2 '
-        'P2 flagged this — match CI\'s `if not os.path.exists` shape.'
+        'unconditionally `open(..., "a").close()` — match CI\'s '
+        '`if not os.path.exists` shape.'
     )
 
 
@@ -99,47 +69,23 @@ def test_command_passes_pythonpath_to_pyright() -> None:
     )
 
 
-def test_base_budget_resolution_is_fail_loud_not_silent_fallback() -> None:
-    """Codex post-auditor-2 P1: missing origin/main must NOT silently fall back to HEAD.
+def test_command_uses_protected_base_budget_not_bootstrap() -> None:
+    """The runner reads the protected base-ref budget; bootstraps only when HEAD adds the file.
 
-    CI's `pr_checks_typing.yml` resolves the base ref by:
-      1. Trying `origin/<base>:.github/typing_budget.json`
-      2. Bootstrapping ONLY if HEAD adds the file
-      3. Failing loud otherwise (`::error::base ref has no .github/typing_budget.json...`)
-
-    The prior local shape silently fell back to `HEAD:.github/typing_budget.json`
-    on origin/main miss — letting a PR raise the head budget locally,
-    pass `bts gate typing`, then fail CI. The runner now mirrors CI:
-    bootstrap or fail loud, never silent.
+    CI resolves the base oracle by trying `origin/<base>:.github/typing_budget.json`
+    first; bootstrapping only if HEAD introduces the file; failing loud
+    otherwise. A silent fallback would let a PR raise the head budget
+    locally, pass `bts gate typing`, then fail CI.
     """
     src = _runner_source()
-    # Must fetch from origin/main first.
-    assert "'origin/main:.github/typing_budget.json'" in src, (
-        'local runner must consult origin/main first as the base oracle'
-    )
-    # Bootstrap mode is conditionally enabled when HEAD adds the file.
-    assert "'--bootstrap'" in src, (
-        'local runner must support bootstrap mode (HEAD introduces budget)'
-    )
-    assert "'.github/typing_budget.json' not in diff.stdout.split()" in src, (
-        'local runner must check that HEAD adds the file before bootstrapping; '
-        'a silent unconditional fallback was the divergence post-auditor-2 caught'
-    )
-    # Fail-loud path on missing-and-not-introduced.
-    assert 'sys.exit(2)' in src, (
-        'local runner must fail loud (sys.exit(2)) when origin/main is missing '
-        'AND HEAD does not introduce the budget — same shape as CI'
-    )
-    # The legacy silent-fallback to HEAD must NOT exist.
-    assert "'HEAD:.github/typing_budget.json'" not in src, (
-        'silent fallback to HEAD ref was the codex-flagged divergence; '
-        'remove any `git show HEAD:.github/typing_budget.json` invocation '
-        'from the runner — the only HEAD-related path is checking whether '
-        'HEAD introduces the budget via `git diff --name-only origin/main...HEAD`.'
-    )
+    assert "'origin/main:.github/typing_budget.json'" in src
+    assert "'--bootstrap'" in src
+    assert "'.github/typing_budget.json' not in diff.stdout.split()" in src
+    assert 'sys.exit(2)' in src
+    assert "'HEAD:.github/typing_budget.json'" not in src
 
 
-def test_runner_calls_typing_gate_with_pyright_json() -> None:
+def test_command_calls_typing_gate_with_pyright_json() -> None:
     """The runner pipes pyright JSON into tools/typing_gate.py."""
     src = _runner_source()
     assert 'tools/typing_gate.py' in src
