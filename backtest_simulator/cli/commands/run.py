@@ -69,10 +69,11 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
                        'Path to a Limen-exported bundle zip '
                        '(<name>__rNNNN.zip) containing sibling '
                        '<name>.py + <name>.json + <name>.csv. '
-                       'Mutually exclusive with --exp-code; bts '
-                       'extracts the bundle, applies the JSON '
-                       'data_source / uel_run overrides, and uses '
-                       'the bundled CSV as the filter pool.'
+                       'Mutually exclusive with --exp-code. bts '
+                       'applies the JSON `data_source` override and '
+                       '`uel_run.n_permutations` (when --n-permutations '
+                       'is not given), and uses the bundled CSV as '
+                       'the filter pool.'
                    ))
     p.add_argument('--window-start', required=True, type=str,
                    help='ISO8601 (e.g. 2026-04-20T08:00:00+00:00).')
@@ -92,7 +93,7 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
     # matches `bts sweep`'s 30 for consistency. Ignored when
     # --experiment-dir is supplied (the operator points at a
     # pre-existing one).
-    p.add_argument('--n-permutations', type=int, default=30,
+    p.add_argument('--n-permutations', type=int, default=None,
                    help=(
                        'Number of UEL permutations to train when '
                        'auto-training the experiment dir. Ignored '

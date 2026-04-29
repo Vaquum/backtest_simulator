@@ -289,9 +289,14 @@ def test_load_bundled_experiment_validates_params_shape(tmp_path: Path) -> None:
 
 def test_materialize_bundle_for_cli_writes_loadable_shim(tmp_path: Path) -> None:
     bundle = _write_bundle(tmp_path)
-    shim_path, csv_path = materialize_bundle_for_cli(bundle, tmp_path / 'cache')
+    shim_path, csv_path, spec = materialize_bundle_for_cli(
+        bundle, tmp_path / 'cache',
+    )
     assert shim_path.is_file()
     assert csv_path.is_file()
+    # Returning the spec lets the caller honor uel_run.n_permutations
+    # without re-extracting the bundle outside the lock.
+    assert spec.uel_run['n_permutations'] == 50
     exp = ExperimentPipeline.load_from_file(shim_path)
     keys = list(exp.params().keys())
     assert 'q' in keys
@@ -307,7 +312,7 @@ def test_materialize_bundle_for_cli_shim_calls_shared_override(
     rather than re-implement the override inline.
     """
     bundle = _write_bundle(tmp_path)
-    shim_path, _ = materialize_bundle_for_cli(bundle, tmp_path / 'cache')
+    shim_path, _, _ = materialize_bundle_for_cli(bundle, tmp_path / 'cache')
     src = shim_path.read_text(encoding='utf-8')
     assert '_override_data_source' in src
     # No second f-string-templated DataSourceConfig construction.
@@ -355,7 +360,7 @@ def test_cli_bundle_exp_code_mutually_exclusive(tmp_path: Path) -> None:
     assert 'not allowed with' in (out.stderr + out.stdout).lower()
 
 
-def test_bts_run_bundle_end_to_end_routes_through_shim(tmp_path: Path) -> None:
+def test_bts_run_bundle_end_to_end(tmp_path: Path) -> None:
     """`bts run --bundle <zip>` rewrites args to point at the synthesized
     shim + CSV before the rest of the run flow executes.
 
@@ -366,7 +371,8 @@ def test_bts_run_bundle_end_to_end_routes_through_shim(tmp_path: Path) -> None:
     points at a shim file that loads cleanly through
     `ExperimentPipeline.load_from_file`, `args.input_from_file` is the
     bundle's CSV, and `args.n_permutations` reflects the JSON's value
-    when the operator did not pass an explicit `--n-permutations`.
+    when the operator did not pass an explicit `--n-permutations`
+    (the parser's `default=None` sentinel signals operator silence).
     """
     import argparse as _ap
 
@@ -376,13 +382,13 @@ def test_bts_run_bundle_end_to_end_routes_through_shim(tmp_path: Path) -> None:
         bundle=bundle,
         exp_code=None,
         input_from_file=None,
-        n_permutations=30,  # bts default; bundle JSON's 50 should win
+        n_permutations=None,  # operator silent: bundle JSON's 50 should win
     )
     work_root = tmp_path / 'work'
     materialize_bundle_on_args(args, work_root)
     assert args.exp_code is not None and args.exp_code.is_file()
     assert args.input_from_file is not None and Path(args.input_from_file).is_file()
-    # Bundle's JSON `uel_run.n_permutations=50` overrides the bts default 30.
+    # Bundle's JSON `uel_run.n_permutations=50` fills the silence.
     assert args.n_permutations == 50
     # Shim is loadable via the existing path-based machinery.
     exp = ExperimentPipeline.load_from_file(args.exp_code)
@@ -402,6 +408,61 @@ def test_bts_run_bundle_respects_explicit_n_permutations(tmp_path: Path) -> None
     )
     materialize_bundle_on_args(args, tmp_path / 'work')
     assert args.n_permutations == 7  # operator wins
+
+
+def test_bts_run_bundle_explicit_30_distinguishable_from_silence(
+    tmp_path: Path,
+) -> None:
+    """Sentinel-default semantics: operator who explicitly types
+    `--n-permutations 30` (bts's canonical fallback) wins over the
+    bundle's JSON. Only `None` (operator silence) lets the bundle speak.
+    """
+    import argparse as _ap
+
+    from backtest_simulator.pipeline.bundle import (
+        N_PERMUTATIONS_DEFAULT,
+        materialize_bundle_on_args,
+    )
+    bundle = _write_bundle(tmp_path)
+    args = _ap.Namespace(
+        bundle=bundle, exp_code=None, input_from_file=None,
+        n_permutations=N_PERMUTATIONS_DEFAULT,  # value-equal-to-default
+    )
+    materialize_bundle_on_args(args, tmp_path / 'work')
+    # Operator-explicit 30 must NOT be overridden by JSON's 50.
+    assert args.n_permutations == N_PERMUTATIONS_DEFAULT
+
+
+def test_bts_run_no_bundle_applies_canonical_default(tmp_path: Path) -> None:
+    """Without --bundle, an operator-silent --n-permutations resolves
+    to `N_PERMUTATIONS_DEFAULT`. Same sentinel-default convention as
+    the bundle path.
+    """
+    import argparse as _ap
+
+    from backtest_simulator.pipeline.bundle import (
+        N_PERMUTATIONS_DEFAULT,
+        materialize_bundle_on_args,
+    )
+    args = _ap.Namespace(bundle=None, n_permutations=None)
+    materialize_bundle_on_args(args, tmp_path / 'work')
+    assert args.n_permutations == N_PERMUTATIONS_DEFAULT
+
+
+def test_extract_bundle_rejects_invalid_sfd_identifier(tmp_path: Path) -> None:
+    """`sfd_identifier` flows into generated Python source for the shim,
+    so a malformed bundle must be rejected at extract time before any
+    code-gen risk arises.
+    """
+    bad_meta = {
+        'sfd_identifier': 'Foo; rm -rf /',  # not a valid Python identifier
+        'data_source': {'method': 'get_spot_klines', 'params': {}},
+        'uel_run': {'experiment_name': 'x', 'n_permutations': 1,
+                    'prep_each_round': False, 'random_search': False},
+    }
+    bundle = _write_bundle(tmp_path, meta=bad_meta)
+    with pytest.raises(ValueError, match='valid Python identifier'):
+        extract_bundle(bundle, tmp_path / 'extract')
 
 
 @pytest.fixture(autouse=True)

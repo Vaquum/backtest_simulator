@@ -74,6 +74,15 @@ def extract_bundle(bundle_zip: Path, work_dir: Path) -> BundleSpec:
             f'non-empty string, got {sfd_identifier!r}'
         )
         raise ValueError(msg)
+    # Identifier flows into generated Python source for the shim;
+    # validate it's a real Python identifier so a malformed bundle
+    # cannot inject arbitrary code (`"Foo; rm -rf /"`).
+    if not sfd_identifier.isidentifier():
+        msg = (
+            f'extract_bundle: {json_path}::sfd_identifier must be a valid '
+            f'Python identifier, got {sfd_identifier!r}'
+        )
+        raise ValueError(msg)
     data_source = meta.get('data_source')
     if not isinstance(data_source, dict):
         msg = (
@@ -288,13 +297,15 @@ def manifest():
 
 def materialize_bundle_for_cli(
     bundle_zip: Path, work_dir: Path,
-) -> tuple[Path, Path]:
-    """Extract a bundle, write a synthetic shim, return (shim_path, csv_path).
+) -> tuple[Path, Path, BundleSpec]:
+    """Extract a bundle, write a synthetic shim, return (shim_path, csv_path, spec).
 
-    Concurrent `bts run --bundle X` invocations on the same bundle race
-    on extract+shim writes; serialize them with `fcntl.LOCK_EX` on a
-    sibling lock file so the second caller sees a complete shim, not a
-    half-written one.
+    Concurrent `bts run --bundle X` invocations race on extract+shim
+    writes; serialize via `fcntl.LOCK_EX` on a sibling lock file. The
+    spec is returned alongside the paths so the caller does not need
+    to re-call `extract_bundle` outside the lock to recover JSON
+    metadata (which would race with the very serialization this
+    helper guarantees).
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     lock_path = work_dir / '.bundle.lock'
@@ -307,7 +318,7 @@ def materialize_bundle_for_cli(
         )
         shim_path = work_dir / f'{spec.py_path.stem}__bts_shim.py'
         shim_path.write_text(shim_source, encoding='utf-8')
-        return shim_path, spec.csv_path
+        return shim_path, spec.csv_path, spec
 
 
 @contextlib.contextmanager
@@ -321,45 +332,44 @@ def _exclusive_dir_lock(lock_path: Path) -> Iterator[None]:
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
+# Sentinel default for --n-permutations on both run.py and sweep.py.
+# argparse stores `None` when the flag is unsupplied; the resolver
+# below picks the bundle's value (if any) or the canonical fallback.
+# The operator's explicit value (any int) is identity-comparable
+# against `None`, so `--n-permutations 30` (operator chose 30) is
+# distinguishable from operator silence.
+N_PERMUTATIONS_DEFAULT: int = 30
+
+
 def materialize_bundle_on_args(
     args: argparse.Namespace, work_root: Path,
 ) -> None:
     """If --bundle was supplied, populate args from the bundle's JSON.
 
-    Sets args.exp_code, args.input_from_file (when not already set), and
-    args.n_permutations (when the operator did not pass an explicit
-    --n-permutations). No-op if --bundle absent.
+    Resolution order for `n_permutations`:
+      1. Operator explicit `--n-permutations <int>` wins.
+      2. Otherwise, bundle's JSON `uel_run.n_permutations` wins.
+      3. Otherwise, fall back to `N_PERMUTATIONS_DEFAULT`.
+
+    The parser's default is `None`; the resolver below applies the
+    fallback. This sentinel-default pattern is the only way to
+    distinguish operator silence from operator explicit-equal-to-default.
     """
     bundle = getattr(args, 'bundle', None)
     if bundle is None:
+        if getattr(args, 'n_permutations', None) is None:
+            args.n_permutations = N_PERMUTATIONS_DEFAULT
         return
     bundle_path = Path(bundle).expanduser().resolve()
     cache_dir = work_root / 'bundles' / bundle_path.stem
-    shim_path, csv_path = materialize_bundle_for_cli(bundle_path, cache_dir)
-    spec = extract_bundle(bundle_path, cache_dir)
+    shim_path, csv_path, spec = materialize_bundle_for_cli(bundle_path, cache_dir)
     args.exp_code = shim_path
     if getattr(args, 'input_from_file', None) is None:
         args.input_from_file = str(csv_path)
-    # JSON's uel_run.n_permutations overrides the CLI default. Operator
-    # precedence: an explicit --n-permutations on the CLI is the value
-    # the user wants; bundle's value applies only when the operator did
-    # not pass the flag (argparse default vs explicit value is detected
-    # by comparing against the parser's stored default).
-    json_n_perm = spec.uel_run.get('n_permutations')
     cli_n_perm = getattr(args, 'n_permutations', None)
-    cli_default = _argparse_default_for(args, 'n_permutations')
-    if isinstance(json_n_perm, int) and cli_n_perm == cli_default:
-        args.n_permutations = json_n_perm
-
-
-def _argparse_default_for(args: argparse.Namespace, name: str) -> object:
-    # argparse Namespace doesn't carry the parser's defaults; the
-    # operator's default value lives in the parser definition. We can't
-    # introspect the parser from here, so fall back to a known sentinel
-    # convention: bts run/sweep both set --n-permutations default to 30.
-    # If the bundle's JSON disagrees AND the operator passed --n-permutations
-    # explicitly, the operator's value wins (no override). When operator
-    # is silent, bundle wins. The known-default lookup is centralized so a
-    # future default change touches one place.
-    _DEFAULTS = {'n_permutations': 30}
-    return _DEFAULTS.get(name)
+    if cli_n_perm is None:
+        json_n_perm = spec.uel_run.get('n_permutations')
+        if isinstance(json_n_perm, int):
+            args.n_permutations = json_n_perm
+        else:
+            args.n_permutations = N_PERMUTATIONS_DEFAULT

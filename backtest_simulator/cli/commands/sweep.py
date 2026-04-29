@@ -146,13 +146,14 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
                        'Path to a Limen-exported bundle zip '
                        '(<name>__rNNNN.zip) containing sibling '
                        '<name>.py + <name>.json + <name>.csv. '
-                       'Mutually exclusive with --exp-code; bts '
-                       'extracts the bundle, applies the JSON '
-                       'data_source / uel_run overrides, and uses '
-                       'the bundled CSV as the filter pool.'
+                       'Mutually exclusive with --exp-code. bts '
+                       'applies the JSON `data_source` override and '
+                       '`uel_run.n_permutations` (when --n-permutations '
+                       'is not given), and uses the bundled CSV as '
+                       'the filter pool.'
                    ))
     p.add_argument('--n-decoders', type=int, default=1)
-    p.add_argument('--n-permutations', type=int, default=30)
+    p.add_argument('--n-permutations', type=int, default=None)
     p.add_argument('--trading-hours-start', type=str, default=None)
     p.add_argument('--trading-hours-end', type=str, default=None)
     p.add_argument('--replay-period-start', type=str, default=None)
