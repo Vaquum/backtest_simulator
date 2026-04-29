@@ -294,6 +294,7 @@ class SubmitterBindings:
     state: InstanceState
     praxis_outbound: PraxisOutbound
     validation_pipeline: ValidationPipeline
+    strategy_budget: Decimal
     # Slice #28 — pipeline.validate's CAPITAL stage runs before
     # HEALTH/PLATFORM_LIMITS, so a denial from a later stage carries
     # the reservation forward (per nexus pipeline_executor). Without
@@ -304,7 +305,6 @@ class SubmitterBindings:
     # state. Default-None for tests that don't care (a denied
     # decision with reservation=None is a no-op release path).
     capital_controller: CapitalController | None = None
-    strategy_budget: Decimal = Decimal('0')
     touch_provider: Callable[[str], Decimal | None] | None = None
     tick_provider: Callable[[str], Decimal] | None = None
     # Slice #17 Task 29 — ATR R-denominator gameability gate.

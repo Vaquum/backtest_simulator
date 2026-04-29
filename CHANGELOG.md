@@ -42,7 +42,7 @@ Two parity gaps remain explicit-in-source rather than stubbed:
 
 ## Test surface
 
-`tests/honesty/test_validation_parity.py` adds 10 tests:
+`tests/honesty/test_validation_parity.py` adds 11 tests:
 - `_allow_stage` AST-absent
 - All 6 stages bound to non-`_allow_stage` callables
 - Per-stage end-to-end denials (INTAKE × 2, PRICE, RISK, HEALTH,
