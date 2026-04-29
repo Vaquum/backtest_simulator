@@ -26,9 +26,17 @@ a small script that mirrors `pr_checks_typing.yml` step-for-step:
 - Runs pyright with `--pythonpath sys.executable` so the venv's
   site-packages is discovered (CI uses system Python where auto-
   detection works).
+- Fetches `origin/main` (`git fetch origin main --depth=1`) before
+  reading the protected base-ref budget — without the fetch, a clone
+  one (or many) commits behind would read a stale budget and the
+  local gate could pass while CI fails (or vice versa).
 - Resolves the base-budget oracle from `origin/main:.github/typing_budget.json`;
   bootstraps only when HEAD adds the file; fails loud otherwise.
   Never silently falls back to `HEAD:`.
+- Fails loud when pyright produces empty output, surfacing pyright's
+  stderr — mirrors `pr_checks_typing.yml:184-189` so a pyright crash
+  shows the actual cause locally instead of a downstream JSON-decode
+  error from `tools/typing_gate.py`.
 
 Without these mirrors, local pyright reported ~2300 errors
 (reportMissingImports, reportUnknownMemberType) for code CI saw
@@ -38,7 +46,7 @@ rejected.
 ## Test surface
 
 `tests/cli/test_bts_lint_paths.py` (4) and
-`tests/cli/test_bts_gate_typing_parity.py` (7) — 11 tests total —
+`tests/cli/test_bts_gate_typing_parity.py` (9) — 13 tests total —
 lock both fixes; a regression in either restores the divergence and
 breaks the test.
 

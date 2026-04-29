@@ -85,6 +85,42 @@ def test_command_uses_protected_base_budget_not_bootstrap() -> None:
     assert "'HEAD:.github/typing_budget.json'" not in src
 
 
+def test_runner_fetches_origin_main_before_reading_base_budget() -> None:
+    """CI runs `git fetch origin <base> --depth=1` before reading the base budget.
+
+    Without the fetch, a local clone one (or many) commits behind
+    `origin/main` would read a stale budget — a budget raised on `main`
+    since the last fetch would be invisible locally and `bts gate typing`
+    could pass while CI failed (or vice versa).
+    """
+    src = _runner_source()
+    assert "'fetch', 'origin', 'main', '--depth=1'" in src, (
+        '`tools/local_typing_gate.py` must fetch origin/main before '
+        "reading `origin/main:.github/typing_budget.json`. Without the "
+        'fetch, the local base ref is stale and the gate diverges from CI.'
+    )
+
+
+def test_runner_fails_loud_on_empty_pyright_output() -> None:
+    """CI fails loud when pyright produces no output; the local runner mirrors that.
+
+    A pyright crash, missing module, or unrecognized flag yields empty
+    JSON. CI's `pr_checks_typing.yml:184-189` checks the file exists
+    and is non-empty, prints `::error::pyright produced no output`,
+    and exits 2. Without the same check locally, an empty JSON gets
+    handed to `tools/typing_gate.py` which surfaces a downstream
+    JSON-decode error rather than the actual pyright stderr.
+    """
+    src = _runner_source()
+    assert "out_path.stat().st_size == 0" in src, (
+        'runner must check pyright_output.json size and fail loud on '
+        'empty output, mirroring CI'
+    )
+    assert 'pyr.stderr' in src, (
+        "runner must surface pyright's stderr when output is empty"
+    )
+
+
 def test_command_calls_typing_gate_with_pyright_json() -> None:
     """The runner pipes pyright JSON into tools/typing_gate.py."""
     src = _runner_source()

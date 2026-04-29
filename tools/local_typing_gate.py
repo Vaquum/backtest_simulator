@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import subprocess
 import sys
 from typing import Final
@@ -29,7 +30,7 @@ def _plant_pytyped_markers() -> None:
 
 
 def _run_pyright() -> None:
-    """Capture pyright JSON to `pyright_output.json`."""
+    """Capture pyright JSON; fail loud on missing/empty output."""
     pyr = subprocess.run(
         [
             sys.executable, '-m', 'pyright',
@@ -40,15 +41,39 @@ def _run_pyright() -> None:
     )
     with open('pyright_output.json', 'w') as f:
         f.write(pyr.stdout)
+    # Mirror pr_checks_typing.yml:184-189 — pyright crash / unrecognized
+    # flag yields empty JSON; surface stderr and exit 2 so the operator
+    # sees the actual cause, not a downstream JSON-decode error.
+    out_path = pathlib.Path('pyright_output.json')
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        if pyr.stderr:
+            sys.stderr.write(pyr.stderr)
+            if not pyr.stderr.endswith('\n'):
+                sys.stderr.write('\n')
+        sys.stderr.write('local_typing_gate: pyright produced no output\n')
+        sys.exit(2)
 
 
 def _resolve_base_budget() -> list[str]:
     """Return the typing_gate.py args for the base-budget oracle.
 
-    Mirrors `pr_checks_typing.yml`'s "Resolve base ref" step: prefer
-    `origin/main:.github/typing_budget.json`; if that fails AND HEAD
-    introduces the file, return `--bootstrap`; otherwise fail loud.
+    Fetch the current protected base before reading it (CI runs
+    `git fetch origin <base_ref> --depth=1` first; without it the
+    local clone reads whatever stale origin/main it last fetched).
+    Then prefer `origin/main:.github/typing_budget.json`; if that
+    fails AND HEAD introduces the file, return `--bootstrap`;
+    otherwise fail loud.
     """
+    fetch = subprocess.run(
+        ['git', 'fetch', 'origin', 'main', '--depth=1'],
+        capture_output=True, text=True, check=False,
+    )
+    if fetch.returncode != 0:
+        sys.stderr.write(
+            'local_typing_gate: git fetch origin main failed; cannot '
+            'verify the base-ref budget. Stderr:\n' + fetch.stderr,
+        )
+        sys.exit(2)
     base = subprocess.run(
         ['git', 'show', 'origin/main:.github/typing_budget.json'],
         capture_output=True, text=True, check=False,
@@ -62,14 +87,10 @@ def _resolve_base_budget() -> list[str]:
         capture_output=True, text=True, check=False,
     )
     if diff.returncode != 0 or '.github/typing_budget.json' not in diff.stdout.split():
-        msg = (
-            'typing_runner: origin/main has no .github/typing_budget.json '
-            'and HEAD does not introduce it. Either the protected base ref '
-            'lost the budget (restore it before merging) or your branch is '
-            'missing origin/main; run `git fetch origin main`. Same fail-loud '
-            'shape as `pr_checks_typing.yml`.'
+        sys.stderr.write(
+            'local_typing_gate: origin/main has no .github/typing_budget.json '
+            'and HEAD does not introduce it.\n',
         )
-        sys.stderr.write(msg + '\n')
         sys.exit(2)
     return ['--bootstrap']
 
