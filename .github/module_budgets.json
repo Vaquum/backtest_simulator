@@ -2,7 +2,7 @@
   "backtest_simulator/__init__.py": 50,
   "backtest_simulator/_limen_cache.py": 100,
   "backtest_simulator/launcher/__init__.py": 30,
-  "backtest_simulator/launcher/action_submitter.py": 590,
+  "backtest_simulator/launcher/action_submitter.py": 620,
   "backtest_simulator/launcher/clock.py": 180,
   "backtest_simulator/launcher/launcher.py": 1130,
   "backtest_simulator/launcher/poller.py": 140,

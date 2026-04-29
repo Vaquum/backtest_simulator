@@ -12,6 +12,7 @@ from enum import Enum
 from types import SimpleNamespace
 from typing import cast
 
+from nexus.core.capital_controller.capital_controller import CapitalController
 from nexus.core.domain.enums import OrderSide
 from nexus.core.domain.instance_state import InstanceState
 from nexus.core.domain.order_types import ExecutionMode as _NexusExecutionMode
@@ -293,7 +294,17 @@ class SubmitterBindings:
     state: InstanceState
     praxis_outbound: PraxisOutbound
     validation_pipeline: ValidationPipeline
-    strategy_budget: Decimal
+    # Slice #28 — pipeline.validate's CAPITAL stage runs before
+    # HEALTH/PLATFORM_LIMITS, so a denial from a later stage carries
+    # the reservation forward (per nexus pipeline_executor). Without
+    # explicit release, available capital leaks. The action_submitter
+    # uses this controller to release reservations attached to denied
+    # decisions; the launcher constructs both pipeline + controller
+    # from the same `build_validation_pipeline` call so they share
+    # state. Default-None for tests that don't care (a denied
+    # decision with reservation=None is a no-op release path).
+    capital_controller: CapitalController | None = None
+    strategy_budget: Decimal = Decimal('0')
     touch_provider: Callable[[str], Decimal | None] | None = None
     tick_provider: Callable[[str], Decimal] | None = None
     # Slice #17 Task 29 — ATR R-denominator gameability gate.
@@ -337,10 +348,16 @@ def build_action_submitter(
         calls can tie back to the original reservation.
       - `on_submit` is the pre-existing drain hook the clock loop uses.
 
-    The only stage this pipeline actually enforces in Part 2 is CAPITAL;
-    INTAKE / RISK / PRICE / HEALTH / PLATFORM_LIMITS are `_allow` stubs
-    as documented in `backtest_simulator.honesty.capital`. ABORT flows
-    through `praxis_outbound.send_abort` unchanged.
+    Slice #28: every Nexus pipeline stage runs a real `validate_*_stage`
+    call. INTAKE / RISK / PRICE / CAPITAL / HEALTH / PLATFORM_LIMITS are
+    all backed by their respective Nexus validators with MMVP-lenient
+    defaults; operator-supplied limits + snapshot providers in
+    `backtest_simulator.honesty.capital.build_validation_pipeline` dial
+    in real denial behavior. CAPITAL runs before HEALTH/PLATFORM_LIMITS
+    in stage order, so a late-stage denial that carries the reservation
+    forward triggers an explicit `capital_controller.release_reservation`
+    in `_submit_translated`. ABORT flows through `praxis_outbound.send_abort`
+    unchanged.
     """
     def _submit(actions: list[Action], strategy_id: str) -> None:
         for raw_action in actions:
@@ -492,6 +509,24 @@ def _submit_translated(
         return command_id, decision, context
     decision = bindings.validation_pipeline.validate(context)
     if not decision.allowed:
+        # Slice #28: CAPITAL is stage 4 of 6, so HEALTH/PLATFORM_LIMITS
+        # denials carry the CAPITAL-stage reservation forward in the
+        # denied decision (nexus pipeline_executor preserves it). The
+        # action is dropped without reaching Praxis, so no fill / no
+        # `order_ack` / no `order_fill` will retire the reservation.
+        # Release it explicitly so available capital is not leaked.
+        if decision.reservation is not None and bindings.capital_controller is not None:
+            release_result = bindings.capital_controller.release_reservation(
+                decision.reservation.reservation_id,
+            )
+            if not release_result.success:
+                _log.warning(
+                    'pipeline-denied reservation release failed: '
+                    'reservation_id=%s reason=%s category=%s',
+                    decision.reservation.reservation_id,
+                    release_result.reason,
+                    release_result.category,
+                )
         _log.warning(
             'validation denied: stage=%s reason_code=%s message=%s command_id=%s',
             decision.failed_stage.value if decision.failed_stage else None,

@@ -1160,6 +1160,7 @@ class BacktestLauncher(Launcher):
                 nexus_config=nexus_config, state=state,
                 praxis_outbound=praxis_outbound,
                 validation_pipeline=pipeline,
+                capital_controller=controller,
                 strategy_budget=allocated_capital,
                 touch_provider=touch_provider,
                 tick_provider=tick_provider,

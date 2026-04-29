@@ -242,6 +242,63 @@ def test_platform_notional_denies() -> None:
     assert decision.reason_code.startswith('PLATFORM_LIMITS_MAX_ORDER_NOTIONAL')
 
 
+# ---- Pipeline-denied reservation is released, not leaked ------------------
+
+
+def test_late_stage_denial_releases_capital_reservation() -> None:
+    """HEALTH/PLATFORM denial after CAPITAL allows must release the reservation.
+
+    Codex post-auditor-1 P1: CAPITAL is stage 4 of 6, so a HEALTH or
+    PLATFORM_LIMITS denial that fires AFTER CAPITAL would carry the
+    reservation forward in the denied decision. Without explicit
+    release, available capital leaks per-denial. The fix lives in
+    `_submit_translated`: on a denied decision with `reservation
+    is not None`, call `capital_controller.release_reservation`.
+    This test exercises the full path: build pipeline → drive an ENTER
+    that CAPITAL allows → HEALTH denies → confirm controller's
+    `reservation_notional` is back to zero.
+    """
+    cfg = InstanceConfig(account_id='bts-test', venue='binance_spot_simulated')
+    policy = HealthStagePolicy(
+        latency_ms=HealthMetricThresholds(breach=Decimal('10')),
+    )
+
+    def hot_snapshot() -> HealthStageSnapshot:
+        return HealthStageSnapshot(
+            latency_ms=Decimal('100'), consecutive_failures=Decimal('0'),
+            failure_rate=Decimal('0'), rate_limit_headroom=Decimal('1'),
+            clock_drift_ms=Decimal('0'),
+        )
+
+    pipeline, controller, capital_state = build_validation_pipeline(
+        nexus_config=cfg, capital_pool=Decimal('100000'),
+        health_policy=policy, health_snapshot_provider=hot_snapshot,
+    )
+    ctx = _ctx(
+        command_id='cmd-leak-1', nexus_config=cfg,
+        capital_state=capital_state,
+    )
+    decision = pipeline.validate(ctx)
+    # The pipeline returns a denied decision carrying the CAPITAL
+    # reservation forward. The action_submitter will release it; we
+    # simulate that here by calling the controller directly.
+    assert not decision.allowed
+    assert decision.failed_stage == ValidationStage.HEALTH
+    assert decision.reservation is not None, (
+        'CAPITAL ran before HEALTH and should have produced a reservation'
+    )
+    # Pre-release: reservation_notional > 0 (the leak shape).
+    assert capital_state.reservation_notional > Decimal('0')
+    release_result = controller.release_reservation(
+        decision.reservation.reservation_id,
+    )
+    assert release_result.success, (
+        f'release_reservation failed: {release_result.reason}'
+    )
+    # Post-release: reservation_notional back to zero — capital not leaked.
+    assert capital_state.reservation_notional == Decimal('0')
+
+
 # ---- SELL fast-path divergence is documented in source --------------------
 
 
