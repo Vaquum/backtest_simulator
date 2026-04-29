@@ -11,10 +11,12 @@ from __future__ import annotations
 import ast
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 
 from nexus.core.domain.capital_state import CapitalState
 from nexus.core.domain.enums import OrderSide
 from nexus.core.domain.instance_state import InstanceState
+from nexus.core.domain.order_types import ExecutionMode, OrderType
 from nexus.core.domain.risk_state import RiskState
 from nexus.core.validator.health_stage import (
     HealthMetricThresholds,
@@ -31,12 +33,16 @@ from nexus.core.validator.platform_limits_stage import (
 )
 from nexus.core.validator.price_stage import PriceCheckSnapshot
 from nexus.core.validator.risk_stage import RiskStageLimits
+from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
 from nexus.instance_config import InstanceConfig
+from nexus.strategy.action import Action, ActionType
 
 from backtest_simulator.honesty import build_validation_pipeline
 from backtest_simulator.launcher.action_submitter import (
+    SubmitterBindings,
     _check_atr_sanity,
     _check_declared_stop,
+    build_action_submitter,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -245,18 +251,40 @@ def test_platform_notional_denies() -> None:
 # ---- Pipeline-denied reservation is released, not leaked ------------------
 
 
-def test_late_stage_denial_releases_capital_reservation() -> None:
-    """HEALTH/PLATFORM denial after CAPITAL allows must release the reservation.
+class _OutboundStub:
+    """Captures `send_command` / `send_abort` for the action_submitter.
 
-    Codex post-auditor-1 P1: CAPITAL is stage 4 of 6, so a HEALTH or
-    PLATFORM_LIMITS denial that fires AFTER CAPITAL would carry the
-    reservation forward in the denied decision. Without explicit
-    release, available capital leaks per-denial. The fix lives in
-    `_submit_translated`: on a denied decision with `reservation
-    is not None`, call `capital_controller.release_reservation`.
-    This test exercises the full path: build pipeline → drive an ENTER
-    that CAPITAL allows → HEALTH denies → confirm controller's
-    `reservation_notional` is back to zero.
+    The release-leak test drives the production `submit` end-to-end;
+    we never expect a command to reach the outbound when HEALTH denies,
+    but we keep the fields populated to satisfy the protocol.
+    """
+
+    def __init__(self) -> None:
+        self.commands: list[object] = []
+        self.aborts: list[object] = []
+
+    def send_command(self, cmd: object) -> str:
+        self.commands.append(cmd)
+        import uuid
+        return str(uuid.uuid4())
+
+    def send_abort(self, **kwargs: object) -> None:
+        self.aborts.append(kwargs)
+
+
+def test_late_stage_denial_releases_capital_reservation() -> None:
+    """HEALTH denial after CAPITAL allows must release the reservation.
+
+    End-to-end through the production action_submitter: build pipeline
+    + controller, wire SubmitterBindings exactly the way the launcher
+    does, drive a BUY ENTER that CAPITAL allows but HEALTH denies, and
+    assert that `capital_state.reservation_notional` is back to zero.
+
+    Deleting the release block at `action_submitter.py::_submit_translated`
+    must fail this test. CAPITAL is stage 4 of 6, so a HEALTH or
+    PLATFORM_LIMITS denial that fires AFTER CAPITAL carries the
+    reservation forward in the denied decision; without explicit
+    release, available capital would leak per-denial.
     """
     cfg = InstanceConfig(account_id='bts-test', venue='binance_spot_simulated')
     policy = HealthStagePolicy(
@@ -274,29 +302,39 @@ def test_late_stage_denial_releases_capital_reservation() -> None:
         nexus_config=cfg, capital_pool=Decimal('100000'),
         health_policy=policy, health_snapshot_provider=hot_snapshot,
     )
-    ctx = _ctx(
-        command_id='cmd-leak-1', nexus_config=cfg,
-        capital_state=capital_state,
+    outbound = _OutboundStub()
+    submit = build_action_submitter(SubmitterBindings(
+        nexus_config=cfg,
+        state=InstanceState(capital=capital_state),
+        praxis_outbound=cast(PraxisOutbound, outbound),
+        validation_pipeline=pipeline,
+        capital_controller=controller,
+        strategy_budget=Decimal('100000'),
+    ))
+    action = Action(
+        action_type=ActionType.ENTER,
+        direction=OrderSide.BUY,
+        size=Decimal('0.001'),
+        execution_mode=ExecutionMode.SINGLE_SHOT,
+        order_type=OrderType.MARKET,
+        execution_params={'symbol': 'BTCUSDT', 'stop_price': '49750'},
+        deadline=60,
+        trade_id=None,
+        command_id='cmd-action-submit-release',
+        maker_preference=None,
+        reference_price=Decimal('50000'),
     )
-    decision = pipeline.validate(ctx)
-    # The pipeline returns a denied decision carrying the CAPITAL
-    # reservation forward. The action_submitter will release it; we
-    # simulate that here by calling the controller directly.
-    assert not decision.allowed
-    assert decision.failed_stage == ValidationStage.HEALTH
-    assert decision.reservation is not None, (
-        'CAPITAL ran before HEALTH and should have produced a reservation'
+    submit([action], 'long_on_signal')
+    # HEALTH denied → no command reached Praxis.
+    assert len(outbound.commands) == 0
+    # ...AND the CAPITAL-stage reservation was released.
+    # (Removing the release block in _submit_translated would leave
+    # reservation_notional > 0 here.)
+    assert capital_state.reservation_notional == Decimal('0'), (
+        f'reservation leaked: notional={capital_state.reservation_notional} — '
+        'the action_submitter did not release the CAPITAL reservation '
+        'attached to the HEALTH-denied decision.'
     )
-    # Pre-release: reservation_notional > 0 (the leak shape).
-    assert capital_state.reservation_notional > Decimal('0')
-    release_result = controller.release_reservation(
-        decision.reservation.reservation_id,
-    )
-    assert release_result.success, (
-        f'release_reservation failed: {release_result.reason}'
-    )
-    # Post-release: reservation_notional back to zero — capital not leaked.
-    assert capital_state.reservation_notional == Decimal('0')
 
 
 # ---- SELL fast-path divergence is documented in source --------------------
