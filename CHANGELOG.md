@@ -1,3 +1,38 @@
+# v2.0.7
+
+BTS-tooling-trust slice — closes the two ways the local CLI and the
+CI gates were two different universes. After this slice, `bts lint`
+produces the same output set CI's `pr_checks_lint` runs, and
+`bts gate typing` produces the same pyright pass/fail state CI's
+`pr_checks_typing` produces. The CLI-first contract ("bts or it
+didn't happen") requires byte-equivalence between the operator's
+acceptance run and CI's; this slice closes the two known divergences.
+
+## Fix 1 — `bts lint` default paths
+
+`backtest_simulator/cli/commands/lint.py:_DEFAULT_PATHS` dropped the
+`'scripts'` entry. The `scripts/` directory was retired in PR #21
+(merged into `tools/`); the stale entry caused `bts lint` to fail
+with E902 "No such file or directory: scripts" while `bts gate lint`
+and CI both passed.
+
+## Fix 2 — `bts gate typing` matches CI byte-for-byte
+
+`backtest_simulator/cli/commands/gate.py::_build_command('typing')`
+now plants PEP 561 `py.typed` markers in `nexus / praxis / limen /
+clickhouse_connect` before invoking pyright (mirroring the
+`pr_checks_typing` workflow's "Plant py.typed markers in sibling
+libraries" step), and passes `--pythonpath sys.executable` so pyright
+finds the venv's site-packages. Without these, local pyright reported
+~2300 errors (reportMissingImports, reportUnknownMemberType) for code
+CI saw cleanly.
+
+## Test surface
+
+`tests/cli/test_bts_lint_paths.py` and
+`tests/cli/test_bts_gate_typing_parity.py` lock both fixes — a
+regression in either restores the divergence and breaks the test.
+
 # v2.0.6
 
 Validator-parity slice — five Nexus pipeline stages that were `_allow`

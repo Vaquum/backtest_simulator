@@ -39,17 +39,39 @@ def _build_command(name: str, repo_root: Path) -> list[str]:
         return [sys.executable, '-m', 'ruff', 'check',
                 'backtest_simulator', 'tools', 'tests']
     if name == 'typing':
-        # Mirror the pr_checks_typing workflow: pyright JSON output
-        # piped into tools/typing_gate.py against the protected base-
-        # ref budget. The local invocation uses
-        # `git show origin/main:.github/typing_budget.json` (or
-        # `HEAD:` as a fallback) as the base, NOT `--bootstrap` —
-        # bootstrap disables the ratchet and would let a local gate
-        # pass after raising the budget while CI still rejected.
+        # Mirror the pr_checks_typing workflow byte-for-byte. Two
+        # things differ between a default local invocation and CI:
+        #
+        # 1. CI plants `py.typed` markers (PEP 561) in nexus / praxis /
+        #    limen / clickhouse_connect right after install — see
+        #    `.github/workflows/pr_checks_typing.yml` step "Plant
+        #    py.typed markers in sibling libraries". Without these,
+        #    pyright emits ~80 `reportMissingTypeStubs` + cascading
+        #    reportUnknown* errors that CI never sees. We plant the
+        #    markers here too (idempotent: open(..., 'a').close()).
+        #
+        # 2. CI runs pyright against system Python where every dep is
+        #    installed; pyright auto-detects that interpreter. Locally
+        #    the package lives inside `.venv/`, and pyright's
+        #    auto-detection does NOT pick the venv when invoked via
+        #    `python -m pyright`. Without `--pythonpath sys.executable`
+        #    pyright sees ~145 reportMissingImports (polars, numpy,
+        #    structlog, nexus, praxis, …) for code that runs cleanly.
+        #    Passing the interpreter path explicitly aligns local with
+        #    CI; CI does not need the flag because its pyright already
+        #    sees the system Python.
+        #
+        # Together these two were the "different universes" gap
+        # — local typing gate could pass while CI rejected (or vice
+        # versa). The CLI-first contract requires byte-equivalent
+        # behavior; these two extra steps close the gap.
         return [
             sys.executable, '-c',
-            'import subprocess, sys; '
-            'pyr = subprocess.run([sys.executable, "-m", "pyright", "--outputjson", "backtest_simulator"], '
+            'import os, subprocess, sys; '
+            'import nexus, praxis, limen, clickhouse_connect; '
+            "[open(os.path.join(os.path.dirname(p.__file__), 'py.typed'), 'a').close() "
+            'for p in (nexus, praxis, limen, clickhouse_connect)]; '
+            'pyr = subprocess.run([sys.executable, "-m", "pyright", "--pythonpath", sys.executable, "--outputjson", "backtest_simulator"], '
             'capture_output=True, text=True, check=False); '
             'open("pyright_output.json", "w").write(pyr.stdout); '
             'base = subprocess.run(["git", "show", "origin/main:.github/typing_budget.json"], '
