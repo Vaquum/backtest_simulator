@@ -39,51 +39,20 @@ def _build_command(name: str, repo_root: Path) -> list[str]:
         return [sys.executable, '-m', 'ruff', 'check',
                 'backtest_simulator', 'tools', 'tests']
     if name == 'typing':
-        # Mirror the pr_checks_typing workflow byte-for-byte. Two
-        # things differ between a default local invocation and CI:
+        # Mirror `pr_checks_typing.yml` byte-for-byte: plant PEP 561
+        # `py.typed` markers in sibling libs (CI's "Plant py.typed
+        # markers in sibling libraries" step), invoke pyright with
+        # `--pythonpath sys.executable` so the venv's site-packages
+        # is discovered (CI uses system Python where auto-detection
+        # works), and resolve the base-budget oracle with the same
+        # bootstrap-or-fail-loud conditional CI uses (origin/main +
+        # HEAD-introduces-file check, never silent fallback).
         #
-        # 1. CI plants `py.typed` markers (PEP 561) in nexus / praxis /
-        #    limen / clickhouse_connect right after install — see
-        #    `.github/workflows/pr_checks_typing.yml` step "Plant
-        #    py.typed markers in sibling libraries". Without these,
-        #    pyright emits ~80 `reportMissingTypeStubs` + cascading
-        #    reportUnknown* errors that CI never sees. We plant the
-        #    markers here too (idempotent: open(..., 'a').close()).
-        #
-        # 2. CI runs pyright against system Python where every dep is
-        #    installed; pyright auto-detects that interpreter. Locally
-        #    the package lives inside `.venv/`, and pyright's
-        #    auto-detection does NOT pick the venv when invoked via
-        #    `python -m pyright`. Without `--pythonpath sys.executable`
-        #    pyright sees ~145 reportMissingImports (polars, numpy,
-        #    structlog, nexus, praxis, …) for code that runs cleanly.
-        #    Passing the interpreter path explicitly aligns local with
-        #    CI; CI does not need the flag because its pyright already
-        #    sees the system Python.
-        #
-        # Together these two were the "different universes" gap
-        # — local typing gate could pass while CI rejected (or vice
-        # versa). The CLI-first contract requires byte-equivalent
-        # behavior; these two extra steps close the gap.
-        return [
-            sys.executable, '-c',
-            'import os, subprocess, sys; '
-            'import nexus, praxis, limen, clickhouse_connect; '
-            "[open(os.path.join(os.path.dirname(p.__file__), 'py.typed'), 'a').close() "
-            'for p in (nexus, praxis, limen, clickhouse_connect)]; '
-            'pyr = subprocess.run([sys.executable, "-m", "pyright", "--pythonpath", sys.executable, "--outputjson", "backtest_simulator"], '
-            'capture_output=True, text=True, check=False); '
-            'open("pyright_output.json", "w").write(pyr.stdout); '
-            'base = subprocess.run(["git", "show", "origin/main:.github/typing_budget.json"], '
-            'capture_output=True, text=True, check=False); '
-            'base = base if base.returncode == 0 else '
-            'subprocess.run(["git", "show", "HEAD:.github/typing_budget.json"], '
-            'capture_output=True, text=True, check=True); '
-            'open("base_budget.json", "w").write(base.stdout); '
-            'sys.exit(subprocess.run([sys.executable, "tools/typing_gate.py", '
-            '"--pyright-json", "pyright_output.json", '
-            '"--base-budget", "base_budget.json"]).returncode)',
-        ]
+        # Implementation lives in `backtest_simulator.cli._typing_runner`
+        # so the conditional is readable Python rather than a dense
+        # one-liner string. Each step there has a docstring naming the
+        # workflow step it mirrors.
+        return [sys.executable, '-m', 'backtest_simulator.cli._typing_runner']
     if name == 'honesty':
         return [sys.executable, '-m', 'pytest', *_honesty_paths(repo_root),
                 '-v', '--tb=short']
