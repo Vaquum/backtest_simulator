@@ -1,4 +1,4 @@
-# v2.0.8
+# v2.1.0
 
 Limen-bundle slice — `bts run --bundle <zip>` and `bts sweep --bundle <zip>`
 consume the upstream Limen bundle directly. The bundle is a zip with

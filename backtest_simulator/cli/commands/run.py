@@ -32,6 +32,7 @@ from backtest_simulator.cli._pipeline import (
     ensure_trained_from_exp_code,
     pick_decoders,
     preflight_tunnel,
+    train_decoder_by_id_from_csv,
 )
 from backtest_simulator.cli._run_window import run_window_in_subprocess
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
@@ -183,7 +184,9 @@ def _run(args: argparse.Namespace) -> int:
             f'bts run: --window-end ({window_end}) must be > --window-start ({window_start})\n',
         )
         return 2
-    _materialize_bundle_if_requested(args)
+    from backtest_simulator.cli._pipeline import WORK_DIR
+    from backtest_simulator.pipeline.bundle import materialize_bundle_on_args
+    materialize_bundle_on_args(args, WORK_DIR)
     preflight_tunnel()
     perm_id, kelly, exp_dir, display_id = _resolve_decoder(args)
     result = run_window_in_subprocess(
@@ -399,31 +402,6 @@ def _maybe_assert_parity(
     return 0
 
 
-def _materialize_bundle_if_requested(args: argparse.Namespace) -> None:
-    """If --bundle was supplied, extract it and rewrite args to point at
-    the synthesized exp-code shim + bundled CSV.
-
-    No-op when --bundle is absent. Idempotent: a second call sees the
-    args already populated.
-    """
-    bundle = getattr(args, 'bundle', None)
-    if bundle is None:
-        return
-    if getattr(args, 'exp_code', None) is not None:
-        # argparse's mutually-exclusive group should prevent this, but
-        # belt-and-braces: refuse the ambiguous shape.
-        msg = 'bts run: --bundle and --exp-code are mutually exclusive.'
-        raise ValueError(msg)
-    from backtest_simulator.cli._pipeline import WORK_DIR
-    from backtest_simulator.pipeline.bundle import materialize_bundle_for_cli
-    bundle_path = Path(bundle).expanduser().resolve()
-    cache_dir = WORK_DIR / 'bundles' / bundle_path.stem
-    shim_path, csv_path = materialize_bundle_for_cli(bundle_path, cache_dir)
-    args.exp_code = shim_path
-    if getattr(args, 'input_from_file', None) is None:
-        args.input_from_file = csv_path
-
-
 def _resolve_decoder(args: argparse.Namespace) -> tuple[int, Decimal, Path, int]:
     """Pick one decoder via the operator's `--exp-code` file."""
     exp_code_path = Path(args.exp_code).expanduser().resolve()
@@ -435,22 +413,28 @@ def _resolve_decoder(args: argparse.Namespace) -> tuple[int, Decimal, Path, int]
         )
         raise FileNotFoundError(msg)
     if args.decoder_id is not None:
-        # Explicit decoder by id — use the experiment_dir produced
-        # by the operator's exp-code file (or args.experiment_dir
-        # if they want to point at a pre-existing one). Auditor P0:
-        # the auto-train path uses `args.n_permutations` (the
-        # Limen model size), NOT `args.n_decoders` (the pick-pool
-        # size). Asking for `--decoder-id 7` against a 1-permutation
-        # cache raises an "id not found" loud error from
-        # `_kelly_for_decoder`; ensuring the cache holds at least
-        # `n_permutations` rows means decoder ids in [0, n) are
-        # satisfiable.
+        # Explicit decoder by id. Three paths:
+        #   1. --experiment-dir given: trust the caller's pre-trained dir.
+        #   2. --input-from-file given (e.g. via --bundle): read that CSV
+        #      row directly and train just one decoder against the
+        #      operator's SFD. The bundle's CSV is the canonical pool;
+        #      retraining UEL would diverge from what the bundle promised.
+        #   3. neither: bts trains UEL against the operator's exp-code
+        #      with --n-permutations and reads the resulting results.csv.
         if args.experiment_dir is not None:
             exp_dir = args.experiment_dir
-        else:
-            exp_dir = ensure_trained_from_exp_code(
-                exp_code_path, args.n_permutations,
+            return (
+                args.decoder_id,
+                _kelly_for_decoder(exp_dir, args.decoder_id),
+                exp_dir, args.decoder_id,
             )
+        if args.input_from_file is not None:
+            return train_decoder_by_id_from_csv(
+                Path(args.input_from_file), exp_code_path, args.decoder_id,
+            )
+        exp_dir = ensure_trained_from_exp_code(
+            exp_code_path, args.n_permutations,
+        )
         return (
             args.decoder_id,
             _kelly_for_decoder(exp_dir, args.decoder_id),

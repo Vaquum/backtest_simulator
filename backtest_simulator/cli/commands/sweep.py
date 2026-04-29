@@ -222,29 +222,11 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
     p.set_defaults(func=_run)
 
 
-def _materialize_bundle_if_requested(args: argparse.Namespace) -> None:
-    """If --bundle was supplied, extract it and rewrite args to point at
-    the synthesized exp-code shim + bundled CSV. No-op when --bundle is absent.
-    """
-    bundle = getattr(args, 'bundle', None)
-    if bundle is None:
-        return
-    if getattr(args, 'exp_code', None) is not None:
-        msg = 'bts sweep: --bundle and --exp-code are mutually exclusive.'
-        raise ValueError(msg)
-    from backtest_simulator.cli._pipeline import WORK_DIR
-    from backtest_simulator.pipeline.bundle import materialize_bundle_for_cli
-    bundle_path = Path(bundle).expanduser().resolve()
-    cache_dir = WORK_DIR / 'bundles' / bundle_path.stem
-    shim_path, csv_path = materialize_bundle_for_cli(bundle_path, cache_dir)
-    args.exp_code = shim_path
-    if getattr(args, 'input_from_file', None) is None:
-        args.input_from_file = str(csv_path)
-
-
 def _run(args: argparse.Namespace) -> int:
     configure(args.verbose)
-    _materialize_bundle_if_requested(args)
+    from backtest_simulator.cli._pipeline import WORK_DIR
+    from backtest_simulator.pipeline.bundle import materialize_bundle_on_args
+    materialize_bundle_on_args(args, WORK_DIR)
     if (args.trading_hours_start is None) != (args.trading_hours_end is None):
         sys.stderr.write(
             'bts sweep: --trading-hours-start and --trading-hours-end '
