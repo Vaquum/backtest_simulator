@@ -53,13 +53,25 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
     # `if __name__ == '__main__':` so importing the file has no
     # side effects — bts drives uel itself with bts-controlled
     # n_permutations.
-    p.add_argument('--exp-code', required=True, type=Path,
+    exp_group = p.add_mutually_exclusive_group(required=True)
+    exp_group.add_argument('--exp-code', type=Path,
                    help=(
                        'Path to a UEL-compliant Python file with '
                        'module-level params() and manifest() '
-                       'callables. REQUIRED — bts has no fallback '
-                       'SFD; this file is the source of truth for '
-                       'training and retraining picked decoders.'
+                       'callables. Mutually exclusive with --bundle. '
+                       'bts has no fallback SFD; this file is the '
+                       'source of truth for training and retraining '
+                       'picked decoders.'
+                   ))
+    exp_group.add_argument('--bundle', type=Path,
+                   help=(
+                       'Path to a Limen-exported bundle zip '
+                       '(<name>__rNNNN.zip) containing sibling '
+                       '<name>.py + <name>.json + <name>.csv. '
+                       'Mutually exclusive with --exp-code; bts '
+                       'extracts the bundle, applies the JSON '
+                       'data_source / uel_run overrides, and uses '
+                       'the bundled CSV as the filter pool.'
                    ))
     p.add_argument('--window-start', required=True, type=str,
                    help='ISO8601 (e.g. 2026-04-20T08:00:00+00:00).')
@@ -171,6 +183,7 @@ def _run(args: argparse.Namespace) -> int:
             f'bts run: --window-end ({window_end}) must be > --window-start ({window_start})\n',
         )
         return 2
+    _materialize_bundle_if_requested(args)
     preflight_tunnel()
     perm_id, kelly, exp_dir, display_id = _resolve_decoder(args)
     result = run_window_in_subprocess(
@@ -384,6 +397,31 @@ def _maybe_assert_parity(
             f'tolerance={args.parity_tolerance}  n_events={n_events}',
         )
     return 0
+
+
+def _materialize_bundle_if_requested(args: argparse.Namespace) -> None:
+    """If --bundle was supplied, extract it and rewrite args to point at
+    the synthesized exp-code shim + bundled CSV.
+
+    No-op when --bundle is absent. Idempotent: a second call sees the
+    args already populated.
+    """
+    bundle = getattr(args, 'bundle', None)
+    if bundle is None:
+        return
+    if getattr(args, 'exp_code', None) is not None:
+        # argparse's mutually-exclusive group should prevent this, but
+        # belt-and-braces: refuse the ambiguous shape.
+        msg = 'bts run: --bundle and --exp-code are mutually exclusive.'
+        raise ValueError(msg)
+    from backtest_simulator.cli._pipeline import WORK_DIR
+    from backtest_simulator.pipeline.bundle import materialize_bundle_for_cli
+    bundle_path = Path(bundle).expanduser().resolve()
+    cache_dir = WORK_DIR / 'bundles' / bundle_path.stem
+    shim_path, csv_path = materialize_bundle_for_cli(bundle_path, cache_dir)
+    args.exp_code = shim_path
+    if getattr(args, 'input_from_file', None) is None:
+        args.input_from_file = csv_path
 
 
 def _resolve_decoder(args: argparse.Namespace) -> tuple[int, Decimal, Path, int]:

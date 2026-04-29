@@ -131,13 +131,25 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
     # `if __name__ == '__main__':` so importing the file has no
     # side effects — bts drives uel itself with bts-controlled
     # n_permutations + experiment_name.
-    p.add_argument('--exp-code', required=True, type=Path,
+    exp_group = p.add_mutually_exclusive_group(required=True)
+    exp_group.add_argument('--exp-code', type=Path,
                    help=(
                        'Path to a UEL-compliant Python file with '
                        'module-level params() and manifest() '
-                       'callables. REQUIRED — bts has no fallback '
-                       'SFD; this file is the source of truth for '
-                       'training and retraining picked decoders.'
+                       'callables. Mutually exclusive with --bundle. '
+                       'bts has no fallback SFD; this file is the '
+                       'source of truth for training and retraining '
+                       'picked decoders.'
+                   ))
+    exp_group.add_argument('--bundle', type=Path,
+                   help=(
+                       'Path to a Limen-exported bundle zip '
+                       '(<name>__rNNNN.zip) containing sibling '
+                       '<name>.py + <name>.json + <name>.csv. '
+                       'Mutually exclusive with --exp-code; bts '
+                       'extracts the bundle, applies the JSON '
+                       'data_source / uel_run overrides, and uses '
+                       'the bundled CSV as the filter pool.'
                    ))
     p.add_argument('--n-decoders', type=int, default=1)
     p.add_argument('--n-permutations', type=int, default=30)
@@ -210,8 +222,29 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
     p.set_defaults(func=_run)
 
 
+def _materialize_bundle_if_requested(args: argparse.Namespace) -> None:
+    """If --bundle was supplied, extract it and rewrite args to point at
+    the synthesized exp-code shim + bundled CSV. No-op when --bundle is absent.
+    """
+    bundle = getattr(args, 'bundle', None)
+    if bundle is None:
+        return
+    if getattr(args, 'exp_code', None) is not None:
+        msg = 'bts sweep: --bundle and --exp-code are mutually exclusive.'
+        raise ValueError(msg)
+    from backtest_simulator.cli._pipeline import WORK_DIR
+    from backtest_simulator.pipeline.bundle import materialize_bundle_for_cli
+    bundle_path = Path(bundle).expanduser().resolve()
+    cache_dir = WORK_DIR / 'bundles' / bundle_path.stem
+    shim_path, csv_path = materialize_bundle_for_cli(bundle_path, cache_dir)
+    args.exp_code = shim_path
+    if getattr(args, 'input_from_file', None) is None:
+        args.input_from_file = str(csv_path)
+
+
 def _run(args: argparse.Namespace) -> int:
     configure(args.verbose)
+    _materialize_bundle_if_requested(args)
     if (args.trading_hours_start is None) != (args.trading_hours_end is None):
         sys.stderr.write(
             'bts sweep: --trading-hours-start and --trading-hours-end '
