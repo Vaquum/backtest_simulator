@@ -1,3 +1,55 @@
+# v2.0.7
+
+BTS-tooling-trust slice — closes the two ways the local CLI and the
+CI gates were two different universes. After this slice, `bts lint`
+produces the same output set CI's `pr_checks_lint` runs, and
+`bts gate typing` produces the same pyright pass/fail state CI's
+`pr_checks_typing` produces. The CLI-first contract ("bts or it
+didn't happen") requires byte-equivalence between the operator's
+acceptance run and CI's; this slice closes the two known divergences.
+
+## Fix 1 — `bts lint` default paths
+
+`backtest_simulator/cli/commands/lint.py:_DEFAULT_PATHS` dropped the
+`'scripts'` entry. The `scripts/` directory was retired in PR #21
+(merged into `tools/`); the stale entry caused `bts lint` to fail
+with E902 "No such file or directory: scripts" while `bts gate lint`
+and CI both passed.
+
+## Fix 2 — `bts gate typing` matches CI byte-for-byte
+
+`bts gate typing` now shells out to `tools/local_typing_gate.py` —
+a small script that mirrors `pr_checks_typing.yml` step-for-step:
+
+- Plants PEP 561 `py.typed` markers in `nexus / praxis / limen / clickhouse_connect`
+  (skip-if-present, matching CI's `if not os.path.exists` shape).
+- Runs pyright with `--pythonpath sys.executable` so the venv's
+  site-packages is discovered (CI uses system Python where auto-
+  detection works).
+- Fetches `origin/main` (`git fetch origin main --depth=1`) before
+  reading the protected base-ref budget — without the fetch, a clone
+  one (or many) commits behind would read a stale budget and the
+  local gate could pass while CI fails (or vice versa).
+- Resolves the base-budget oracle from `origin/main:.github/typing_budget.json`;
+  bootstraps only when HEAD adds the file; fails loud otherwise.
+  Never silently falls back to `HEAD:`.
+- Fails loud when pyright produces empty output, surfacing pyright's
+  stderr — mirrors `pr_checks_typing.yml:184-189` so a pyright crash
+  shows the actual cause locally instead of a downstream JSON-decode
+  error from `tools/typing_gate.py`.
+
+Without these mirrors, local pyright reported ~2300 errors
+(reportMissingImports, reportUnknownMemberType) for code CI saw
+cleanly, and a stale base-budget could let a local PR pass while CI
+rejected.
+
+## Test surface
+
+`tests/cli/test_bts_lint_paths.py` (4) and
+`tests/cli/test_bts_gate_typing_parity.py` (9) — 13 tests total —
+lock both fixes; a regression in either restores the divergence and
+breaks the test.
+
 # v2.0.6
 
 Validator-parity slice — five Nexus pipeline stages that were `_allow`

@@ -39,29 +39,7 @@ def _build_command(name: str, repo_root: Path) -> list[str]:
         return [sys.executable, '-m', 'ruff', 'check',
                 'backtest_simulator', 'tools', 'tests']
     if name == 'typing':
-        # Mirror the pr_checks_typing workflow: pyright JSON output
-        # piped into tools/typing_gate.py against the protected base-
-        # ref budget. The local invocation uses
-        # `git show origin/main:.github/typing_budget.json` (or
-        # `HEAD:` as a fallback) as the base, NOT `--bootstrap` —
-        # bootstrap disables the ratchet and would let a local gate
-        # pass after raising the budget while CI still rejected.
-        return [
-            sys.executable, '-c',
-            'import subprocess, sys; '
-            'pyr = subprocess.run([sys.executable, "-m", "pyright", "--outputjson", "backtest_simulator"], '
-            'capture_output=True, text=True, check=False); '
-            'open("pyright_output.json", "w").write(pyr.stdout); '
-            'base = subprocess.run(["git", "show", "origin/main:.github/typing_budget.json"], '
-            'capture_output=True, text=True, check=False); '
-            'base = base if base.returncode == 0 else '
-            'subprocess.run(["git", "show", "HEAD:.github/typing_budget.json"], '
-            'capture_output=True, text=True, check=True); '
-            'open("base_budget.json", "w").write(base.stdout); '
-            'sys.exit(subprocess.run([sys.executable, "tools/typing_gate.py", '
-            '"--pyright-json", "pyright_output.json", '
-            '"--base-budget", "base_budget.json"]).returncode)',
-        ]
+        return [sys.executable, 'tools/local_typing_gate.py']
     if name == 'honesty':
         return [sys.executable, '-m', 'pytest', *_honesty_paths(repo_root),
                 '-v', '--tb=short']

@@ -35,8 +35,6 @@ def test_gate_honesty() -> None:
 def test_gate_typing() -> None:
     from backtest_simulator.cli.commands.gate import _build_command
     cmd = _build_command('typing', REPO_ROOT)
-    joined = ' '.join(cmd)
-    # The typing gate runs pyright then tools/typing_gate.py — not just
-    # pyright on its own. The subprocess script is embedded in the cmd.
-    assert 'pyright' in joined
-    assert 'typing_gate.py' in joined
+    assert cmd[1:] == ['tools/local_typing_gate.py'], (
+        f'`bts gate typing` must invoke tools/local_typing_gate.py. cmd[1:]={cmd[1:]!r}'
+    )

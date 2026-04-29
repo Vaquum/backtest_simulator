@@ -13,15 +13,16 @@ from typing import Final
 
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
 
+# Same path set CI runs (.github/workflows/pr_checks_lint.yml).
 _DEFAULT_PATHS: Final[tuple[str, ...]] = (
-    'backtest_simulator', 'tools', 'tests', 'scripts',
+    'backtest_simulator', 'tools', 'tests',
 )
 
 
 def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
     p = add_parser('lint', 'Run ruff check.')
     p.add_argument('--paths', nargs='*', type=Path, default=None,
-                   help='Override paths (default: backtest_simulator tools tests scripts).')
+                   help='Override paths (default: backtest_simulator tools tests).')
     p.add_argument('--fix', action='store_true', help='Apply ruff --fix.')
     add_verbosity_arg(p)
     p.set_defaults(func=_run)
