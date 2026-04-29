@@ -139,3 +139,74 @@ def test_capture_runtime_prediction_skips_when_timestamp_missing() -> None:
     sink: list[dict[str, object]] = []
     capture_runtime_prediction(wired=wired, signal=signal, sink=sink)
     assert sink == []
+
+
+def test_capture_runtime_prediction_drops_post_window_signal() -> None:
+    """Signals whose timestamp is AFTER `window_end` are dropped.
+
+    Why: `accelerated_clock` releases when the launcher exits the
+    `with` block, but the capture hook stays wired for the full
+    `run_window` call. Stray Timer thread fires after release see
+    `datetime.now(UTC)` returning wall time (e.g. today's date) — those
+    must not pollute the parity check, which is anchored to the
+    SIMULATED window. Without this filter, sweeps fail with "runtime
+    tick 2026-04-29T18:29Z OUTSIDE the scheduled grid (range:
+    2026-04-15 02:00..22:00)" — operator-observed in the bundle path.
+    """
+    wired = _FakeWired(sensor_id='d1')
+    window_start = datetime(2026, 4, 15, 0, 0, tzinfo=UTC)
+    window_end = datetime(2026, 4, 15, 23, 59, tzinfo=UTC)
+    # Wall-time straggler — well past window_end:
+    post_ts = datetime(2026, 4, 29, 18, 29, tzinfo=UTC)
+    signal = _FakeSignal(
+        values=MappingProxyType({'_preds': 1}),
+        timestamp=post_ts,
+    )
+    sink: list[dict[str, object]] = []
+    capture_runtime_prediction(
+        wired=wired, signal=signal, sink=sink,
+        window_start=window_start, window_end=window_end,
+    )
+    assert sink == []
+
+
+def test_capture_runtime_prediction_drops_pre_window_signal() -> None:
+    """Signals whose timestamp is BEFORE `window_start` are dropped.
+
+    Symmetric to the post-window case: a calibration produce_signal
+    that fires before the simulated window opens cannot anchor to
+    any expected_tick.
+    """
+    wired = _FakeWired(sensor_id='d1')
+    window_start = datetime(2026, 4, 15, 12, 0, tzinfo=UTC)
+    window_end = datetime(2026, 4, 15, 23, 59, tzinfo=UTC)
+    pre_ts = datetime(2026, 4, 15, 11, 59, tzinfo=UTC)
+    signal = _FakeSignal(
+        values=MappingProxyType({'_preds': 1}),
+        timestamp=pre_ts,
+    )
+    sink: list[dict[str, object]] = []
+    capture_runtime_prediction(
+        wired=wired, signal=signal, sink=sink,
+        window_start=window_start, window_end=window_end,
+    )
+    assert sink == []
+
+
+def test_capture_runtime_prediction_keeps_in_window_signal() -> None:
+    """Signals inside `[window_start, window_end]` are captured."""
+    wired = _FakeWired(sensor_id='d1')
+    window_start = datetime(2026, 4, 15, 0, 0, tzinfo=UTC)
+    window_end = datetime(2026, 4, 15, 23, 59, tzinfo=UTC)
+    in_ts = datetime(2026, 4, 15, 14, 0, tzinfo=UTC)
+    signal = _FakeSignal(
+        values=MappingProxyType({'_preds': 1}),
+        timestamp=in_ts,
+    )
+    sink: list[dict[str, object]] = []
+    capture_runtime_prediction(
+        wired=wired, signal=signal, sink=sink,
+        window_start=window_start, window_end=window_end,
+    )
+    assert len(sink) == 1
+    assert sink[0]['timestamp'] == in_ts.isoformat()

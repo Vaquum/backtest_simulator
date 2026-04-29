@@ -73,6 +73,7 @@ def test_signals_parity_match_returns_count() -> None:
         decoder_id='d1', table=table,
         runtime_predictions=runtime_predictions,
         expected_ticks=ticks,
+        interval_seconds=60,
     )
     assert n == len(ticks), (
         f'expected {len(ticks)} successful comparisons; got {n}'
@@ -102,6 +103,7 @@ def test_signals_parity_single_mismatch_raises() -> None:
             decoder_id='d1', table=table,
             runtime_predictions=runtime_predictions,
             expected_ticks=ticks,
+            interval_seconds=60,
         )
 
 
@@ -130,6 +132,7 @@ def test_signals_parity_empty_tick_set_raises() -> None:
             decoder_id='d1', table=table,
             runtime_predictions=runtime_predictions,
             expected_ticks=[],
+            interval_seconds=60,
         )
 
 
@@ -161,6 +164,7 @@ def test_signals_parity_only_out_of_grid_ticks_raises() -> None:
             decoder_id='d1', table=table,
             runtime_predictions=out_of_grid,
             expected_ticks=ticks,
+            interval_seconds=60,
         )
 
 
@@ -183,6 +187,7 @@ def test_signals_parity_empty_runtime_predictions_raises() -> None:
         assert_signals_parity(
             decoder_id='d1', table=table, runtime_predictions=[],
             expected_ticks=ticks,
+            interval_seconds=60,
         )
 
 
@@ -208,6 +213,7 @@ def test_signals_parity_malformed_entry_raises() -> None:
             decoder_id='d1', table=table,
             runtime_predictions=runtime_predictions,
             expected_ticks=ticks,
+            interval_seconds=60,
         )
 
 
@@ -229,6 +235,7 @@ def test_signals_parity_non_int_pred_raises() -> None:
             decoder_id='d1', table=table,
             runtime_predictions=runtime_predictions,
             expected_ticks=ticks,
+            interval_seconds=60,
         )
 
 
@@ -251,6 +258,7 @@ def test_signals_parity_partial_out_of_grid_raises() -> None:
             decoder_id='d1', table=table,
             runtime_predictions=runtime_predictions,
             expected_ticks=ticks,
+            interval_seconds=60,
         )
 
 
@@ -283,6 +291,7 @@ def test_signals_parity_partial_capture_missing_tick_raises() -> None:
             decoder_id='d1', table=table,
             runtime_predictions=partial,
             expected_ticks=ticks,
+            interval_seconds=60,
         )
 
 
@@ -310,6 +319,7 @@ def test_signals_parity_duplicate_runtime_tick_raises() -> None:
             decoder_id='d1', table=table,
             runtime_predictions=duped,
             expected_ticks=ticks,
+            interval_seconds=60,
         )
 
 
@@ -346,4 +356,108 @@ def test_signals_parity_cross_window_in_sweep_grid_raises() -> None:
             runtime_predictions=runtime_for_window1,
             # Per-window expected ticks (window 1 only):
             expected_ticks=window1_ticks,
+            interval_seconds=60,
         )
+
+
+def test_signals_parity_snaps_runtime_drift_to_expected_tick() -> None:
+    """Runtime tick lands AFTER its planned `expected_tick` boundary by
+    less than `interval_seconds` (clock-callback drift in the launcher).
+    The parity check must SNAP each such tick to its anchoring
+    expected_tick — same row, same comparison.
+
+    Mutation proof: removing the snap and reverting to strict equality
+    makes this test raise `OUTSIDE the scheduled` on every drifted
+    entry. Hardcoding interval_seconds=0 makes every drift unmatched.
+
+    The bundle path on `LogReg-Placeholder__r0007.zip` (`kline_size
+    =7200`) hits this: the launcher's main-loop tick advances frozen
+    time in 120s steps, and a Timer callback that runs while the
+    main loop is mid-tick observes frozen time several minutes past
+    the planned target. Without the snap, every fire raises.
+    """
+    preds = [1, 0, 1, 1, 0, 1, 0, 1]
+    table, ticks = _build_table(preds=preds)
+    # 60-second bars; simulate a 17-second drift (well within one bar).
+    runtime_predictions = [
+        {
+            'sensor_id': 'd1',
+            'timestamp': (t + timedelta(seconds=17)).isoformat(),
+            'pred': p,
+        }
+        for t, p in zip(ticks, preds, strict=True)
+    ]
+    n = assert_signals_parity(
+        decoder_id='d1', table=table,
+        runtime_predictions=runtime_predictions,
+        expected_ticks=ticks,
+        interval_seconds=60,
+    )
+    assert n == len(ticks), (
+        f'expected {len(ticks)} successful comparisons after snap; got {n}'
+    )
+
+
+def test_signals_parity_snap_drift_beyond_grid_raises() -> None:
+    """A runtime tick whose timestamp falls past the LAST expected_tick
+    + interval_seconds does not anchor to any expected_tick — that's a
+    real cadence divergence, not callback jitter. Raise OUTSIDE.
+
+    Mutation proof: a snap implementation that expanded the tolerance
+    to `+ 2 * interval_seconds` would silently match this entry to
+    the last tick and skip the divergence.
+    """
+    preds = [1, 0, 1, 1, 0, 1, 0, 1]
+    table, ticks = _build_table(preds=preds)
+    # ticks[-1] + 60s is the boundary; +120s lands strictly past it.
+    far_future = ticks[-1] + timedelta(seconds=120)
+    runtime_predictions = [
+        {
+            'sensor_id': 'd1',
+            'timestamp': far_future.isoformat(),
+            'pred': preds[-1],
+        },
+    ]
+    with pytest.raises(ParityViolation, match='OUTSIDE the scheduled'):
+        assert_signals_parity(
+            decoder_id='d1', table=table,
+            runtime_predictions=runtime_predictions,
+            expected_ticks=ticks,
+            interval_seconds=60,
+        )
+
+
+def test_signals_parity_kline_size_7200_with_drift() -> None:
+    """End-to-end at the bundle's actual cadence: kline_size=7200
+    (2-hour klines) with a 10-minute drift on every fire. The fix
+    must accept these as in-grid via snap.
+    """
+    base = datetime(2026, 4, 15, 0, 0, tzinfo=UTC)
+    ticks = [base + timedelta(seconds=i * 7200) for i in range(12)]
+    preds = [1, 0] * 6
+    table = SignalsTable.from_predictions(
+        decoder_id='bundle-snap',
+        split_config=(70, 15, 15),
+        predictions=PredictionsInput(
+            timestamps=ticks,
+            probs=np.array([0.55] * 12),
+            preds=np.array(preds, dtype=np.int64),
+            label_horizon_bars=1,
+            bar_seconds=7200,
+        ),
+    )
+    runtime_predictions = [
+        {
+            'sensor_id': 'bundle-snap',
+            'timestamp': (t + timedelta(minutes=10)).isoformat(),
+            'pred': p,
+        }
+        for t, p in zip(ticks, preds, strict=True)
+    ]
+    n = assert_signals_parity(
+        decoder_id='bundle-snap', table=table,
+        runtime_predictions=runtime_predictions,
+        expected_ticks=ticks,
+        interval_seconds=7200,
+    )
+    assert n == len(ticks)

@@ -24,7 +24,7 @@ from backtest_simulator.cli._pipeline import (
     seed_price_at,
 )
 from backtest_simulator.cli._run_window import (
-    RUN_WINDOW_INTERVAL_SECONDS,
+    read_kline_size_from_experiment_dir,
     run_window_in_subprocess,
 )
 from backtest_simulator.cli._signals_builder import (
@@ -83,6 +83,34 @@ def assert_sweep_signals_parity_ran(
         f'is unreliable and is rejected.'
     )
     raise ParityViolation(msg)
+
+
+def _resolve_grid_interval(
+    picks: list[tuple[int, Decimal, Path, int]],
+) -> int:
+    """Pick the single `interval_seconds` for the sweep's parity grid.
+
+    A single `bts sweep` invocation runs against ONE exp_code or ONE
+    bundle, so every pick's experiment_dir derives from the same SFD
+    manifest and shares one `kline_size`. We assert this — a mismatch
+    means picks were assembled from heterogeneous training pools and
+    the shared parity grid is not well-defined.
+    """
+    seen: dict[int, Path] = {}
+    for _, _, exp_dir, _ in picks:
+        ks = read_kline_size_from_experiment_dir(exp_dir)
+        prior = seen.get(ks)
+        if prior is None:
+            seen[ks] = exp_dir
+    if len(seen) != 1:
+        msg = (
+            f'_resolve_grid_interval: picks declare more than one '
+            f'kline_size: {seen}. A single sweep must run against a '
+            f'homogeneous decoder pool (one bundle / one exp_code) '
+            f'— the parity grid uses ONE cadence.'
+        )
+        raise ValueError(msg)
+    return next(iter(seen))
 
 
 def _runtime_tick_timestamps(
@@ -280,11 +308,19 @@ def _run(args: argparse.Namespace) -> int:
     # firing schedule (codex round-4 P0); iterating klines instead
     # of ticks over-emits when interval_seconds < kline_size, and
     # always over-emits across non-trading hours.
+    #
+    # Cadence anchor: the runtime PredictLoop's Timer fires every
+    # `kline_size` seconds (set in `_run_window.py` from the SAME
+    # `read_kline_size_from_experiment_dir`). The parity grid must
+    # use the SAME cadence — otherwise different-kline_size bundles
+    # (e.g. 7200 in the LogReg-Placeholder bundle vs 3600 in earlier
+    # exp-codes) raise ParityViolation on every fire.
+    interval_seconds = _resolve_grid_interval(picks)
     replay_start = datetime.combine(days[0].date(), hours_start, tzinfo=UTC)
     replay_end = datetime.combine(days[-1].date(), hours_end, tzinfo=UTC)
     tick_timestamps = _runtime_tick_timestamps(
         days=days, hours_start=hours_start, hours_end=hours_end,
-        interval_seconds=RUN_WINDOW_INTERVAL_SECONDS,
+        interval_seconds=interval_seconds,
     )
     signals_per_decoder = _build_and_save_signals_tables(
         picks, tick_timestamps=tick_timestamps,
@@ -489,6 +525,7 @@ def _run(args: argparse.Namespace) -> int:
                 table=table,
                 runtime_predictions=runtime_preds_list,
                 expected_ticks=window_expected_ticks,
+                interval_seconds=interval_seconds,
             )
             sweep_signals_parity_total += n_signals_compared
             print_run(

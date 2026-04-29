@@ -40,12 +40,35 @@ from backtest_simulator.cli._pipeline import (
     seed_price_at,
 )
 
-# Tick cadence baked into every per-window manifest. Importers
-# (e.g. `_signals_builder.py` via `sweep.py`) pin to this constant
-# so SignalsTable build replays at the SAME boundaries Nexus's
-# PredictLoop fires at runtime — the byte-equivalence promise
-# under "strategy tested, strategy deployed".
-RUN_WINDOW_INTERVAL_SECONDS: int = 3600
+
+def read_kline_size_from_experiment_dir(experiment_dir: Path) -> int:
+    """Read `kline_size` from `experiment_dir/metadata.json`'s SFD manifest.
+
+    Mirrors `BacktestLauncher._kline_size_from_experiment_dir` so the
+    sensor's `interval_seconds` (the runtime PredictLoop Timer cadence)
+    and the sweep's `expected_ticks` parity grid both anchor to the
+    SAME source of truth — the SFD's `data_source_config.params
+    ['kline_size']`. Anything else is drift between "what the bundle
+    declared" and "what bts actually ticks at", which is the bug
+    operator hit on the LogReg-Placeholder bundle (kline_size=7200,
+    bts hardcoded to 3600).
+    """
+    metadata_path = experiment_dir / 'metadata.json'
+    if not metadata_path.is_file():
+        msg = (
+            f'read_kline_size_from_experiment_dir: metadata.json not '
+            f'found at {metadata_path} — cannot derive kline_size for '
+            f'the SensorBinding interval. Limen writes this file when '
+            f'the experiment dir is created; missing it means the dir '
+            f'was created out-of-band or got truncated.'
+        )
+        raise FileNotFoundError(msg)
+    metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+    sfd_module_name = metadata['sfd_module']
+    import importlib  # local import — cli hot path is import-light
+    sfd = importlib.import_module(sfd_module_name)
+    limen_manifest = sfd.manifest()
+    return int(limen_manifest.data_source_config.params['kline_size'])
 
 
 # Shape of the dict returned by `run_window_in_process` and
@@ -95,6 +118,8 @@ class WindowResult(TypedDict):
 
 def capture_runtime_prediction(
     *, wired: object, signal: object, sink: list[dict[str, object]],
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
 ) -> None:
     """Append `(sensor_id, timestamp, pred)` to `sink` if `signal` carries a `_preds` int.
 
@@ -110,11 +135,22 @@ def capture_runtime_prediction(
     real-runtime prediction — sweep parity printed "no comparisons
     made" forever. Accept `collections.abc.Mapping` instead.
 
+    `window_start` / `window_end`: optional bounds (UTC). When given,
+    signals whose `timestamp` falls outside `[window_start, window_end]`
+    are dropped. This filters the launcher's grace-drain stragglers
+    that fire AFTER `accelerated_clock` releases and so carry wall-
+    clock timestamps from the present moment, not the simulated tick
+    instant. Without this filter, a sweep that ran at 18:29 wall
+    today would record a "runtime tick at 2026-04-29T18:29:34Z" for
+    a 2026-04-15 simulated window, breaking parity.
+
     Silently no-ops on:
       - `signal.values` is not a `Mapping`
       - `_preds` key is absent
       - `_preds` value is not an `int`
       - `signal.timestamp` is not a `datetime`
+      - `signal.timestamp` falls outside `[window_start, window_end]`
+        (when those bounds are supplied)
 
     Each silent skip is a real "missing data" signal — the wrapper
     cannot synthesize a valid (t, pred) pair from the absence. The
@@ -131,6 +167,10 @@ def capture_runtime_prediction(
         return
     ts_obj = getattr(signal, 'timestamp', None)
     if not isinstance(ts_obj, datetime):
+        return
+    if window_start is not None and ts_obj < window_start:
+        return
+    if window_end is not None and ts_obj > window_end:
         return
     sink.append({
         'sensor_id': str(getattr(wired, 'sensor_id', '')),
@@ -182,6 +222,13 @@ def run_window_in_process(
     state_dir = work / 'state'
     state_dir.mkdir()
 
+    # Honor the experiment's declared kline_size as the runtime
+    # PredictLoop tick cadence. With kline_size=7200 (2-hour klines)
+    # in the bundle and a hardcoded 3600 here, every other Timer tick
+    # would re-predict on stale data and the parity check downstream
+    # would land on a wrong-cadence grid (codex P0: "different bundles
+    # must run properly").
+    interval_seconds = read_kline_size_from_experiment_dir(experiment_dir)
     built = ManifestBuilder(output_dir=manifest_dir).build(
         account=AccountSpec(
             account_id='bts-sweep',
@@ -192,7 +239,7 @@ def run_window_in_process(
         sensor=SensorBinding(
             experiment_dir=experiment_dir,
             permutation_ids=(perm_id,),
-            interval_seconds=RUN_WINDOW_INTERVAL_SECONDS,
+            interval_seconds=interval_seconds,
         ),
         strategy_params=StrategyParamsSpec(
             symbol=SYMBOL,
@@ -299,6 +346,7 @@ def run_window_in_process(
         signal = _real_produce_signal(wired, market_data)
         capture_runtime_prediction(
             wired=wired, signal=signal, sink=runtime_predictions,
+            window_start=window_start, window_end=window_end,
         )
         return signal
 
