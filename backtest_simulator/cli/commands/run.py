@@ -32,6 +32,7 @@ from backtest_simulator.cli._pipeline import (
     ensure_trained_from_exp_code,
     pick_decoders,
     preflight_tunnel,
+    train_decoder_by_id_from_csv,
 )
 from backtest_simulator.cli._run_window import run_window_in_subprocess
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
@@ -53,13 +54,26 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
     # `if __name__ == '__main__':` so importing the file has no
     # side effects — bts drives uel itself with bts-controlled
     # n_permutations.
-    p.add_argument('--exp-code', required=True, type=Path,
+    exp_group = p.add_mutually_exclusive_group(required=True)
+    exp_group.add_argument('--exp-code', type=Path,
                    help=(
                        'Path to a UEL-compliant Python file with '
                        'module-level params() and manifest() '
-                       'callables. REQUIRED — bts has no fallback '
-                       'SFD; this file is the source of truth for '
-                       'training and retraining picked decoders.'
+                       'callables. Mutually exclusive with --bundle. '
+                       'bts has no fallback SFD; this file is the '
+                       'source of truth for training and retraining '
+                       'picked decoders.'
+                   ))
+    exp_group.add_argument('--bundle', type=Path,
+                   help=(
+                       'Path to a Limen-exported bundle zip '
+                       '(<name>__rNNNN.zip) containing sibling '
+                       '<name>.py + <name>.json + <name>.csv. '
+                       'Mutually exclusive with --exp-code. bts '
+                       'applies the JSON `data_source` override and '
+                       '`uel_run.n_permutations` (when --n-permutations '
+                       'is not given), and uses the bundled CSV as '
+                       'the filter pool.'
                    ))
     p.add_argument('--window-start', required=True, type=str,
                    help='ISO8601 (e.g. 2026-04-20T08:00:00+00:00).')
@@ -79,7 +93,7 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
     # matches `bts sweep`'s 30 for consistency. Ignored when
     # --experiment-dir is supplied (the operator points at a
     # pre-existing one).
-    p.add_argument('--n-permutations', type=int, default=30,
+    p.add_argument('--n-permutations', type=int, default=None,
                    help=(
                        'Number of UEL permutations to train when '
                        'auto-training the experiment dir. Ignored '
@@ -171,6 +185,9 @@ def _run(args: argparse.Namespace) -> int:
             f'bts run: --window-end ({window_end}) must be > --window-start ({window_start})\n',
         )
         return 2
+    from backtest_simulator.cli._pipeline import WORK_DIR
+    from backtest_simulator.pipeline.bundle import materialize_bundle_on_args
+    materialize_bundle_on_args(args, WORK_DIR)
     preflight_tunnel()
     perm_id, kelly, exp_dir, display_id = _resolve_decoder(args)
     result = run_window_in_subprocess(
@@ -397,22 +414,28 @@ def _resolve_decoder(args: argparse.Namespace) -> tuple[int, Decimal, Path, int]
         )
         raise FileNotFoundError(msg)
     if args.decoder_id is not None:
-        # Explicit decoder by id — use the experiment_dir produced
-        # by the operator's exp-code file (or args.experiment_dir
-        # if they want to point at a pre-existing one). Auditor P0:
-        # the auto-train path uses `args.n_permutations` (the
-        # Limen model size), NOT `args.n_decoders` (the pick-pool
-        # size). Asking for `--decoder-id 7` against a 1-permutation
-        # cache raises an "id not found" loud error from
-        # `_kelly_for_decoder`; ensuring the cache holds at least
-        # `n_permutations` rows means decoder ids in [0, n) are
-        # satisfiable.
+        # Explicit decoder by id. Three paths:
+        #   1. --experiment-dir given: trust the caller's pre-trained dir.
+        #   2. --input-from-file given (e.g. via --bundle): read that CSV
+        #      row directly and train just one decoder against the
+        #      operator's SFD. The bundle's CSV is the canonical pool;
+        #      retraining UEL would diverge from what the bundle promised.
+        #   3. neither: bts trains UEL against the operator's exp-code
+        #      with --n-permutations and reads the resulting results.csv.
         if args.experiment_dir is not None:
             exp_dir = args.experiment_dir
-        else:
-            exp_dir = ensure_trained_from_exp_code(
-                exp_code_path, args.n_permutations,
+            return (
+                args.decoder_id,
+                _kelly_for_decoder(exp_dir, args.decoder_id),
+                exp_dir, args.decoder_id,
             )
+        if args.input_from_file is not None:
+            return train_decoder_by_id_from_csv(
+                Path(args.input_from_file), exp_code_path, args.decoder_id,
+            )
+        exp_dir = ensure_trained_from_exp_code(
+            exp_code_path, args.n_permutations,
+        )
         return (
             args.decoder_id,
             _kelly_for_decoder(exp_dir, args.decoder_id),

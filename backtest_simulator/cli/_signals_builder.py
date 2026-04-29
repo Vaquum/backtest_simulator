@@ -23,7 +23,7 @@
 # bars + feature warmup), not with the experiment's training span.
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 import numpy as np
@@ -230,11 +230,39 @@ def _as_utc_datetime(ts: object) -> datetime:
     return ts
 
 
+def _snap_runtime_to_expected(
+    *, ts: datetime, expected_ticks: list[datetime],
+    interval_seconds: int,
+) -> datetime | None:
+    """Find the unique `expected_tick e` such that `e <= ts < e + interval_seconds`.
+
+    The PredictLoop's Timer fires at an exact `expected_tick` boundary,
+    but the strategy's signal carries `signal.timestamp = datetime.now
+    (UTC)` at signal-construction time — which lands AFTER the boundary
+    by the launcher's main-loop callback drift (documented in
+    `launcher.py:_advance_clock_until` as "~10 min per main tick").
+    Each runtime tick belongs to the unique expected_tick whose half-
+    open `[e, e + interval_seconds)` window contains it.
+
+    Returns the matching `e` on success; `None` if no expected_tick is
+    within `interval_seconds` of `ts` (drift > one interval is a real
+    cadence divergence, not just callback jitter).
+    """
+    matches = [
+        e for e in expected_ticks
+        if e <= ts < e + timedelta(seconds=interval_seconds)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 def assert_signals_parity(
     *, decoder_id: str,
     table: SignalsTable,
     runtime_predictions: list[dict[str, object]],
     expected_ticks: list[datetime],
+    interval_seconds: int,
 ) -> int:
     """Verify SignalsTable matches per-tick runtime predictions.
 
@@ -333,14 +361,21 @@ def assert_signals_parity(
                 f'Capture serialiser produced unverifiable data.'
             )
             raise ParityViolation(msg)
-        if ts not in covered:
-            # Codex (post-auditor-4) P1: out-of-grid runtime
-            # ticks were silently skipped, masking a partial
-            # capture failure. Now loud: any tick outside the
-            # scheduled grid is a divergence between when the
-            # PredictLoop fired and what the sweep planned. The
-            # operator sees the offending timestamp + the grid
-            # bounds.
+        # Snap the runtime tick down to its anchoring expected_tick.
+        # Why: the PredictLoop's Timer fires at `target` (an exact
+        # `expected_tick` boundary), but the strategy's signal then
+        # carries `signal.timestamp = datetime.now(UTC)` at the moment
+        # of signal-construction — which lands AFTER `target` by the
+        # launcher's main-loop callback drift (the documented
+        # "~10 min per main tick" in `launcher.py:_advance_clock_until`).
+        # The runtime tick belongs to the unique `expected_tick e`
+        # such that `e <= ts < e + interval_seconds`. Drifts BEYOND
+        # one interval are real bugs and still raise.
+        snapped_ts = _snap_runtime_to_expected(
+            ts=ts, expected_ticks=expected_ticks,
+            interval_seconds=interval_seconds,
+        )
+        if snapped_ts is None:
             grid_min = min(covered) if covered else None
             grid_max = max(covered) if covered else None
             msg = (
@@ -348,14 +383,16 @@ def assert_signals_parity(
                 f'{decoder_id!r}: runtime tick {ts.isoformat()} '
                 f'falls OUTSIDE the scheduled per-window `expected_ticks` '
                 f'grid (range: {grid_min}..{grid_max}, '
-                f'n_ticks={len(covered)}). The PredictLoop fired '
-                f'at an unexpected instant — sweep replay did not '
-                f'plan a comparison there, or the sweep passed the '
-                f'whole-sweep grid instead of the per-window slice.'
+                f'n_ticks={len(covered)}, interval_seconds='
+                f'{interval_seconds}). The PredictLoop fired at an '
+                f'instant that does not anchor to any expected tick '
+                f'within one interval window — capture is broken, '
+                f'the runtime cadence diverged from the planned '
+                f'grid, or the sweep passed the wrong grid slice.'
             )
             raise ParityViolation(msg)
-        captured.append(ts)
-        row = table.lookup(ts)
+        captured.append(snapped_ts)
+        row = table.lookup(snapped_ts)
         if row is None:
             # In-grid timestamp with no row is a build-side bug
             # (the table failed to write the row it scheduled).
@@ -363,16 +400,18 @@ def assert_signals_parity(
             # row to compare against.
             msg = (
                 f'SignalsTable parity violation for decoder '
-                f'{decoder_id!r}: scheduled tick {ts.isoformat()} '
+                f'{decoder_id!r}: scheduled tick {snapped_ts.isoformat()} '
                 f'has no row in the table — build skipped this '
-                f'instant. Sweep-time replay incomplete; cannot '
-                f'compare runtime pred={runtime_pred}.'
+                f'instant (runtime ts={ts.isoformat()}). Sweep-time '
+                f'replay incomplete; cannot compare runtime '
+                f'pred={runtime_pred}.'
             )
             raise ParityViolation(msg)
         if row.pred != runtime_pred:
             msg = (
                 f'SignalsTable parity violation for decoder '
-                f'{decoder_id!r} at tick {ts.isoformat()}: '
+                f'{decoder_id!r} at tick {snapped_ts.isoformat()} '
+                f'(runtime ts={ts.isoformat()}): '
                 f'runtime Sensor.predict() emitted pred={runtime_pred} '
                 f'but the sweep-time SignalsTable says pred={row.pred}. '
                 f'The deployed strategy is operating on different '

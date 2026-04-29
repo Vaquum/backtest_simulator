@@ -116,6 +116,17 @@ def _install_sweep_stubs(
             raise RuntimeError(msg)
         return subprocess_result
 
+    # `_resolve_grid_interval` reads kline_size from each pick's
+    # experiment_dir's `metadata.json` (Limen writes it; the bundle
+    # path relies on it). Stub picks build empty tmp dirs, so we
+    # short-circuit the helper to the historical 1-hour cadence the
+    # SignalsTable test fixtures use.
+    def _fake_kline_size(_path: Path) -> int:
+        return 3600
+    monkeypatch.setattr(
+        sweep_module, 'read_kline_size_from_experiment_dir',
+        _fake_kline_size,
+    )
     monkeypatch.setattr(sweep_module, 'pick_decoders', _fake_pick_decoders)
     monkeypatch.setattr(
         sweep_module, '_build_and_save_signals_tables', _fake_build,
@@ -337,8 +348,10 @@ def test_sweep_run_calls_parity_unconditionally_even_with_empty_predictions(
         *, decoder_id: str, table: SignalsTable,
         runtime_predictions: list[dict[str, object]],
         expected_ticks: list[datetime],
+        interval_seconds: int,
     ) -> int:
         del decoder_id, table, runtime_predictions, expected_ticks
+        del interval_seconds
         n_calls['value'] += 1
         return 0
 
@@ -402,8 +415,9 @@ def test_sweep_run_passes_per_window_expected_ticks_only(
         *, decoder_id: str, table: SignalsTable,
         runtime_predictions: list[dict[str, object]],
         expected_ticks: list[datetime],
+        interval_seconds: int,
     ) -> int:
-        del decoder_id, table, runtime_predictions
+        del decoder_id, table, runtime_predictions, interval_seconds
         captured_calls.append(list(expected_ticks))
         # Return non-zero so post-loop guard doesn't fire.
         return 1

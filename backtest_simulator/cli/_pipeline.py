@@ -648,6 +648,51 @@ def _cache_dir_matches_expected_module(
     return snapshot_path.is_file()
 
 
+def train_decoder_by_id_from_csv(
+    csv_path: Path, exp_code_path: Path, decoder_id: int,
+) -> tuple[int, Decimal, Path, int]:
+    """Mirror `pick_decoders`'s file-mode for the explicit-id case.
+
+    `bts run --bundle X --decoder-id N` lands here: read row at
+    id == N, train that one decoder via `train_single_decoder`,
+    return `(0, kelly, sub_dir, N)`.
+    """
+    import polars as pl
+    csv_path = Path(csv_path).expanduser().resolve()
+    if not csv_path.is_file():
+        msg = f'train_decoder_by_id_from_csv: {csv_path} does not exist'
+        raise FileNotFoundError(msg)
+    op_param_keys = derive_op_param_keys(exp_code_path)
+    results = pl.read_csv(csv_path)
+    if 'id' not in results.columns or 'backtest_mean_kelly_pct' not in results.columns:
+        msg = (
+            f'{csv_path} missing required columns `id` and / or '
+            f'`backtest_mean_kelly_pct`'
+        )
+        raise ValueError(msg)
+    row_df = results.filter(pl.col('id') == decoder_id)
+    if row_df.height == 0:
+        msg = f'decoder_id={decoder_id} not found in {csv_path}'
+        raise ValueError(msg)
+    row = {k: row_df[k][0] for k in op_param_keys}
+    params = row_params(row, op_param_keys)
+    kelly_raw = row_df['backtest_mean_kelly_pct'][0]
+    kelly = Decimal(str(kelly_raw))
+    exp_code_content_hash = hashlib.sha256(exp_code_path.read_bytes()).hexdigest()
+    cache_input = json.dumps({
+        'params': {k: str(v) for k, v in sorted(params.items())},
+        'exp_code_path': str(exp_code_path),
+        'exp_code_sha256': exp_code_content_hash,
+    }, sort_keys=True)
+    cache_hash = hashlib.sha256(cache_input.encode('utf-8')).hexdigest()
+    sub_dir = (
+        WORK_DIR / 'trained_from_file'
+        / f'{csv_path.stem}_{exp_code_path.stem}_id_{decoder_id}_{cache_hash}'
+    )
+    train_single_decoder(sub_dir, params, exp_code_path, op_param_keys)
+    return (0, kelly, sub_dir, decoder_id)
+
+
 def pick_decoders(
     n: int, *,
     exp_code_path: Path,

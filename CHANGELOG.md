@@ -1,3 +1,36 @@
+# v2.1.0
+
+Limen-bundle slice — `bts run --bundle <zip>` and `bts sweep --bundle <zip>`
+consume the upstream Limen bundle directly. The bundle is a zip with
+three sibling files at the same stem:
+
+- `<name>__rNNNN.py` — canonical SFD definition (imports + helpers + class).
+- `<name>__rNNNN.json` — overrides for `data_source` (method + params)
+  and `uel_run` (experiment_name, n_permutations, prep_each_round, etc.).
+  JSON wins where it overlaps with the .py's script body.
+- `<name>__rNNNN.csv` — the trained-and-filtered results pool (one
+  row per decoder; `id` matches `--decoder-id`).
+
+bts loads the .py up to (but not including) the first runtime
+side-effect statement (`limen.HistoricalData(...)`,
+`historical.get_spot_klines(...)`, `limen.UniversalExperimentLoop(...)`,
+or `<uel>.run(...)`) — everything above is the SFD class + helpers
+bts needs; everything below is the script's reproducer body bts ignores.
+Module-level `params` / `manifest` aliases are written into a synthetic
+shim file at `WORK_DIR / 'bundles' / <stem> / <stem>__bts_shim.py`,
+with the manifest's `data_source_config` replaced from the JSON values.
+
+`backtest_simulator/pipeline/bundle.py` carries `extract_bundle`,
+`_strip_runtime_body`, `load_bundled_experiment`, and the CLI helper
+`materialize_bundle_for_cli`. `--bundle` is mutually exclusive with
+`--exp-code` on both `bts run` and `bts sweep`; the bundle's `.csv`
+auto-populates `--input-from-file` unless the operator overrides it.
+
+15 contract tests in `tests/pipeline/test_bundle.py` lock the AST cut
+rule, the bundle-shape acceptance, the JSON `data_source` override,
+the `--bundle` / `--exp-code` mutual exclusion, and the synthetic
+shim's compatibility with the existing `ExperimentPipeline.load_from_file`.
+
 # v2.0.7
 
 BTS-tooling-trust slice — closes the two ways the local CLI and the
