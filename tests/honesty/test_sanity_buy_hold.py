@@ -153,6 +153,7 @@ def test_sanity_buy_hold() -> None:
     trades = _trades_dataframe()
     initial_pool = Decimal('100000')
     pipeline, _controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=initial_pool,
     )
     outbound = _OutboundCapture()

@@ -264,6 +264,7 @@ def _run_buy_hold_on_tape(
     submit = None
     if outbound is not None:
         pipeline, _controller, capital_state = build_validation_pipeline(
+            nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
             capital_pool=_INITIAL_CAPITAL,
         )
         bindings = SubmitterBindings(

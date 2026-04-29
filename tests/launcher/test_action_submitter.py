@@ -67,6 +67,7 @@ def _pipeline_and_state() -> tuple[ValidationPipeline, InstanceState]:
     # the InstanceState carries — that's the invariant the real
     # launcher enforces and what the CAPITAL validator reads from.
     pipeline, _controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     state = InstanceState(capital=capital_state)

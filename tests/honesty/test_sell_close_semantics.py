@@ -64,6 +64,7 @@ def test_sell_close_does_not_reserve_capital() -> None:
     # double-commit).
     outbound = _OutboundStub()
     pipeline, _controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     state = InstanceState(capital=capital_state)
@@ -107,6 +108,7 @@ def test_sell_close_still_fires_on_submit() -> None:
     # the drain for SELL would hang the clock.
     outbound = _OutboundStub()
     pipeline, _controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=Decimal('100000'),
     )
     state = InstanceState(capital=capital_state)

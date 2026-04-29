@@ -309,6 +309,7 @@ def _run_production_path(seed: int, trades: pl.DataFrame, signal_times: list[dat
     by the caller against the strategy's emitted action count.
     """
     pipeline, _controller, capital_state = build_validation_pipeline(
+        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
         capital_pool=_INITIAL_CAPITAL,
     )
     outbound = _OutboundCapture()
