@@ -106,6 +106,7 @@ def build_validation_pipeline(
     health_snapshot_provider: Callable[[], HealthStageSnapshot] = _default_health_snapshot,
     platform_snapshot_provider: Callable[[], PlatformLimitsStageSnapshot] = _default_platform_snapshot,
     price_snapshot_provider: Callable[[], PriceCheckSnapshot | None] = _default_price_snapshot,
+    max_allocation_per_trade_pct: Decimal | None = None,
 ) -> tuple[ValidationPipeline, CapitalController, CapitalState]:
     """Build the six-stage validator pipeline that runs every backtest action.
 
@@ -128,7 +129,13 @@ def build_validation_pipeline(
     acceleration.
     """
     state = CapitalState(capital_pool=capital_pool)
-    controller = CapitalController(state)
+    if max_allocation_per_trade_pct is None:
+        controller = CapitalController(state)
+    else:
+        controller = CapitalController(
+            state,
+            max_allocation_per_trade_pct=max_allocation_per_trade_pct,
+        )
 
     intake_hooks = build_default_intake_hooks(nexus_config)
     resolved_risk_limits = risk_limits if risk_limits is not None else RiskStageLimits()

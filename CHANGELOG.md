@@ -1,3 +1,55 @@
+# v2.2.0
+
+Bts honors bundle `data_source.params` end-to-end and exposes the
+two new Nexus 0.35.0 / 0.36.0 kwargs as bts CLI flags
+(`--max-allocation-per-trade-pct` and `--predict-lookback`).
+
+Without this, `BacktestMarketDataPoller` fetched klines using the
+hardcoded `DEFAULT_N_ROWS=5000` / `DEFAULT_START_DATE_LIMIT=
+'2019-01-01'` regardless of what the bundle's `data_source.params`
+declared, so the runtime feed silently diverged from the slice
+Limen trained on. The launcher now resolves params per-kline_size
+from each sensor's `experiment_dir/metadata.json -> sfd_module ->
+manifest()` and forwards them to the poller via a new
+`params_by_kline_size` kwarg. Unknown params keys fail loud at
+fetch time. `sweep.py`'s SignalsTable replay path mirrors the
+same fetch byte-for-byte.
+
+The two new bts CLI flags wire upstream Nexus kwargs:
+
+- `--max-allocation-per-trade-pct` overrides Nexus
+  CapitalController's per-trade cap (default `0.15`). bts
+  pre-clamps the strategy's Kelly% to `max / (1 +
+  NOTIONAL_RESERVATION_BUFFER)` so a request above the cap arrives
+  at the cap rather than being denied for overshoot.
+- `--predict-lookback` overrides Nexus's `produce_signal` lookback
+  (default `1`), so multi-row history reaches stateful predictors
+  (rolling-quantile thresholds, hysteresis state machines).
+  `--predict-lookback` also threads into
+  `build_signals_table_for_decoder` so the SignalsTable parity
+  reference uses the same lookback as the runtime path; without
+  this the parity gate fires `ParityViolation` for stateful
+  predictors when `--predict-lookback > 1`.
+
+Renames `_NOTIONAL_RESERVATION_BUFFER` -> `NOTIONAL_RESERVATION_BUFFER`
+in `action_submitter` so the CLI sizing helper imports it without
+a private-cross-module pyright violation. Adds `vaquum-nexus` to
+uv `override-dependencies` for parity with the existing Limen pin.
+
+Tests in `tests/cli/test_run_window_sizing.py` cover the four
+paths through `_effective_kelly_pct_for_allocation` (no cap,
+below cap, above cap, non-positive cap rejected).
+
+Surfaces: `backtest_simulator/launcher/poller.py`,
+`backtest_simulator/launcher/launcher.py`,
+`backtest_simulator/launcher/action_submitter.py`,
+`backtest_simulator/honesty/capital.py`,
+`backtest_simulator/cli/_run_window.py`,
+`backtest_simulator/cli/_signals_builder.py`,
+`backtest_simulator/cli/commands/run.py`,
+`backtest_simulator/cli/commands/sweep.py`,
+`pyproject.toml`, `tests/cli/test_run_window_sizing.py`.
+
 # v2.1.0
 
 Limen-bundle slice — `bts run --bundle <zip>` and `bts sweep --bundle <zip>`

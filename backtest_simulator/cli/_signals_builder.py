@@ -82,6 +82,8 @@ def build_signals_table_for_decoder(
     tick_timestamps: list[datetime],
     round_params: dict[str, object],
     decoder_id: str,
+    predict_lookback: int | None = None,
+    n_rows: int | None = None,
 ) -> SignalsTable:
     """Build SignalsTable for one decoder via per-bar runtime replay.
 
@@ -169,15 +171,34 @@ def build_signals_table_for_decoder(
 
     # Per-tick replay — Nexus's exact recipe, batched. Match
     # `BacktestMarketDataPoller.get_market_data` byte-for-byte at
-    # each tick: causal slice + `tail(POLLER_N_ROWS)` (codex round-3
-    # P0). Iterate at the runtime tick instants (codex round-4 P0).
+    # each tick: causal slice + `tail(n_rows)` where `n_rows`
+    # comes from the bundle's `data_source.params` (falls back to
+    # POLLER_N_ROWS if the bundle didn't declare it). Iterate at
+    # the runtime tick instants (codex round-4 P0).
+    if predict_lookback is not None and predict_lookback < 1:
+        msg = (
+            f'build_signals_table_for_decoder: predict_lookback must be '
+            f'>= 1, got {predict_lookback}. predict consumes '
+            f'tail(predict_lookback); lookback < 1 yields empty x_test '
+            f'and an IndexError on `_preds[-1]`.'
+        )
+        raise ValueError(msg)
+    if n_rows is not None and n_rows < 1:
+        msg = (
+            f'build_signals_table_for_decoder: n_rows must be >= 1, got '
+            f'{n_rows}. Per-tick causal slice tails n_rows; n_rows < 1 '
+            f'yields an empty causal frame and the bar is silently skipped.'
+        )
+        raise ValueError(msg)
     manifest_full = manifest.with_params_override(split_config=(1, 0, 0))
+    effective_lookback = 1 if predict_lookback is None else predict_lookback
+    effective_n_rows = POLLER_N_ROWS if n_rows is None else n_rows
     timestamps: list[datetime] = []
     preds_list: list[int] = []
     probs_list: list[float] = []
     for raw_tick in tick_timestamps:
         tick = _as_utc_datetime(raw_tick)
-        causal = klines.filter(pl.col('datetime') <= tick).tail(POLLER_N_ROWS)
+        causal = klines.filter(pl.col('datetime') <= tick).tail(effective_n_rows)
         if causal.is_empty():
             # No klines yet at this tick — runtime poller would
             # return an empty frame and `produce_signal` would emit
@@ -192,10 +213,14 @@ def build_signals_table_for_decoder(
             # Feature warmup hasn't filled — Nexus's runtime would
             # also emit no Signal here. Skip honestly.
             continue
-        last_x = x_train_obj.tail(1).to_numpy()
+        last_x = x_train_obj.tail(effective_lookback).to_numpy()
         result = sensor.predict({'x_test': last_x})
-        preds_list.append(int(result['_preds'][0]))
-        probs_list.append(float(result['_probs'][0]))
+        # Mirror Nexus's `_extract_values`: take the last element of
+        # the predict output array, which corresponds to the current
+        # tick. With effective_lookback==1 this reduces to the legacy
+        # single-row behaviour.
+        preds_list.append(int(result['_preds'][-1]))
+        probs_list.append(float(result['_probs'][-1]))
         timestamps.append(tick)
 
     if not timestamps:

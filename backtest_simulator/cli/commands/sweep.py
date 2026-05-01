@@ -39,7 +39,10 @@ from backtest_simulator.cli._stats import (
 )
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
 from backtest_simulator.honesty.cpcv import CpcvPaths
-from backtest_simulator.launcher.poller import DEFAULT_START_DATE_LIMIT
+from backtest_simulator.launcher.poller import (
+    DEFAULT_N_ROWS,
+    DEFAULT_START_DATE_LIMIT,
+)
 from backtest_simulator.sensors.precompute import SignalsTable
 
 _SECOND_WEEK_APRIL_START: Final = datetime(2026, 4, 6, tzinfo=UTC).date()
@@ -218,6 +221,20 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
                    ))
     p.add_argument('--atr-window-seconds', type=int, default=900,
                    help='ATR window in seconds. Default: 900s.')
+    p.add_argument('--max-allocation-per-trade-pct', type=str, default=None,
+                   help=(
+                       'Override Nexus CapitalController default of 0.15. '
+                       'Decimal fraction (e.g. 0.4 for 40%% of pool). Requires '
+                       'vaquum-nexus >= 0.35.0. Default: leave Nexus default.'
+                   ))
+    p.add_argument('--predict-lookback', type=int, default=None,
+                   help=(
+                       'Number of trailing prepared rows fed into '
+                       'sensor.predict per tick. Default 1 (single-row '
+                       'predict) preserves prior behaviour. >1 enables '
+                       'stateful predictors to evolve across rows. '
+                       'Requires vaquum-nexus >= 0.36.0.'
+                   ))
     # Slice #17 Task 17 (CPCV portion). Operator-controllable
     # CSCV partitioning. Defaults C(4,2)=6 paths so the math runs
     # on every default sweep that has enough clean days; otherwise
@@ -322,9 +339,14 @@ def _run(args: argparse.Namespace) -> int:
         days=days, hours_start=hours_start, hours_end=hours_end,
         interval_seconds=interval_seconds,
     )
+    raw_lookback_for_signals = getattr(args, 'predict_lookback', None)
     signals_per_decoder = _build_and_save_signals_tables(
         picks, tick_timestamps=tick_timestamps,
         replay_start=replay_start, replay_end=replay_end,
+        predict_lookback=(
+            None if raw_lookback_for_signals is None
+            else int(raw_lookback_for_signals)
+        ),
     )
     _print_sweep_signals_summary(
         signals_per_decoder, tick_timestamps=tick_timestamps,
@@ -403,6 +425,8 @@ def _run(args: argparse.Namespace) -> int:
             )
             sys.stderr.flush()
             t0 = time.perf_counter()
+            raw_max_alloc = getattr(args, 'max_allocation_per_trade_pct', None)
+            raw_lookback = getattr(args, 'predict_lookback', None)
             try:
                 result = run_window_in_subprocess(
                     perm_id, kelly, window_start, window_end, exp_dir,
@@ -410,6 +434,13 @@ def _run(args: argparse.Namespace) -> int:
                     strict_impact=bool(getattr(args, 'strict_impact', False)),
                     atr_k=str(getattr(args, 'atr_k', '0.5')),
                     atr_window_seconds=int(getattr(args, 'atr_window_seconds', 900)),
+                    max_allocation_per_trade_pct=(
+                        None if raw_max_alloc is None
+                        else Decimal(str(raw_max_alloc))
+                    ),
+                    predict_lookback=(
+                        None if raw_lookback is None else int(raw_lookback)
+                    ),
                 )
             except Exception as exc:
                 # Codex (post-auditor-4) P1: prior `continue` pattern
@@ -706,6 +737,7 @@ def _build_and_save_signals_tables(
     *,
     tick_timestamps: list[datetime],
     replay_start: datetime, replay_end: datetime,
+    predict_lookback: int | None = None,
 ) -> dict[str, SignalsTable]:
     """Build + save SignalsTable per picked decoder.
 
@@ -743,14 +775,42 @@ def _build_and_save_signals_tables(
             )
             raise ValueError(msg)
         kline_size = int(cfg.params['kline_size'])
-        # Same fetch the launcher's BacktestMarketDataPoller uses,
-        # so the precomputed predictions match runtime byte-for-byte
-        # (codex round-3 P0). The launcher passes no `start_date_limit`
-        # to the poller, so the poller's DEFAULT applies — NOT the
-        # manifest's start_date_limit.
+        # Mirror BacktestMarketDataPoller._fetch so the SignalsTable
+        # replay matches the runtime poller byte-for-byte. Defaults
+        # mirror the poller's: bundle-declared n_rows wins; absent
+        # falls back to DEFAULT_N_ROWS (NOT None — Limen treats None
+        # as "fetch full dataset" which is a memory regression).
+        ds_params = dict(cfg.params)
+        ds_params.pop('kline_size', None)
+        ds_n_rows_obj = ds_params.pop('n_rows', DEFAULT_N_ROWS)
+        ds_start_obj = ds_params.pop(
+            'start_date_limit', DEFAULT_START_DATE_LIMIT,
+        )
+        if ds_params:
+            msg = (
+                f'sweep signals: manifest at {exp_dir} declares '
+                f'unsupported data_source.params keys: '
+                f'{sorted(ds_params)}. Limen.HistoricalData.get_spot_klines '
+                f'accepts only n_rows / kline_size / start_date_limit.'
+            )
+            raise ValueError(msg)
+        if not isinstance(ds_n_rows_obj, int):
+            msg = (
+                f'sweep signals: manifest at {exp_dir} n_rows must be '
+                f'int, got {type(ds_n_rows_obj).__name__}={ds_n_rows_obj!r}'
+            )
+            raise TypeError(msg)
+        if not isinstance(ds_start_obj, str):
+            msg = (
+                f'sweep signals: manifest at {exp_dir} start_date_limit '
+                f'must be str, got '
+                f'{type(ds_start_obj).__name__}={ds_start_obj!r}'
+            )
+            raise TypeError(msg)
         klines = historical.get_spot_klines(
+            n_rows=ds_n_rows_obj,
             kline_size=kline_size,
-            start_date_limit=DEFAULT_START_DATE_LIMIT,
+            start_date_limit=ds_start_obj,
         )
         sensors = trainer.train([pid for pid, _ in decoders])
         for (perm_id, display_id), sensor in zip(decoders, sensors, strict=True):
@@ -762,6 +822,14 @@ def _build_and_save_signals_tables(
                 manifest=manifest, sensor=sensor, klines=klines,
                 tick_timestamps=tick_timestamps,
                 round_params=round_params, decoder_id=decoder_id,
+                predict_lookback=predict_lookback,
+                # Mirror the bundle's `data_source.params['n_rows']`
+                # the runtime poller reads (zero-bang on PR #43): without
+                # this, replay tails 5000 rows where the runtime tails
+                # the bundle's declared count, features diverge for any
+                # bundle declaring n_rows > 5000, and assert_signals_parity
+                # fires ParityViolation.
+                n_rows=ds_n_rows_obj,
             )
             # Load-bearing gates — wired so neither stays decorative.
             table.assert_split_alignment(manifest.split_config)

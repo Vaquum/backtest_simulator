@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
@@ -39,6 +39,39 @@ from backtest_simulator.cli._pipeline import (
     op_sfd_pythonpath,
     seed_price_at,
 )
+
+
+def _effective_kelly_pct_for_allocation(
+    kelly_pct: Decimal,
+    max_allocation_per_trade_pct: Decimal | None,
+) -> Decimal:
+    """Clamp Kelly sizing so CAPITAL sees max, not reject.
+
+    The strategy sizes raw notional as `capital * kelly_pct / 100`.
+    bts reserves a small notional buffer before sending to Nexus, so
+    cap the baked Kelly at `max / (1 + buffer)` rather than at `max`
+    directly. Example: max=0.4 with a 7% buffer -> raw Kelly cap is
+    37.383%, producing a reserved notional of 40%.
+    """
+    if max_allocation_per_trade_pct is None:
+        return kelly_pct
+    if max_allocation_per_trade_pct <= 0:
+        msg = (
+            f'max_allocation_per_trade_pct must be positive, '
+            f'got {max_allocation_per_trade_pct}'
+        )
+        raise ValueError(msg)
+    from backtest_simulator.launcher.action_submitter import (
+        NOTIONAL_RESERVATION_BUFFER,
+    )
+    max_kelly_pct = (
+        max_allocation_per_trade_pct
+        / (Decimal('1') + NOTIONAL_RESERVATION_BUFFER)
+        * Decimal('100')
+    ).quantize(
+        Decimal('0.000001'), rounding=ROUND_DOWN,
+    )
+    return min(kelly_pct, max_kelly_pct)
 
 
 def read_kline_size_from_experiment_dir(experiment_dir: Path) -> int:
@@ -198,8 +231,17 @@ def run_window_in_process(
     strict_impact: bool = False,
     atr_k: str = '0.5',
     atr_window_seconds: int = 900,
+    max_allocation_per_trade_pct: Decimal | None = None,
+    predict_lookback: int | None = None,
 ) -> WindowResult:
     """In-process single-window run — picklable result for cross-process use."""
+    if predict_lookback is not None and predict_lookback < 1:
+        msg = (
+            f'predict_lookback must be >= 1, got {predict_lookback}. '
+            f'Nexus produce_signal feeds tail(lookback) into predict; '
+            f'lookback < 1 yields an empty x_test and IndexError downstream.'
+        )
+        raise ValueError(msg)
     from praxis.launcher import InstanceConfig
     from praxis.trading_config import TradingConfig
 
@@ -229,6 +271,9 @@ def run_window_in_process(
     # would land on a wrong-cadence grid (codex P0: "different bundles
     # must run properly").
     interval_seconds = read_kline_size_from_experiment_dir(experiment_dir)
+    effective_kelly_pct = _effective_kelly_pct_for_allocation(
+        kelly_pct, max_allocation_per_trade_pct,
+    )
     built = ManifestBuilder(output_dir=manifest_dir).build(
         account=AccountSpec(
             account_id='bts-sweep',
@@ -244,7 +289,7 @@ def run_window_in_process(
         strategy_params=StrategyParamsSpec(
             symbol=SYMBOL,
             capital=Decimal('100000'),
-            kelly_pct=kelly_pct,
+            kelly_pct=effective_kelly_pct,
             estimated_price=seed_price,
             stop_bps=Decimal('50'),
             maker_preference=maker_preference,
@@ -320,6 +365,7 @@ def run_window_in_process(
         db_path=work / 'event_spine.sqlite',
         atr_gate=atr_gate,
         atr_provider=atr_provider,
+        max_allocation_per_trade_pct=max_allocation_per_trade_pct,
     )
     # Auditor (post-v2.0.2) "make it real": capture per-tick runtime
     # predictions so the sweep can assert SignalsTable parity AGAINST
@@ -340,10 +386,16 @@ def run_window_in_process(
     # public (Nexus's PredictLoop calls it), just not advertised
     # via `__all__`.
     _real_produce_signal = getattr(_predict_loop_mod, 'produce_signal')
+    _lookback = predict_lookback
     def _capturing_produce_signal(
         wired: object, market_data: object,
     ) -> object:
-        signal = _real_produce_signal(wired, market_data)
+        if _lookback is None:
+            signal = _real_produce_signal(wired, market_data)
+        else:
+            signal = _real_produce_signal(
+                wired, market_data, lookback=_lookback,
+            )
         capture_runtime_prediction(
             wired=wired, signal=signal, sink=runtime_predictions,
             window_start=window_start, window_end=window_end,
@@ -667,6 +719,8 @@ def run_window_in_subprocess(
     strict_impact: bool = False,
     atr_k: str = '0.5',
     atr_window_seconds: int = 900,
+    max_allocation_per_trade_pct: Decimal | None = None,
+    predict_lookback: int | None = None,
 ) -> WindowResult:
     """Run one window in a fresh Python interpreter for state isolation."""
     payload = json.dumps({
@@ -679,6 +733,13 @@ def run_window_in_subprocess(
         'strict_impact': bool(strict_impact),
         'atr_k': str(atr_k),
         'atr_window_seconds': int(atr_window_seconds),
+        'max_allocation_per_trade_pct': (
+            None if max_allocation_per_trade_pct is None
+            else str(max_allocation_per_trade_pct)
+        ),
+        'predict_lookback': (
+            None if predict_lookback is None else int(predict_lookback)
+        ),
     })
     # Propagate the bts op-sfd cache dir to the child's
     # PYTHONPATH so Limen's `Trainer.train()` (invoked inside
@@ -719,6 +780,8 @@ def run_window_in_subprocess(
 def _child_main() -> int:
     """Child-process entry: read JSON payload from stdin, run, write JSON result."""
     payload = json.loads(sys.stdin.read())
+    raw_max_alloc = payload.get('max_allocation_per_trade_pct')
+    raw_lookback = payload.get('predict_lookback')
     result = run_window_in_process(
         int(payload['perm_id']),
         Decimal(payload['kelly_pct']),
@@ -729,6 +792,12 @@ def _child_main() -> int:
         strict_impact=bool(payload.get('strict_impact', False)),
         atr_k=str(payload.get('atr_k', '0.5')),
         atr_window_seconds=int(payload.get('atr_window_seconds', 900)),
+        max_allocation_per_trade_pct=(
+            None if raw_max_alloc is None else Decimal(str(raw_max_alloc))
+        ),
+        predict_lookback=(
+            None if raw_lookback is None else int(raw_lookback)
+        ),
     )
     print(json.dumps(result), flush=True)
     return 0

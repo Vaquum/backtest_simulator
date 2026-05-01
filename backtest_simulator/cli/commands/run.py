@@ -131,6 +131,21 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
                        'k * ATR(window) from entry. 0 disables the '
                        'gate. Default: 0.5 (half a local ATR).'
                    ))
+    p.add_argument('--max-allocation-per-trade-pct', type=str, default=None,
+                   help=(
+                       'Override Nexus CapitalController default of 0.15. '
+                       'Decimal fraction (e.g. 0.4 for 40%% of pool). Requires '
+                       'vaquum-nexus >= 0.35.0. Default: leave Nexus default.'
+                   ))
+    p.add_argument('--predict-lookback', type=int, default=None,
+                   help=(
+                       'Number of trailing prepared rows fed into '
+                       'sensor.predict per tick. Default 1 (single-row '
+                       'predict) preserves prior behaviour. >1 enables '
+                       'stateful predictors (rolling thresholds, hysteresis '
+                       'state machines) to evolve across rows. Requires '
+                       'vaquum-nexus >= 0.36.0.'
+                   ))
     p.add_argument('--atr-window-seconds', type=int, default=900,
                    help=(
                        'ATR window in seconds. Wilder true-range ATR: '
@@ -190,12 +205,21 @@ def _run(args: argparse.Namespace) -> int:
     materialize_bundle_on_args(args, WORK_DIR)
     preflight_tunnel()
     perm_id, kelly, exp_dir, display_id = _resolve_decoder(args)
+    raw_max_alloc = getattr(args, 'max_allocation_per_trade_pct', None)
+    raw_lookback = getattr(args, 'predict_lookback', None)
+    from decimal import Decimal as _Decimal
     result = run_window_in_subprocess(
         perm_id, kelly, window_start, window_end, exp_dir,
         maker_preference=bool(getattr(args, 'maker', False)),
         strict_impact=bool(getattr(args, 'strict_impact', False)),
         atr_k=str(getattr(args, 'atr_k', '0.5')),
         atr_window_seconds=int(getattr(args, 'atr_window_seconds', 900)),
+        max_allocation_per_trade_pct=(
+            None if raw_max_alloc is None else _Decimal(str(raw_max_alloc))
+        ),
+        predict_lookback=(
+            None if raw_lookback is None else int(raw_lookback)
+        ),
     )
     trades_raw = result['trades']
     stops_raw = result['declared_stops']

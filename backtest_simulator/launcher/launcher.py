@@ -304,7 +304,7 @@ def _finalize_successful_fill(
         msg = (
             f'capital overshoot: fill_notional={fill_notional} exceeds '
             f'reserved={reservation_notional} for command_id={command_id} '
-            f'by {slippage}. Raise `_NOTIONAL_RESERVATION_BUFFER` in '
+            f'by {slippage}. Raise `NOTIONAL_RESERVATION_BUFFER` in '
             f'backtest_simulator.launcher.action_submitter to absorb this '
             f'slippage honestly; silently capping here would bypass '
             f'CAPITAL gating.'
@@ -820,6 +820,7 @@ class BacktestLauncher(Launcher):
         historical_data: HistoricalData | None = None,
         atr_gate: AtrSanityGate | None = None,
         atr_provider: Callable[[str, datetime], Decimal | None] | None = None,
+        max_allocation_per_trade_pct: Decimal | None = None,
     ) -> None:
         # A backtest run is one window, one set of events — not a live
         # service that needs durable state across processes. Starting
@@ -857,6 +858,7 @@ class BacktestLauncher(Launcher):
         self._atr_provider = atr_provider
         self._n_atr_rejected = 0
         self._n_atr_uncalibrated = 0
+        self._max_allocation_per_trade_pct = max_allocation_per_trade_pct
 
     @property
     def n_atr_rejected(self) -> int:
@@ -934,6 +936,7 @@ class BacktestLauncher(Launcher):
 
     def _start_poller(self) -> None:
         kline_intervals = self._resolve_kline_intervals_from_manifests()
+        params_by_kline_size = self._resolve_data_source_params_by_kline_size()
         # `BacktestMarketDataPoller` is duck-typed against the parent's
         # `MarketDataPoller` Protocol — same public surface, different
         # underlying source. setattr-style assignment dodges the
@@ -942,6 +945,7 @@ class BacktestLauncher(Launcher):
         poller = BacktestMarketDataPoller(
             kline_intervals=kline_intervals,
             historical_data=self._historical_data,
+            params_by_kline_size=params_by_kline_size,
         )
         setattr(self, '_poller', poller)
         poller.start()
@@ -949,6 +953,60 @@ class BacktestLauncher(Launcher):
             'backtest poller started',
             extra={'kline_sizes': sorted(kline_intervals)},
         )
+
+    def _resolve_data_source_params_by_kline_size(
+        self,
+    ) -> dict[int, dict[str, object]]:
+        # Fail-loud on conflicts: if two sensors share a kline_size
+        # but disagree on data_source.params (different n_rows /
+        # start_date_limit), the silent last-writer-wins produces
+        # a fetch that doesn't match either sensor's training. Raise
+        # so the bundle author sees the mismatch instead of debugging
+        # a parity violation later.
+        params_by_kline: dict[int, dict[str, object]] = {}
+        for inst in self._instances:
+            manifest = load_manifest(inst.manifest_path)
+            for spec in manifest.strategies:
+                for sensor_spec in spec.sensors:
+                    cfg_params = self._data_source_params_from_experiment_dir(
+                        sensor_spec.experiment_dir,
+                    )
+                    kline_size_obj = cfg_params['kline_size']
+                    if not isinstance(kline_size_obj, int):
+                        msg = (
+                            f'data_source params kline_size for '
+                            f'{sensor_spec.experiment_dir} must be int, got '
+                            f'{type(kline_size_obj).__name__}={kline_size_obj!r}'
+                        )
+                        raise TypeError(msg)
+                    prior = params_by_kline.get(kline_size_obj)
+                    if prior is not None and prior != cfg_params:
+                        msg = (
+                            f'conflicting data_source.params for '
+                            f'kline_size={kline_size_obj}: prior={prior!r} '
+                            f'new={cfg_params!r} (from '
+                            f'{sensor_spec.experiment_dir}). Two sensors '
+                            f'sharing a kline_size must declare identical '
+                            f'data_source.params; otherwise the poller '
+                            f'cannot serve a single coherent fetch.'
+                        )
+                        raise ValueError(msg)
+                    params_by_kline[kline_size_obj] = cfg_params
+        return params_by_kline
+
+    @staticmethod
+    def _data_source_params_from_experiment_dir(
+        experiment_dir: Path,
+    ) -> dict[str, object]:
+        metadata_path = experiment_dir / 'metadata.json'
+        if not metadata_path.is_file():
+            msg = f'metadata.json not found at {metadata_path}'
+            raise FileNotFoundError(msg)
+        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+        sfd_module_name = metadata['sfd_module']
+        sfd = importlib.import_module(sfd_module_name)
+        limen_manifest = sfd.manifest()
+        return dict(limen_manifest.data_source_config.params)
 
     def _resolve_kline_intervals_from_manifests(self) -> dict[int, int]:
         # Praxis's inherited `_collect_kline_intervals` reads
@@ -978,17 +1036,20 @@ class BacktestLauncher(Launcher):
                         intervals[kline_size] = sensor_spec.interval_seconds
         return intervals
 
-    @staticmethod
-    def _kline_size_from_experiment_dir(experiment_dir: Path) -> int:
-        metadata_path = experiment_dir / 'metadata.json'
-        if not metadata_path.is_file():
-            msg = f'metadata.json not found at {metadata_path}'
-            raise FileNotFoundError(msg)
-        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
-        sfd_module_name = metadata['sfd_module']
-        sfd = importlib.import_module(sfd_module_name)
-        limen_manifest = sfd.manifest()
-        return int(limen_manifest.data_source_config.params['kline_size'])
+    @classmethod
+    def _kline_size_from_experiment_dir(cls, experiment_dir: Path) -> int:
+        # Reuses the single metadata.json -> sfd_module -> manifest()
+        # loader so the two extraction paths cannot drift.
+        params = cls._data_source_params_from_experiment_dir(experiment_dir)
+        kline_size_obj = params['kline_size']
+        if not isinstance(kline_size_obj, int):
+            msg = (
+                f'data_source params kline_size for {experiment_dir} '
+                f'must be int, got '
+                f'{type(kline_size_obj).__name__}={kline_size_obj!r}'
+            )
+            raise TypeError(msg)
+        return kline_size_obj
 
     def _shutdown(self) -> None:
         # Slice #17 Task 18 / auditor round 5 P1: Praxis's parent
@@ -1128,6 +1189,7 @@ class BacktestLauncher(Launcher):
         pipeline, controller, capital_state = build_validation_pipeline(
             nexus_config=nexus_config,
             capital_pool=allocated_capital,
+            max_allocation_per_trade_pct=self._max_allocation_per_trade_pct,
         )
         state = InstanceState(capital=capital_state)
         self._capital_state = capital_state
