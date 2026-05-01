@@ -127,6 +127,21 @@ class ManifestBuilder:
         """
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
+        # `force_flatten_after` must be tz-aware. The strategy's
+        # `on_signal` compares it against `signal.timestamp`, which
+        # is UTC-aware everywhere in the runtime path (Nexus emits
+        # `datetime.now(tz=timezone.utc)`). A naive cutoff would
+        # raise `TypeError: can't compare offset-naive and offset-aware
+        # datetimes` on the first signal — fail loud at config build.
+        ffa = strategy_params.force_flatten_after
+        if ffa is not None and ffa.tzinfo is None:
+            msg = (
+                f'StrategyParamsSpec.force_flatten_after must be '
+                f'tz-aware, got naive datetime {ffa!r}. The strategy '
+                f'compares this against UTC-aware signal timestamps; '
+                f'a naive cutoff raises TypeError on the first signal.'
+            )
+            raise ValueError(msg)
         raw_params: dict[str, object] = {
             'symbol': strategy_params.symbol,
             'capital': str(strategy_params.capital),
@@ -135,8 +150,7 @@ class ManifestBuilder:
             'stop_bps': str(strategy_params.stop_bps),
             'maker_preference': bool(strategy_params.maker_preference),
             'force_flatten_after': (
-                None if strategy_params.force_flatten_after is None
-                else strategy_params.force_flatten_after.isoformat()
+                None if ffa is None else ffa.isoformat()
             ),
         }
         # Nexus's StrategySpec schema has no `params` field, and its

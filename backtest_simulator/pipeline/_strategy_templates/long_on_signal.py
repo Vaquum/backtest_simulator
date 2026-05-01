@@ -90,6 +90,17 @@ class Strategy(_StrategyBase):
             None if force_flatten_raw is None
             else datetime.fromisoformat(str(force_flatten_raw))
         )
+        # Defensive: signal.timestamp is always UTC-aware (Nexus emits
+        # `datetime.now(tz=timezone.utc)`); a naive cutoff raises
+        # TypeError on the comparison. ManifestBuilder validates this
+        # at config build time, but a hand-edited baked config would
+        # bypass that — this catches the runtime side too.
+        if force_flatten_after is not None and force_flatten_after.tzinfo is None:
+            msg = (
+                f'_BAKED_CONFIG[force_flatten_after] must be tz-aware, '
+                f'got naive {force_flatten_after!r}'
+            )
+            raise ValueError(msg)
         self._config = _Config(
             symbol=str(_BAKED_CONFIG['symbol']),
             capital=Decimal(str(_BAKED_CONFIG['capital'])),

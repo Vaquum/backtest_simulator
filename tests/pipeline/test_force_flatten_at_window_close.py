@@ -18,7 +18,6 @@ from nexus.strategy.context import StrategyContext
 from nexus.strategy.params import StrategyParams
 from nexus.strategy.signal import Signal
 
-
 _T0 = datetime(2026, 4, 20, 0, 0, tzinfo=UTC)
 _KLINE_SECONDS = 14400  # 4-hour klines (matches r0011)
 _WINDOW_END = datetime(2026, 4, 20, 23, 59, 59, tzinfo=UTC)
