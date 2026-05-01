@@ -802,6 +802,13 @@ def _build_and_save_signals_tables(
                 tick_timestamps=tick_timestamps,
                 round_params=round_params, decoder_id=decoder_id,
                 predict_lookback=predict_lookback,
+                # Mirror the bundle's `data_source.params['n_rows']`
+                # the runtime poller reads (zero-bang on PR #43): without
+                # this, replay tails 5000 rows where the runtime tails
+                # the bundle's declared count, features diverge for any
+                # bundle declaring n_rows > 5000, and assert_signals_parity
+                # fires ParityViolation.
+                n_rows=ds_n_rows,
             )
             # Load-bearing gates — wired so neither stays decorative.
             table.assert_split_alignment(manifest.split_config)

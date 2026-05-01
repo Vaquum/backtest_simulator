@@ -83,6 +83,7 @@ def build_signals_table_for_decoder(
     round_params: dict[str, object],
     decoder_id: str,
     predict_lookback: int | None = None,
+    n_rows: int | None = None,
 ) -> SignalsTable:
     """Build SignalsTable for one decoder via per-bar runtime replay.
 
@@ -170,16 +171,19 @@ def build_signals_table_for_decoder(
 
     # Per-tick replay — Nexus's exact recipe, batched. Match
     # `BacktestMarketDataPoller.get_market_data` byte-for-byte at
-    # each tick: causal slice + `tail(POLLER_N_ROWS)` (codex round-3
-    # P0). Iterate at the runtime tick instants (codex round-4 P0).
+    # each tick: causal slice + `tail(n_rows)` where `n_rows`
+    # comes from the bundle's `data_source.params` (falls back to
+    # POLLER_N_ROWS if the bundle didn't declare it). Iterate at
+    # the runtime tick instants (codex round-4 P0).
     manifest_full = manifest.with_params_override(split_config=(1, 0, 0))
     effective_lookback = 1 if predict_lookback is None else predict_lookback
+    effective_n_rows = POLLER_N_ROWS if n_rows is None else n_rows
     timestamps: list[datetime] = []
     preds_list: list[int] = []
     probs_list: list[float] = []
     for raw_tick in tick_timestamps:
         tick = _as_utc_datetime(raw_tick)
-        causal = klines.filter(pl.col('datetime') <= tick).tail(POLLER_N_ROWS)
+        causal = klines.filter(pl.col('datetime') <= tick).tail(effective_n_rows)
         if causal.is_empty():
             # No klines yet at this tick — runtime poller would
             # return an empty frame and `produce_signal` would emit
