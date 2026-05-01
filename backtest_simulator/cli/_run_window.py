@@ -18,7 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
@@ -292,6 +292,15 @@ def run_window_in_process(
             kelly_pct=effective_kelly_pct,
             estimated_price=seed_price,
             stop_bps=Decimal('50'),
+            # Force-flatten cutoff = `window_end - kline_size`. The
+            # strategy's last in-window signal arrives at this
+            # timestamp; on or after it, the strategy emits SELL on
+            # any held inventory and refuses new BUYs. Without this
+            # cutoff, a BUY late in the window could open a position
+            # that has no closing signal before subprocess shutdown,
+            # leaving an orphaned position the per-day summary
+            # mislabels as `trades 0`.
+            force_flatten_after=window_end - timedelta(seconds=interval_seconds),
             maker_preference=maker_preference,
         ),
     )

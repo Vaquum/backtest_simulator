@@ -1,3 +1,49 @@
+# v2.2.1
+
+Force-flatten at window close. The `long_on_signal` strategy template
+now refuses to leave inventory open past the window's last in-window
+signal. `StrategyParamsSpec` carries a new `force_flatten_after`
+field which `_run_window.py` sets to `window_end - kline_size`; the
+manifest builder bakes the ISO string into the strategy's
+`_BAKED_CONFIG`, and the strategy's `on_signal` adds a check at the
+top: if the signal's timestamp is at or after the cutoff, it emits
+SELL on any held inventory regardless of `_preds`, and refuses new
+BUYs. The SELL flows through the same Nexus → Praxis → venue
+adapter path every other SELL takes, so the trade ledger,
+EventSpine, and capital state remain naturally consistent — no bts
+launcher / EventSpine / tracker changes.
+
+Without this, a BUY late in the window (or a regime where `_preds=0`
+never fires before window close) opened a position with no closing
+signal before subprocess shutdown, leaving the per-day `trades` summary
+showing `0` while EventSpine carried orphaned BUY events. Downstream
+DSR/SPA/CPCV math consumed that biased return distribution.
+
+`force_flatten_after` must be tz-aware. ManifestBuilder.build raises
+ValueError when a naive datetime is provided; the strategy template
+defensively re-checks the parsed value at on_startup.
+
+Five tests in `tests/pipeline/test_force_flatten_at_window_close.py`
+cover: SELL emitted at the cutoff signal when long, SELL emitted
+after the cutoff when long, no new BUY at-or-after the cutoff when
+flat, no premature flatten before the cutoff, and legacy behaviour
+preserved when `force_flatten_after=None`.
+
+Surfaces:
+- `backtest_simulator/pipeline/manifest_builder.py` — `force_flatten_after`
+  field + bake into `__BTS_PARAMS__` + tz-aware validation
+- `backtest_simulator/pipeline/_strategy_templates/long_on_signal.py`
+  — parse cutoff from baked config, force-flatten branch in
+  `on_signal`, defensive tz-aware check
+- `backtest_simulator/cli/_run_window.py` — set cutoff to
+  `window_end - kline_size`
+- `tests/pipeline/test_force_flatten_at_window_close.py` — new
+- `tests/tools/test_lint_ci_contract.py` — extend ruff per-file-ignores
+  contract for the strategy template
+- `pyproject.toml` — add the strategy template to ruff per-file-ignores
+- `.github/module_budgets.json` — bump strategy template budget for
+  the new defensive check
+
 # v2.2.0
 
 Bts honors bundle `data_source.params` end-to-end and exposes the

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from decimal import ROUND_DOWN, Decimal
 
 from nexus.core.domain.enums import OrderSide
@@ -31,6 +32,7 @@ class _Config:
     def __init__(
         self, symbol: str, capital: Decimal, kelly_pct: Decimal,
         estimated_price: Decimal, stop_bps: Decimal,
+        force_flatten_after: datetime | None,
         maker_preference: bool = False,
     ) -> None:
         self.symbol = symbol
@@ -38,6 +40,14 @@ class _Config:
         self.kelly_pct = kelly_pct
         self.estimated_price = estimated_price
         self.stop_bps = stop_bps
+        # Force-flatten cutoff. When the next signal's timestamp is
+        # at or after this instant, the strategy emits SELL on any
+        # held inventory regardless of `_preds`, AND blocks new BUYs.
+        # bts sets it to `window_end - kline_size` so the strategy's
+        # last in-window signal closes any open position before the
+        # subprocess shuts down. None disables force-flatten (legacy
+        # behaviour: positions can survive past window close).
+        self.force_flatten_after = force_flatten_after
         # When True the strategy emits LIMIT orders at the
         # estimated price (passive maker post). When False
         # (default) it emits MARKET orders. The runtime venue
@@ -75,12 +85,18 @@ class Strategy(_StrategyBase):
         # the mechanism ManifestBuilder uses to carry per-instance config
         # to each strategy file.
         del params, context
+        force_flatten_raw = _BAKED_CONFIG.get('force_flatten_after')
+        force_flatten_after = (
+            None if force_flatten_raw is None
+            else datetime.fromisoformat(str(force_flatten_raw))
+        )
         self._config = _Config(
             symbol=str(_BAKED_CONFIG['symbol']),
             capital=Decimal(str(_BAKED_CONFIG['capital'])),
             kelly_pct=Decimal(str(_BAKED_CONFIG['kelly_pct'])),
             estimated_price=Decimal(str(_BAKED_CONFIG['estimated_price'])),
             stop_bps=Decimal(str(_BAKED_CONFIG['stop_bps'])),
+            force_flatten_after=force_flatten_after,
             maker_preference=bool(
                 _BAKED_CONFIG.get('maker_preference', False),
             ),
@@ -131,6 +147,23 @@ class Strategy(_StrategyBase):
             'on_signal fired: preds=%s probs=%s was_long=%s',
             preds, signal.values.get('_probs'), was_long,
         )
+        # Force-flatten at window close: if this signal arrives at or
+        # after the configured cutoff (window_end - kline_size), close
+        # any open position immediately and refuse new entries. The
+        # strategy's last in-window signal becomes a guaranteed
+        # exposure-zero point so per-day stats reflect realized PnL
+        # without orphaned positions.
+        cutoff = self._config.force_flatten_after
+        if cutoff is not None and signal.timestamp >= cutoff:
+            if was_long and not self._pending_sell:
+                qty = self._entry_qty
+                self._pending_sell = True
+                _log.info(
+                    'FORCE FLATTEN at window close: qty=%s ts=%s cutoff=%s',
+                    qty, signal.timestamp, cutoff,
+                )
+                return [self._build_action(OrderSide.SELL, qty, signal)]
+            return []
         if preds == 1 and not was_long and not self._pending_buy:
             qty_raw = (
                 self._config.capital * self._config.kelly_pct / Decimal('100')
