@@ -175,6 +175,21 @@ def build_signals_table_for_decoder(
     # comes from the bundle's `data_source.params` (falls back to
     # POLLER_N_ROWS if the bundle didn't declare it). Iterate at
     # the runtime tick instants (codex round-4 P0).
+    if predict_lookback is not None and predict_lookback < 1:
+        msg = (
+            f'build_signals_table_for_decoder: predict_lookback must be '
+            f'>= 1, got {predict_lookback}. predict consumes '
+            f'tail(predict_lookback); lookback < 1 yields empty x_test '
+            f'and an IndexError on `_preds[-1]`.'
+        )
+        raise ValueError(msg)
+    if n_rows is not None and n_rows < 1:
+        msg = (
+            f'build_signals_table_for_decoder: n_rows must be >= 1, got '
+            f'{n_rows}. Per-tick causal slice tails n_rows; n_rows < 1 '
+            f'yields an empty causal frame and the bar is silently skipped.'
+        )
+        raise ValueError(msg)
     manifest_full = manifest.with_params_override(split_config=(1, 0, 0))
     effective_lookback = 1 if predict_lookback is None else predict_lookback
     effective_n_rows = POLLER_N_ROWS if n_rows is None else n_rows

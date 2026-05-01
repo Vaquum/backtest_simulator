@@ -821,7 +821,6 @@ class BacktestLauncher(Launcher):
         atr_gate: AtrSanityGate | None = None,
         atr_provider: Callable[[str, datetime], Decimal | None] | None = None,
         max_allocation_per_trade_pct: Decimal | None = None,
-        predict_lookback: int | None = None,
     ) -> None:
         # A backtest run is one window, one set of events — not a live
         # service that needs durable state across processes. Starting
@@ -860,7 +859,6 @@ class BacktestLauncher(Launcher):
         self._n_atr_rejected = 0
         self._n_atr_uncalibrated = 0
         self._max_allocation_per_trade_pct = max_allocation_per_trade_pct
-        self._predict_lookback = predict_lookback
 
     @property
     def n_atr_rejected(self) -> int:
@@ -959,6 +957,12 @@ class BacktestLauncher(Launcher):
     def _resolve_data_source_params_by_kline_size(
         self,
     ) -> dict[int, dict[str, object]]:
+        # Fail-loud on conflicts: if two sensors share a kline_size
+        # but disagree on data_source.params (different n_rows /
+        # start_date_limit), the silent last-writer-wins produces
+        # a fetch that doesn't match either sensor's training. Raise
+        # so the bundle author sees the mismatch instead of debugging
+        # a parity violation later.
         params_by_kline: dict[int, dict[str, object]] = {}
         for inst in self._instances:
             manifest = load_manifest(inst.manifest_path)
@@ -975,6 +979,18 @@ class BacktestLauncher(Launcher):
                             f'{type(kline_size_obj).__name__}={kline_size_obj!r}'
                         )
                         raise TypeError(msg)
+                    prior = params_by_kline.get(kline_size_obj)
+                    if prior is not None and prior != cfg_params:
+                        msg = (
+                            f'conflicting data_source.params for '
+                            f'kline_size={kline_size_obj}: prior={prior!r} '
+                            f'new={cfg_params!r} (from '
+                            f'{sensor_spec.experiment_dir}). Two sensors '
+                            f'sharing a kline_size must declare identical '
+                            f'data_source.params; otherwise the poller '
+                            f'cannot serve a single coherent fetch.'
+                        )
+                        raise ValueError(msg)
                     params_by_kline[kline_size_obj] = cfg_params
         return params_by_kline
 
@@ -1020,17 +1036,20 @@ class BacktestLauncher(Launcher):
                         intervals[kline_size] = sensor_spec.interval_seconds
         return intervals
 
-    @staticmethod
-    def _kline_size_from_experiment_dir(experiment_dir: Path) -> int:
-        metadata_path = experiment_dir / 'metadata.json'
-        if not metadata_path.is_file():
-            msg = f'metadata.json not found at {metadata_path}'
-            raise FileNotFoundError(msg)
-        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
-        sfd_module_name = metadata['sfd_module']
-        sfd = importlib.import_module(sfd_module_name)
-        limen_manifest = sfd.manifest()
-        return int(limen_manifest.data_source_config.params['kline_size'])
+    @classmethod
+    def _kline_size_from_experiment_dir(cls, experiment_dir: Path) -> int:
+        # Reuses the single metadata.json -> sfd_module -> manifest()
+        # loader so the two extraction paths cannot drift.
+        params = cls._data_source_params_from_experiment_dir(experiment_dir)
+        kline_size_obj = params['kline_size']
+        if not isinstance(kline_size_obj, int):
+            msg = (
+                f'data_source params kline_size for {experiment_dir} '
+                f'must be int, got '
+                f'{type(kline_size_obj).__name__}={kline_size_obj!r}'
+            )
+            raise TypeError(msg)
+        return kline_size_obj
 
     def _shutdown(self) -> None:
         # Slice #17 Task 18 / auditor round 5 P1: Praxis's parent

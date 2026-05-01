@@ -235,6 +235,13 @@ def run_window_in_process(
     predict_lookback: int | None = None,
 ) -> WindowResult:
     """In-process single-window run — picklable result for cross-process use."""
+    if predict_lookback is not None and predict_lookback < 1:
+        msg = (
+            f'predict_lookback must be >= 1, got {predict_lookback}. '
+            f'Nexus produce_signal feeds tail(lookback) into predict; '
+            f'lookback < 1 yields an empty x_test and IndexError downstream.'
+        )
+        raise ValueError(msg)
     from praxis.launcher import InstanceConfig
     from praxis.trading_config import TradingConfig
 
@@ -359,7 +366,6 @@ def run_window_in_process(
         atr_gate=atr_gate,
         atr_provider=atr_provider,
         max_allocation_per_trade_pct=max_allocation_per_trade_pct,
-        predict_lookback=predict_lookback,
     )
     # Auditor (post-v2.0.2) "make it real": capture per-tick runtime
     # predictions so the sweep can assert SignalsTable parity AGAINST

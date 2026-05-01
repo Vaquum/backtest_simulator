@@ -106,7 +106,12 @@ class BacktestMarketDataPoller:
     def _fetch(self, kline_size: int) -> pl.DataFrame:
         params = dict(self._params_by_kline_size.get(kline_size, {}))
         params.pop('kline_size', None)
-        n_rows_obj = params.pop('n_rows', None)
+        # Bundle's declared `n_rows` wins; fall back to the constructor
+        # default rather than `None`. Passing `n_rows=None` to Limen
+        # asks for the full dataset, which is a large perf/memory
+        # regression versus the prior 5000-row fetch and contradicts
+        # the class docstring's "constructor-level fallback" claim.
+        n_rows_obj = params.pop('n_rows', self._n_rows)
         start_date_limit_obj = params.pop(
             'start_date_limit', self._start_date_limit,
         )
@@ -118,10 +123,10 @@ class BacktestMarketDataPoller:
                 f'accepts only n_rows / kline_size / start_date_limit.'
             )
             raise ValueError(msg)
-        if n_rows_obj is not None and not isinstance(n_rows_obj, int):
+        if not isinstance(n_rows_obj, int):
             msg = (
                 f'BacktestMarketDataPoller._fetch: kline_size={kline_size} '
-                f'n_rows must be int|None, got '
+                f'n_rows must be int, got '
                 f'{type(n_rows_obj).__name__}={n_rows_obj!r}'
             )
             raise TypeError(msg)

@@ -39,7 +39,10 @@ from backtest_simulator.cli._stats import (
 )
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
 from backtest_simulator.honesty.cpcv import CpcvPaths
-from backtest_simulator.launcher.poller import DEFAULT_START_DATE_LIMIT
+from backtest_simulator.launcher.poller import (
+    DEFAULT_N_ROWS,
+    DEFAULT_START_DATE_LIMIT,
+)
 from backtest_simulator.sensors.precompute import SignalsTable
 
 _SECOND_WEEK_APRIL_START: Final = datetime(2026, 4, 6, tzinfo=UTC).date()
@@ -773,11 +776,16 @@ def _build_and_save_signals_tables(
             raise ValueError(msg)
         kline_size = int(cfg.params['kline_size'])
         # Mirror BacktestMarketDataPoller._fetch so the SignalsTable
-        # replay matches the runtime poller byte-for-byte.
+        # replay matches the runtime poller byte-for-byte. Defaults
+        # mirror the poller's: bundle-declared n_rows wins; absent
+        # falls back to DEFAULT_N_ROWS (NOT None — Limen treats None
+        # as "fetch full dataset" which is a memory regression).
         ds_params = dict(cfg.params)
         ds_params.pop('kline_size', None)
-        ds_n_rows = ds_params.pop('n_rows', None)
-        ds_start = ds_params.pop('start_date_limit', DEFAULT_START_DATE_LIMIT)
+        ds_n_rows_obj = ds_params.pop('n_rows', DEFAULT_N_ROWS)
+        ds_start_obj = ds_params.pop(
+            'start_date_limit', DEFAULT_START_DATE_LIMIT,
+        )
         if ds_params:
             msg = (
                 f'sweep signals: manifest at {exp_dir} declares '
@@ -786,10 +794,23 @@ def _build_and_save_signals_tables(
                 f'accepts only n_rows / kline_size / start_date_limit.'
             )
             raise ValueError(msg)
+        if not isinstance(ds_n_rows_obj, int):
+            msg = (
+                f'sweep signals: manifest at {exp_dir} n_rows must be '
+                f'int, got {type(ds_n_rows_obj).__name__}={ds_n_rows_obj!r}'
+            )
+            raise TypeError(msg)
+        if not isinstance(ds_start_obj, str):
+            msg = (
+                f'sweep signals: manifest at {exp_dir} start_date_limit '
+                f'must be str, got '
+                f'{type(ds_start_obj).__name__}={ds_start_obj!r}'
+            )
+            raise TypeError(msg)
         klines = historical.get_spot_klines(
-            n_rows=ds_n_rows,
+            n_rows=ds_n_rows_obj,
             kline_size=kline_size,
-            start_date_limit=ds_start,
+            start_date_limit=ds_start_obj,
         )
         sensors = trainer.train([pid for pid, _ in decoders])
         for (perm_id, display_id), sensor in zip(decoders, sensors, strict=True):
@@ -808,7 +829,7 @@ def _build_and_save_signals_tables(
                 # the bundle's declared count, features diverge for any
                 # bundle declaring n_rows > 5000, and assert_signals_parity
                 # fires ParityViolation.
-                n_rows=ds_n_rows,
+                n_rows=ds_n_rows_obj,
             )
             # Load-bearing gates — wired so neither stays decorative.
             table.assert_split_alignment(manifest.split_config)
