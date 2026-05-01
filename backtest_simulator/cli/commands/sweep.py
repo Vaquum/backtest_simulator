@@ -743,14 +743,24 @@ def _build_and_save_signals_tables(
             )
             raise ValueError(msg)
         kline_size = int(cfg.params['kline_size'])
-        # Same fetch the launcher's BacktestMarketDataPoller uses,
-        # so the precomputed predictions match runtime byte-for-byte
-        # (codex round-3 P0). The launcher passes no `start_date_limit`
-        # to the poller, so the poller's DEFAULT applies — NOT the
-        # manifest's start_date_limit.
+        # Mirror BacktestMarketDataPoller._fetch so the SignalsTable
+        # replay matches the runtime poller byte-for-byte.
+        ds_params = dict(cfg.params)
+        ds_params.pop('kline_size', None)
+        ds_n_rows = ds_params.pop('n_rows', None)
+        ds_start = ds_params.pop('start_date_limit', DEFAULT_START_DATE_LIMIT)
+        if ds_params:
+            msg = (
+                f'sweep signals: manifest at {exp_dir} declares '
+                f'unsupported data_source.params keys: '
+                f'{sorted(ds_params)}. Limen.HistoricalData.get_spot_klines '
+                f'accepts only n_rows / kline_size / start_date_limit.'
+            )
+            raise ValueError(msg)
         klines = historical.get_spot_klines(
+            n_rows=ds_n_rows,
             kline_size=kline_size,
-            start_date_limit=DEFAULT_START_DATE_LIMIT,
+            start_date_limit=ds_start,
         )
         sensors = trainer.train([pid for pid, _ in decoders])
         for (perm_id, display_id), sensor in zip(decoders, sensors, strict=True):

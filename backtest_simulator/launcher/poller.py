@@ -10,13 +10,9 @@ from limen import HistoricalData
 
 _log = logging.getLogger(__name__)
 
-# Public (no leading underscore) so callers that mirror the poller's
-# fetch semantics — slice #17 Task 16's `_signals_builder.py`, which
-# rebuilds at sweep time exactly the slice the poller serves at
-# runtime — can pin to the same constants without reaching into
-# private state. Changing either default here shifts both runtime
-# and sweep-replay together, preserving "strategy tested, strategy
-# deployed".
+# Fallbacks used only when the manifest's `data_source_config.params`
+# does not declare `n_rows` / `start_date_limit`. Bundle path reads
+# the manifest; `--exp-code` path may rely on these.
 DEFAULT_START_DATE_LIMIT = '2019-01-01 00:00:00'
 DEFAULT_N_ROWS = 5000
 
@@ -26,14 +22,16 @@ class BacktestMarketDataPoller:
 
     Same public surface (`start`/`stop`/`running`/`get_market_data`/
     `add_kline_size`/`remove_kline_size`) so `praxis.Launcher` consumes
-    it interchangeably. The difference is the data source: klines come
-    from the same Limen HistoricalData path Praxis uses for offline
-    analysis, not from live Binance REST.
+    it interchangeably. Klines come from Limen `HistoricalData`, not
+    live Binance REST.
 
-    freezegun compatibility: `get_market_data` filters the cached frame
-    by `pl.col('datetime') <= datetime.now(utc)`. Under freezegun that
-    yields the strategy's frozen view of history; under real time it
-    yields everything up to now.
+    `params_by_kline_size` holds the manifest's `data_source.params` per
+    kline_size; the poller forwards them to `get_spot_klines`. Empty for
+    a kline_size means use the constructor-level `n_rows` /
+    `start_date_limit` fallbacks.
+
+    Under freezegun, `get_market_data` filters by `datetime.now(UTC)`;
+    under real time, it yields everything up to now.
     """
 
     def __init__(
@@ -42,10 +40,14 @@ class BacktestMarketDataPoller:
         n_rows: int = DEFAULT_N_ROWS,
         historical_data: HistoricalData | None = None,
         start_date_limit: str = DEFAULT_START_DATE_LIMIT,
+        params_by_kline_size: dict[int, dict[str, object]] | None = None,
     ) -> None:
         self._n_rows = n_rows
         self._historical_data = historical_data or HistoricalData()
         self._start_date_limit = start_date_limit
+        self._params_by_kline_size: dict[int, dict[str, object]] = (
+            params_by_kline_size or {}
+        )
         self._lock = threading.Lock()
         self._kline_sizes: set[int] = set((kline_intervals or {}).keys())
         self._klines: dict[int, pl.DataFrame] = {}
@@ -88,14 +90,36 @@ class BacktestMarketDataPoller:
             frame = self._klines.get(kline_size)
         if frame is None or frame.is_empty():
             return pl.DataFrame()
-        # freezegun patches `datetime.now`; `now()` is the strategy's view
-        # of history under a `freeze_time` block and real wall time otherwise.
         now = datetime.now(UTC)
         causal = frame.filter(pl.col('datetime') <= now)
-        return causal.tail(self._n_rows)
+        params = self._params_by_kline_size.get(kline_size, {})
+        n_rows_obj = params.get('n_rows', self._n_rows)
+        if not isinstance(n_rows_obj, int):
+            msg = (
+                f'BacktestMarketDataPoller.get_market_data: bundle '
+                f'n_rows for kline_size={kline_size} must be int, '
+                f'got {type(n_rows_obj).__name__}={n_rows_obj!r}'
+            )
+            raise TypeError(msg)
+        return causal.tail(n_rows_obj)
 
     def _fetch(self, kline_size: int) -> pl.DataFrame:
+        params = dict(self._params_by_kline_size.get(kline_size, {}))
+        params.pop('kline_size', None)
+        n_rows = params.pop('n_rows', None)
+        start_date_limit = params.pop(
+            'start_date_limit', self._start_date_limit,
+        )
+        if params:
+            msg = (
+                f'BacktestMarketDataPoller._fetch: kline_size={kline_size} '
+                f'has unsupported data_source.params keys: '
+                f'{sorted(params)}. Limen.HistoricalData.get_spot_klines '
+                f'accepts only n_rows / kline_size / start_date_limit.'
+            )
+            raise ValueError(msg)
         return self._historical_data.get_spot_klines(
+            n_rows=n_rows,
             kline_size=kline_size,
-            start_date_limit=self._start_date_limit,
+            start_date_limit=start_date_limit,
         )

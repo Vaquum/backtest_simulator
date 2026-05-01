@@ -934,6 +934,7 @@ class BacktestLauncher(Launcher):
 
     def _start_poller(self) -> None:
         kline_intervals = self._resolve_kline_intervals_from_manifests()
+        params_by_kline_size = self._resolve_data_source_params_by_kline_size()
         # `BacktestMarketDataPoller` is duck-typed against the parent's
         # `MarketDataPoller` Protocol — same public surface, different
         # underlying source. setattr-style assignment dodges the
@@ -942,6 +943,7 @@ class BacktestLauncher(Launcher):
         poller = BacktestMarketDataPoller(
             kline_intervals=kline_intervals,
             historical_data=self._historical_data,
+            params_by_kline_size=params_by_kline_size,
         )
         setattr(self, '_poller', poller)
         poller.start()
@@ -949,6 +951,35 @@ class BacktestLauncher(Launcher):
             'backtest poller started',
             extra={'kline_sizes': sorted(kline_intervals)},
         )
+
+    def _resolve_data_source_params_by_kline_size(
+        self,
+    ) -> dict[int, dict[str, object]]:
+        params_by_kline: dict[int, dict[str, object]] = {}
+        for inst in self._instances:
+            manifest = load_manifest(inst.manifest_path)
+            for spec in manifest.strategies:
+                for sensor_spec in spec.sensors:
+                    cfg_params = self._data_source_params_from_experiment_dir(
+                        sensor_spec.experiment_dir,
+                    )
+                    kline_size = int(cfg_params['kline_size'])
+                    params_by_kline[kline_size] = cfg_params
+        return params_by_kline
+
+    @staticmethod
+    def _data_source_params_from_experiment_dir(
+        experiment_dir: Path,
+    ) -> dict[str, object]:
+        metadata_path = experiment_dir / 'metadata.json'
+        if not metadata_path.is_file():
+            msg = f'metadata.json not found at {metadata_path}'
+            raise FileNotFoundError(msg)
+        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+        sfd_module_name = metadata['sfd_module']
+        sfd = importlib.import_module(sfd_module_name)
+        limen_manifest = sfd.manifest()
+        return dict(limen_manifest.data_source_config.params)
 
     def _resolve_kline_intervals_from_manifests(self) -> dict[int, int]:
         # Praxis's inherited `_collect_kline_intervals` reads
