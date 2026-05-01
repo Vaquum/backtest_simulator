@@ -26,11 +26,14 @@ Output examples:
 - BUY filled, SELL did not:          `trades 0 (+1 open, orders 2)`
 - 1 BUY submit, no fill (PENDING):   `trades 0 (orders 1)`
 
-`n_orders` defaults to `0` for backward compat — callers that don't
-thread the new parameter render exactly as before. `bts run` and
-`bts sweep` both thread `int(result.get('orders', 0))` from the
-`WindowResult.orders` field already populated by
-`run_window_in_process`. Seven tests in
+`n_orders` defaults to `0`; when a caller does not thread it the
+`orders K` extra is suppressed (legacy headline, no `(orders K)`
+suffix). The `+N open` extra is always derived from `pair_trades`'s
+trailing list and surfaces whenever a BUY landed in `account.trades`
+without a closing SELL fill — independent of the `n_orders` value.
+`bts run` and `bts sweep` both thread
+`int(result.get('orders', 0))` from the `WindowResult.orders` field
+already populated by `run_window_in_process`. Seven tests in
 `tests/cli/test_print_run_activity_readout.py` lock the new format
 and the `pair_trades` trailing-vs-pairs split.
 
