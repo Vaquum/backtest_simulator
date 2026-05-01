@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -43,6 +44,15 @@ class StrategyParamsSpec:
     kelly_pct: Decimal
     estimated_price: Decimal
     stop_bps: Decimal
+    # `force_flatten_after` is the cutoff after which the strategy
+    # emits a SELL on any new signal if it holds inventory, regardless
+    # of `_preds`, AND blocks new BUYs. Set by the caller (sweep / run)
+    # to `window_end - kline_size` so the strategy uses its last
+    # in-window signal to close any open position. Without this,
+    # positions opened late in a window survive past `run_window`
+    # without a closing SELL — the per-day trade summary shows
+    # `trades 0` while EventSpine has BUY events without closes.
+    force_flatten_after: datetime | None = None
     # When True, ENTER actions emit LIMIT orders at the
     # estimated price (passive maker post). When False, MARKET
     # (default behavior). Plumbed via `bts run --maker` and
@@ -117,6 +127,25 @@ class ManifestBuilder:
         """
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
+        # `force_flatten_after` must be tz-aware. The strategy's
+        # `on_signal` compares it against `signal.timestamp`, which
+        # is UTC-aware everywhere in the runtime path (Nexus emits
+        # `datetime.now(tz=timezone.utc)`). A naive cutoff would
+        # raise `TypeError: can't compare offset-naive and offset-aware
+        # datetimes` on the first signal — fail loud at config build.
+        ffa = strategy_params.force_flatten_after
+        # `tzinfo is None` is not sufficient: a tzinfo subclass whose
+        # utcoffset() returns None is effectively naive (Python treats
+        # it as such for comparisons). Check utcoffset() to catch both.
+        if ffa is not None and ffa.utcoffset() is None:
+            msg = (
+                f'StrategyParamsSpec.force_flatten_after must be '
+                f'tz-aware, got effectively-naive datetime {ffa!r} '
+                f'(tzinfo={ffa.tzinfo!r} but utcoffset()=None). The '
+                f'strategy compares this against UTC-aware signal '
+                f'timestamps; a naive cutoff raises TypeError.'
+            )
+            raise ValueError(msg)
         raw_params: dict[str, object] = {
             'symbol': strategy_params.symbol,
             'capital': str(strategy_params.capital),
@@ -124,6 +153,9 @@ class ManifestBuilder:
             'estimated_price': str(strategy_params.estimated_price),
             'stop_bps': str(strategy_params.stop_bps),
             'maker_preference': bool(strategy_params.maker_preference),
+            'force_flatten_after': (
+                None if ffa is None else ffa.isoformat()
+            ),
         }
         # Nexus's StrategySpec schema has no `params` field, and its
         # startup sequencer constructs `StrategyParams(raw={})` — there's

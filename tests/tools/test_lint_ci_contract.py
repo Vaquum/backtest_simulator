@@ -77,6 +77,14 @@ EXPECTED_RUFF_POLICY: Final[dict[str, object]] = {
         # the parity surface; collapsing them would diverge from
         # Praxis and lose per-stage knob clarity.
         'backtest_simulator/honesty/capital.py': ['PLR0913'],
+        # Slice #40: _Config.__init__ in long_on_signal.py mirrors
+        # StrategyParamsSpec's named fields 1:1 (symbol, capital,
+        # kelly_pct, estimated_price, stop_bps, force_flatten_after,
+        # maker_preference). The strategy template is the bts ->
+        # Nexus boundary; bundling these into a config object would
+        # lose the field clarity readers rely on when auditing baked
+        # params.
+        'backtest_simulator/pipeline/_strategy_templates/long_on_signal.py': ['PLR0913'],
         # M2 Task 1 (slice #17): the CLI subcommand modules
         # legitimately print() per-run summaries to stdout (the
         # operator's debug surface) and the sweep / run / pipeline

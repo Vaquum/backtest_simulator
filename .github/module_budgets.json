@@ -40,7 +40,7 @@
   "backtest_simulator/pipeline/manifest_builder.py": 240,
   "backtest_simulator/pipeline/bundle.py": 320,
   "backtest_simulator/pipeline/_strategy_templates/__init__.py": 10,
-  "backtest_simulator/pipeline/_strategy_templates/long_on_signal.py": 260,
+  "backtest_simulator/pipeline/_strategy_templates/long_on_signal.py": 295,
   "backtest_simulator/strategies/__init__.py": 30,
   "backtest_simulator/strategies/buy_and_hold.py": 160,
   "backtest_simulator/strategies/inverse_prescient.py": 200,

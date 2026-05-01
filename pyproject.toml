@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "backtest_simulator"
-version = "2.2.0"
+version = "2.2.1"
 description = "Honest, gate-enforced backtester for unmodified Nexus strategies against unmodified Praxis."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -202,6 +202,13 @@ max-statements = 50
 # signature (it wraps SimulatedVenueAdapter.submit_order without
 # changing arity).
 "backtest_simulator/launcher/launcher.py" = ["PLR0913"]
+# `_Config.__init__` mirrors `StrategyParamsSpec`'s named fields
+# 1:1 (symbol, capital, kelly_pct, estimated_price, stop_bps,
+# force_flatten_after, maker_preference). The strategy template
+# is the bts -> Nexus boundary; bundling these into a config
+# object would lose the field clarity readers rely on when
+# auditing baked params.
+"backtest_simulator/pipeline/_strategy_templates/long_on_signal.py" = ["PLR0913"]
 # The CLI subcommand modules legitimately print() per-run summaries to
 # stdout (the operator's debug surface) and the sweep / run / pipeline
 # orchestration carries enough branches to exceed PLR0912 / PLR0915.
