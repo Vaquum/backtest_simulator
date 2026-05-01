@@ -91,14 +91,18 @@ class Strategy(_StrategyBase):
             else datetime.fromisoformat(str(force_flatten_raw))
         )
         # Defensive: signal.timestamp is always UTC-aware (Nexus emits
-        # `datetime.now(tz=timezone.utc)`); a naive cutoff raises
-        # TypeError on the comparison. ManifestBuilder validates this
-        # at config build time, but a hand-edited baked config would
-        # bypass that — this catches the runtime side too.
-        if force_flatten_after is not None and force_flatten_after.tzinfo is None:
+        # `datetime.now(tz=timezone.utc)`). An effectively-naive cutoff
+        # raises TypeError on the comparison. ManifestBuilder validates
+        # this at config build time; a hand-edited baked config would
+        # bypass that. utcoffset() catches tzinfo subclasses whose
+        # utcoffset() returns None.
+        if (
+            force_flatten_after is not None
+            and force_flatten_after.utcoffset() is None
+        ):
             msg = (
                 f'_BAKED_CONFIG[force_flatten_after] must be tz-aware, '
-                f'got naive {force_flatten_after!r}'
+                f'got effectively-naive {force_flatten_after!r}'
             )
             raise ValueError(msg)
         self._config = _Config(
@@ -217,7 +221,9 @@ class Strategy(_StrategyBase):
             return [self._build_action(OrderSide.SELL, qty, signal)]
         return []
 
-    def _build_action(self, side: OrderSide, qty: Decimal, signal: Signal) -> Action:
+    def _build_action(
+        self, side: OrderSide, qty: Decimal, signal: Signal | None,
+    ) -> Action:
         del signal
         # Declared-stop enforcement (Part 2): every OPEN-position ENTER
         # must carry a concrete `stop_price`. For long-only we only
@@ -345,6 +351,28 @@ class Strategy(_StrategyBase):
                     outcome.outcome_type.value, outcome.fill_size,
                     self._entry_qty,
                 )
+                # Force-flatten edge case: a maker LIMIT BUY emitted
+                # before the cutoff can fill (via on_outcome) AFTER
+                # the cutoff. on_signal's force-flatten branch won't
+                # see this position because no further signal fires
+                # post-cutoff. Emit the closing SELL here, gated on
+                # the same cutoff check.
+                cutoff = self._config.force_flatten_after
+                if (
+                    cutoff is not None
+                    and outcome.timestamp >= cutoff
+                    and not self._pending_sell
+                ):
+                    qty = self._entry_qty
+                    self._pending_sell = True
+                    _log.info(
+                        'FORCE FLATTEN on BUY fill past cutoff: qty=%s '
+                        'fill_ts=%s cutoff=%s',
+                        qty, outcome.timestamp, cutoff,
+                    )
+                    return [
+                        self._build_action(OrderSide.SELL, qty, signal=None),
+                    ]
             else:
                 # Reduce inventory by the fill_size; only flip
                 # `_long` to False when the SELL has FULLY closed

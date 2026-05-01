@@ -172,3 +172,78 @@ def test_force_flatten_disabled_when_after_is_none(tmp_path: Path) -> None:
     )
 
     assert actions == []
+
+
+def test_force_flatten_emits_sell_when_buy_fills_past_cutoff(
+    tmp_path: Path,
+) -> None:
+    """Maker BUY emitted before cutoff but filling after must trigger SELL.
+
+    Edge case Copilot flagged on PR #41: a `maker_preference=True`
+    LIMIT BUY can sit pending across the cutoff (deadline=60s). The
+    fill arrives via `on_outcome` AFTER `signal.timestamp >= cutoff`,
+    so `on_signal`'s force-flatten branch never sees it. `on_outcome`
+    must emit the closing SELL itself.
+    """
+    mod = _load_template(tmp_path, force_flatten_after=_FORCE_FLATTEN_AFTER)
+    strategy = mod.Strategy('force-flatten-fixture')
+    strategy.on_startup(StrategyParams(raw={}), _ctx())
+    pre_cutoff = _FORCE_FLATTEN_AFTER - timedelta(seconds=10)
+    enter = strategy.on_signal(
+        _signal(pre_cutoff, preds=1), StrategyParams(raw={}), _ctx(),
+    )
+    assert len(enter) == 1
+    fill_qty = enter[0].size
+
+    past_cutoff_fill_ts = _FORCE_FLATTEN_AFTER + timedelta(seconds=5)
+    outcome = TradeOutcome(
+        outcome_id='oc-buy-late', command_id='cmd-buy-late',
+        outcome_type=TradeOutcomeType.FILLED,
+        timestamp=past_cutoff_fill_ts,
+        fill_size=fill_qty,
+        fill_price=Decimal('70000'),
+        fill_notional=fill_qty * Decimal('70000'),
+        actual_fees=Decimal('0'),
+        remaining_size=Decimal('0'),
+        reject_reason=None, cancel_reason=None,
+    )
+    actions = strategy.on_outcome(
+        outcome, StrategyParams(raw={}), _ctx(),
+    )
+
+    assert len(actions) == 1
+    assert actions[0].direction == OrderSide.SELL
+    assert actions[0].size == fill_qty
+    assert getattr(strategy, '_pending_sell') is True
+
+
+def test_force_flatten_does_not_emit_sell_when_buy_fills_before_cutoff(
+    tmp_path: Path,
+) -> None:
+    """A BUY filling before the cutoff must NOT trigger force-flatten in on_outcome."""
+    mod = _load_template(tmp_path, force_flatten_after=_FORCE_FLATTEN_AFTER)
+    strategy = mod.Strategy('force-flatten-fixture')
+    strategy.on_startup(StrategyParams(raw={}), _ctx())
+    enter = strategy.on_signal(
+        _signal(_T0, preds=1), StrategyParams(raw={}), _ctx(),
+    )
+    fill_qty = enter[0].size
+
+    pre_cutoff_fill_ts = _FORCE_FLATTEN_AFTER - timedelta(seconds=5)
+    outcome = TradeOutcome(
+        outcome_id='oc-buy', command_id='cmd-buy',
+        outcome_type=TradeOutcomeType.FILLED,
+        timestamp=pre_cutoff_fill_ts,
+        fill_size=fill_qty,
+        fill_price=Decimal('70000'),
+        fill_notional=fill_qty * Decimal('70000'),
+        actual_fees=Decimal('0'),
+        remaining_size=Decimal('0'),
+        reject_reason=None, cancel_reason=None,
+    )
+    actions = strategy.on_outcome(
+        outcome, StrategyParams(raw={}), _ctx(),
+    )
+
+    assert actions == []
+    assert getattr(strategy, '_long') is True

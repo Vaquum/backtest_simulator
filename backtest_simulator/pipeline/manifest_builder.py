@@ -134,12 +134,16 @@ class ManifestBuilder:
         # raise `TypeError: can't compare offset-naive and offset-aware
         # datetimes` on the first signal — fail loud at config build.
         ffa = strategy_params.force_flatten_after
-        if ffa is not None and ffa.tzinfo is None:
+        # `tzinfo is None` is not sufficient: a tzinfo subclass whose
+        # utcoffset() returns None is effectively naive (Python treats
+        # it as such for comparisons). Check utcoffset() to catch both.
+        if ffa is not None and ffa.utcoffset() is None:
             msg = (
                 f'StrategyParamsSpec.force_flatten_after must be '
-                f'tz-aware, got naive datetime {ffa!r}. The strategy '
-                f'compares this against UTC-aware signal timestamps; '
-                f'a naive cutoff raises TypeError on the first signal.'
+                f'tz-aware, got effectively-naive datetime {ffa!r} '
+                f'(tzinfo={ffa.tzinfo!r} but utcoffset()=None). The '
+                f'strategy compares this against UTC-aware signal '
+                f'timestamps; a naive cutoff raises TypeError.'
             )
             raise ValueError(msg)
         raw_params: dict[str, object] = {
