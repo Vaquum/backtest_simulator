@@ -336,9 +336,14 @@ def _run(args: argparse.Namespace) -> int:
         days=days, hours_start=hours_start, hours_end=hours_end,
         interval_seconds=interval_seconds,
     )
+    raw_lookback_for_signals = getattr(args, 'predict_lookback', None)
     signals_per_decoder = _build_and_save_signals_tables(
         picks, tick_timestamps=tick_timestamps,
         replay_start=replay_start, replay_end=replay_end,
+        predict_lookback=(
+            None if raw_lookback_for_signals is None
+            else int(raw_lookback_for_signals)
+        ),
     )
     _print_sweep_signals_summary(
         signals_per_decoder, tick_timestamps=tick_timestamps,
@@ -729,6 +734,7 @@ def _build_and_save_signals_tables(
     *,
     tick_timestamps: list[datetime],
     replay_start: datetime, replay_end: datetime,
+    predict_lookback: int | None = None,
 ) -> dict[str, SignalsTable]:
     """Build + save SignalsTable per picked decoder.
 
@@ -795,6 +801,7 @@ def _build_and_save_signals_tables(
                 manifest=manifest, sensor=sensor, klines=klines,
                 tick_timestamps=tick_timestamps,
                 round_params=round_params, decoder_id=decoder_id,
+                predict_lookback=predict_lookback,
             )
             # Load-bearing gates — wired so neither stays decorative.
             table.assert_split_alignment(manifest.split_config)

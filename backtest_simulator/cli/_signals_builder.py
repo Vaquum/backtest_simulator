@@ -82,6 +82,7 @@ def build_signals_table_for_decoder(
     tick_timestamps: list[datetime],
     round_params: dict[str, object],
     decoder_id: str,
+    predict_lookback: int | None = None,
 ) -> SignalsTable:
     """Build SignalsTable for one decoder via per-bar runtime replay.
 
@@ -172,6 +173,7 @@ def build_signals_table_for_decoder(
     # each tick: causal slice + `tail(POLLER_N_ROWS)` (codex round-3
     # P0). Iterate at the runtime tick instants (codex round-4 P0).
     manifest_full = manifest.with_params_override(split_config=(1, 0, 0))
+    effective_lookback = 1 if predict_lookback is None else predict_lookback
     timestamps: list[datetime] = []
     preds_list: list[int] = []
     probs_list: list[float] = []
@@ -192,10 +194,14 @@ def build_signals_table_for_decoder(
             # Feature warmup hasn't filled — Nexus's runtime would
             # also emit no Signal here. Skip honestly.
             continue
-        last_x = x_train_obj.tail(1).to_numpy()
+        last_x = x_train_obj.tail(effective_lookback).to_numpy()
         result = sensor.predict({'x_test': last_x})
-        preds_list.append(int(result['_preds'][0]))
-        probs_list.append(float(result['_probs'][0]))
+        # Mirror Nexus's `_extract_values`: take the last element of
+        # the predict output array, which corresponds to the current
+        # tick. With effective_lookback==1 this reduces to the legacy
+        # single-row behaviour.
+        preds_list.append(int(result['_preds'][-1]))
+        probs_list.append(float(result['_probs'][-1]))
         timestamps.append(tick)
 
     if not timestamps:
