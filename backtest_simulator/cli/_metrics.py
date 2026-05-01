@@ -111,6 +111,7 @@ def print_run(
     perm_id: int, day_label: str,
     trades: list[Trade], declared_stops: dict[str, Decimal],
     *,
+    n_orders: int = 0,
     slippage_cost_bps: Decimal | None = None,
     slippage_n_samples: int = 0,
     slippage_n_excluded: int = 0,
@@ -146,7 +147,8 @@ def print_run(
     large = recalibrate. The headline appends `gap <±bp>` after
     the slip column when the gap is non-None.
     """
-    pairs, _trailing = pair_trades(trades)
+    pairs, trailing = pair_trades(trades)
+    n_open = len(trailing)
     net_pnls: list[Decimal] = []
     return_pcts: list[Decimal] = []
     r_mults: list[Decimal] = []
@@ -246,9 +248,30 @@ def print_run(
         atr_str = f'  atr_rej={n_atr_rejected}/uncal={n_atr_uncalibrated}'
     else:
         atr_str = ''
+    # `trades N` counts CLOSED BUY->SELL round trips. A day with
+    # order activity that did not close a round trip (BUY filled
+    # without SELL fill, BUY/SELL submitted but neither filled,
+    # outcome stuck PENDING, etc.) used to read as `trades 0` and
+    # was indistinguishable from a genuinely flat day. Append:
+    #   - `+N open` when there is unmatched filled inventory
+    #     (BUY in `account.trades` with no closing SELL — every
+    #     such position carries real exposure even if the SELL
+    #     side never landed).
+    #   - `orders K` when the venue accepted at least one order
+    #     submit (even a non-fill / PENDING outcome). This is the
+    #     "did anything happen this day" indicator the operator
+    #     needs to distinguish a flat day from a fail-to-fill day.
+    activity_extras: list[str] = []
+    if n_open > 0:
+        activity_extras.append(f'+{n_open} open')
+    if n_orders > 0:
+        activity_extras.append(f'orders {n_orders}')
+    activity_str = (
+        f' ({", ".join(activity_extras)})' if activity_extras else ''
+    )
     print(
         f'   perm {perm_id:<4}  {day_label}  '
-        f'trades {n_trades:<3}  PF {pf_str:<6}  '
+        f'trades {n_trades}{activity_str}  PF {pf_str:<6}  '
         f'R̄ {r_mean_str:<7}  DD {fmt_dec(-max_dd_pct, 2)}%  '
         f'total {fmt_dec(total_pct, 2)}%  '
         f'{slip_str}'
