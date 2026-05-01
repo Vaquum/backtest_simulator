@@ -304,7 +304,7 @@ def _finalize_successful_fill(
         msg = (
             f'capital overshoot: fill_notional={fill_notional} exceeds '
             f'reserved={reservation_notional} for command_id={command_id} '
-            f'by {slippage}. Raise `_NOTIONAL_RESERVATION_BUFFER` in '
+            f'by {slippage}. Raise `NOTIONAL_RESERVATION_BUFFER` in '
             f'backtest_simulator.launcher.action_submitter to absorb this '
             f'slippage honestly; silently capping here would bypass '
             f'CAPITAL gating.'
@@ -820,6 +820,8 @@ class BacktestLauncher(Launcher):
         historical_data: HistoricalData | None = None,
         atr_gate: AtrSanityGate | None = None,
         atr_provider: Callable[[str, datetime], Decimal | None] | None = None,
+        max_allocation_per_trade_pct: Decimal | None = None,
+        predict_lookback: int | None = None,
     ) -> None:
         # A backtest run is one window, one set of events — not a live
         # service that needs durable state across processes. Starting
@@ -857,6 +859,8 @@ class BacktestLauncher(Launcher):
         self._atr_provider = atr_provider
         self._n_atr_rejected = 0
         self._n_atr_uncalibrated = 0
+        self._max_allocation_per_trade_pct = max_allocation_per_trade_pct
+        self._predict_lookback = predict_lookback
 
     @property
     def n_atr_rejected(self) -> int:
@@ -1159,6 +1163,7 @@ class BacktestLauncher(Launcher):
         pipeline, controller, capital_state = build_validation_pipeline(
             nexus_config=nexus_config,
             capital_pool=allocated_capital,
+            max_allocation_per_trade_pct=self._max_allocation_per_trade_pct,
         )
         state = InstanceState(capital=capital_state)
         self._capital_state = capital_state

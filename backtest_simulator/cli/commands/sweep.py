@@ -218,6 +218,20 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
                    ))
     p.add_argument('--atr-window-seconds', type=int, default=900,
                    help='ATR window in seconds. Default: 900s.')
+    p.add_argument('--max-allocation-per-trade-pct', type=str, default=None,
+                   help=(
+                       'Override Nexus CapitalController default of 0.15. '
+                       'Decimal fraction (e.g. 0.4 for 40%% of pool). Requires '
+                       'vaquum-nexus >= 0.35.0. Default: leave Nexus default.'
+                   ))
+    p.add_argument('--predict-lookback', type=int, default=None,
+                   help=(
+                       'Number of trailing prepared rows fed into '
+                       'sensor.predict per tick. Default 1 (single-row '
+                       'predict) preserves prior behaviour. >1 enables '
+                       'stateful predictors to evolve across rows. '
+                       'Requires vaquum-nexus >= 0.36.0.'
+                   ))
     # Slice #17 Task 17 (CPCV portion). Operator-controllable
     # CSCV partitioning. Defaults C(4,2)=6 paths so the math runs
     # on every default sweep that has enough clean days; otherwise
@@ -403,6 +417,8 @@ def _run(args: argparse.Namespace) -> int:
             )
             sys.stderr.flush()
             t0 = time.perf_counter()
+            raw_max_alloc = getattr(args, 'max_allocation_per_trade_pct', None)
+            raw_lookback = getattr(args, 'predict_lookback', None)
             try:
                 result = run_window_in_subprocess(
                     perm_id, kelly, window_start, window_end, exp_dir,
@@ -410,6 +426,13 @@ def _run(args: argparse.Namespace) -> int:
                     strict_impact=bool(getattr(args, 'strict_impact', False)),
                     atr_k=str(getattr(args, 'atr_k', '0.5')),
                     atr_window_seconds=int(getattr(args, 'atr_window_seconds', 900)),
+                    max_allocation_per_trade_pct=(
+                        None if raw_max_alloc is None
+                        else Decimal(str(raw_max_alloc))
+                    ),
+                    predict_lookback=(
+                        None if raw_lookback is None else int(raw_lookback)
+                    ),
                 )
             except Exception as exc:
                 # Codex (post-auditor-4) P1: prior `continue` pattern

@@ -71,6 +71,7 @@ integration = [
 # the documented uv knob for resolving sibling-lib URL drift.
 override-dependencies = [
     "vaquum_limen @ git+https://github.com/Vaquum/Limen",
+    "vaquum-nexus @ git+https://github.com/Vaquum/Nexus",
 ]
 
 [project.scripts]
