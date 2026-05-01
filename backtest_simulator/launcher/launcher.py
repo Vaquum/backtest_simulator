@@ -967,8 +967,15 @@ class BacktestLauncher(Launcher):
                     cfg_params = self._data_source_params_from_experiment_dir(
                         sensor_spec.experiment_dir,
                     )
-                    kline_size = int(cfg_params['kline_size'])
-                    params_by_kline[kline_size] = cfg_params
+                    kline_size_obj = cfg_params['kline_size']
+                    if not isinstance(kline_size_obj, int):
+                        msg = (
+                            f'data_source params kline_size for '
+                            f'{sensor_spec.experiment_dir} must be int, got '
+                            f'{type(kline_size_obj).__name__}={kline_size_obj!r}'
+                        )
+                        raise TypeError(msg)
+                    params_by_kline[kline_size_obj] = cfg_params
         return params_by_kline
 
     @staticmethod

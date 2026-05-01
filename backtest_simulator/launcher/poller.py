@@ -106,8 +106,8 @@ class BacktestMarketDataPoller:
     def _fetch(self, kline_size: int) -> pl.DataFrame:
         params = dict(self._params_by_kline_size.get(kline_size, {}))
         params.pop('kline_size', None)
-        n_rows = params.pop('n_rows', None)
-        start_date_limit = params.pop(
+        n_rows_obj = params.pop('n_rows', None)
+        start_date_limit_obj = params.pop(
             'start_date_limit', self._start_date_limit,
         )
         if params:
@@ -118,8 +118,22 @@ class BacktestMarketDataPoller:
                 f'accepts only n_rows / kline_size / start_date_limit.'
             )
             raise ValueError(msg)
+        if n_rows_obj is not None and not isinstance(n_rows_obj, int):
+            msg = (
+                f'BacktestMarketDataPoller._fetch: kline_size={kline_size} '
+                f'n_rows must be int|None, got '
+                f'{type(n_rows_obj).__name__}={n_rows_obj!r}'
+            )
+            raise TypeError(msg)
+        if not isinstance(start_date_limit_obj, str):
+            msg = (
+                f'BacktestMarketDataPoller._fetch: kline_size={kline_size} '
+                f'start_date_limit must be str, got '
+                f'{type(start_date_limit_obj).__name__}={start_date_limit_obj!r}'
+            )
+            raise TypeError(msg)
         return self._historical_data.get_spot_klines(
-            n_rows=n_rows,
+            n_rows=n_rows_obj,
             kline_size=kline_size,
-            start_date_limit=start_date_limit,
+            start_date_limit=start_date_limit_obj,
         )
