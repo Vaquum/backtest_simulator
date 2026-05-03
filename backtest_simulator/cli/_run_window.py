@@ -347,7 +347,16 @@ def run_window_in_process(
         feed=feed,
         filters=BinanceSpotFilters.binance_spot(SYMBOL),
         fees=FeeSchedule(),
-        trade_window_seconds=60,
+        # Walk one full kline of trade tape per submit, clamped to
+        # the run window's end. `interval_seconds` is the bundle's
+        # `data_source_config.params['kline_size']` derived above.
+        # `window_end_clamp` prevents a submit near the close of the
+        # run window from peeking at post-window tape — without the
+        # clamp, a SELL submitted at e.g. `window_end - 60s` with a
+        # 4h `trade_window_seconds` would consume ~4h of future
+        # data.
+        trade_window_seconds=interval_seconds,
+        window_end_clamp=window_end,
         slippage_model=slippage_model,
         maker_fill_model=maker_fill_model,
         market_impact_bucket_minutes=1,

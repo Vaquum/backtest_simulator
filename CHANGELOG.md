@@ -1,3 +1,44 @@
+# v2.3.4
+
+Venue tape walk now spans one full `kline_size` per submit
+(was hardcoded 60 s). Eliminates the "phantom intent"
+artefact: the prior 60-second cap caused 5–10% of MARKET
+orders on BTCUSDT to silently fail to fill in the simulated
+venue, even though a real exchange would have crossed the
+book in microseconds.
+
+The single change is in
+`backtest_simulator/cli/_run_window.py::run_window_in_process`:
+`SimulatedVenueAdapter(... trade_window_seconds=60 ...)` →
+`SimulatedVenueAdapter(... trade_window_seconds=interval_seconds ...)`,
+where `interval_seconds` is the bundle's
+`data_source_config.params['kline_size']` derived a few lines
+above. The venue's `_walk_market` itself is untouched — it
+already walks the entire window passed to it. We just stop
+truncating the window to 60 s.
+
+A BUY retry latch (mirroring the v2.3.3 SELL `_must_close_
+outstanding`) was considered and dropped: the EXPIRED BUY
+path is ambiguous between "no liquidity" and
+"stop-breach-before-fill" (`fills.py:142` halts the walk on
+declared-stop breach, returning zero fills, which surface as
+EXPIRED). Blanket retry would book stop-invalidated entries.
+With the wider tape walk the no-liquidity case becomes
+near-impossible on BTCUSDT, and stop-breach-before-fill stays
+a clean honest EXPIRED that the strategy correctly does not
+retry. If a future slice surfaces `stop_halted` distinctly
+from `liquidity_exhausted` at the venue/Praxis boundary, BUY
+retry can be reconsidered.
+
+Verified by AST-based test in
+`tests/cli/test_run_window_trade_window.py`: the
+`SimulatedVenueAdapter(...)` keyword argument
+`trade_window_seconds` must reference the local
+`interval_seconds`, and `interval_seconds` must come from
+`read_kline_size_from_experiment_dir(...)`. A regression that
+re-hardcodes the value, or reassigns the local from another
+source, fails the gate.
+
 # v2.3.3
 
 Deferred SELL retry on PARTIAL/EXPIRED until flat or hard reject.
