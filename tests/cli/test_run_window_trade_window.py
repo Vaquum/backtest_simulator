@@ -66,16 +66,19 @@ def _find_simulated_venue_adapter_call(
     raise AssertionError(msg)
 
 
-def test_run_window_passes_interval_seconds_as_trade_window() -> None:
-    """`trade_window_seconds` MUST be `interval_seconds`, not a constant.
+def test_run_window_trade_window_references_interval_seconds() -> None:
+    """`trade_window_seconds` MUST reference the bundle's `interval_seconds`.
 
-    AST-based check (not substring): walks `_run_window.py`'s AST,
-    finds the `SimulatedVenueAdapter(...)` call inside
-    `run_window_in_process`, locates the `trade_window_seconds`
-    keyword argument, and asserts the value is the bare name
-    `interval_seconds`. A constant integer (e.g. 60), a
-    different name, or a comment carrying the string `interval_
-    seconds` would all fail this check.
+    AST-based check (not substring) — walks `_run_window.py`'s AST,
+    locates the `SimulatedVenueAdapter(...)` keyword
+    `trade_window_seconds`, and asserts the local `interval_seconds`
+    appears somewhere in the value expression. Allows future
+    implementations that wrap the value (e.g. a `min(...)` clamp,
+    a helper, or an explicit `int(...)` cast) as long as the
+    bundle-derived kline size is the source of truth — the only
+    regression this guards against is re-introducing a hardcoded
+    constant or sourcing the window from anywhere other than the
+    bundle.
     """
     src = _RUN_WINDOW_PATH.read_text(encoding='utf-8')
     tree = ast.parse(src)
@@ -95,17 +98,60 @@ def test_run_window_passes_interval_seconds_as_trade_window() -> None:
         'the bundle kline_size.'
     )
     value = trade_window_kwarg.value
-    assert isinstance(value, ast.Name), (
-        f'trade_window_seconds must be `interval_seconds` (a name '
-        f'reference to the kline-size local), got '
-        f'{ast.dump(value)} of type {type(value).__name__}. '
-        f'A constant or expression here re-introduces the '
-        f'phantom-intent bug.'
+    assert not isinstance(value, ast.Constant), (
+        f'trade_window_seconds must not be a hardcoded constant '
+        f'(was {ast.dump(value)}); use `interval_seconds` from '
+        f'the bundle manifest.'
     )
-    assert value.id == 'interval_seconds', (
-        f'trade_window_seconds must be the local '
-        f'`interval_seconds` (= kline_size from the bundle '
-        f'manifest); got name `{value.id}`.'
+    name_descendants = {
+        n.id for n in ast.walk(value) if isinstance(n, ast.Name)
+    }
+    assert 'interval_seconds' in name_descendants, (
+        f'trade_window_seconds expression must reference the local '
+        f'`interval_seconds` (= bundle kline_size); '
+        f'value AST: {ast.dump(value)} '
+        f'(names referenced: {sorted(name_descendants)})'
+    )
+
+
+def test_run_window_passes_window_end_clamp_to_adapter() -> None:
+    """`SimulatedVenueAdapter(... window_end_clamp=window_end ...)`.
+
+    The wider tape walk (kline_size instead of 60s) creates a real
+    risk: a SELL submitted near the run window's close can pull
+    fills from past `window_end` if the venue isn't told where the
+    window ends. This is silent lookahead — the strategy thinks
+    it closed cleanly when in fact the closing fill came from
+    future data.
+
+    The fix lives at the venue layer (a per-submit clamp), but
+    the venue can only enforce it if the run-window caller passes
+    `window_end` explicitly. This test pins that plumbing.
+    """
+    src = _RUN_WINDOW_PATH.read_text(encoding='utf-8')
+    tree = ast.parse(src)
+    fn = _find_run_window_in_process(tree)
+    adapter_call = _find_simulated_venue_adapter_call(fn)
+    clamp_kwarg = next(
+        (
+            kw for kw in adapter_call.keywords
+            if kw.arg == 'window_end_clamp'
+        ),
+        None,
+    )
+    assert clamp_kwarg is not None, (
+        'SimulatedVenueAdapter(...) is missing the '
+        'window_end_clamp keyword argument; without it, a submit '
+        'near window-end can peek at post-window tape (silent '
+        'lookahead, the bug Copilot caught on PR #57).'
+    )
+    name_descendants = {
+        n.id for n in ast.walk(clamp_kwarg.value) if isinstance(n, ast.Name)
+    }
+    assert 'window_end' in name_descendants, (
+        f'window_end_clamp expression must reference the local '
+        f'`window_end`; got AST {ast.dump(clamp_kwarg.value)} '
+        f'(names referenced: {sorted(name_descendants)}).'
     )
 
 

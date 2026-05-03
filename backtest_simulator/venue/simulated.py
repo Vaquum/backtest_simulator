@@ -52,12 +52,24 @@ class SimulatedVenueAdapter:
         market_impact_bucket_minutes: int | None = None,
         market_impact_threshold_fraction: Decimal = Decimal('0.1'),
         strict_impact_policy: bool = False,
+        window_end_clamp: datetime | None = None,
     ) -> None:
         self._feed = feed
         self._filters = filters
         self._fees = fees
         self._fill_config = fill_config or FillModelConfig()
         self._trade_window_seconds = trade_window_seconds
+        # Sweep-window upper bound on the tape walk: a submit near the
+        # end of the run window must not pull fills from past
+        # `window_end`, otherwise `_walk_market` would peek at trades
+        # that occur after the window closes — silent lookahead. The
+        # caller (`run_window_in_process`) sets this to the run's
+        # `window_end`; the per-submit walk endpoint is then
+        # `min(submit_time + trade_window_seconds, window_end_clamp)`.
+        # `None` (the default) disables the clamp; tests and any
+        # caller that wants the legacy unbounded-walk behaviour leave
+        # it unset.
+        self._window_end_clamp = window_end_clamp
         # `slippage_model` is calibrated externally (`SlippageModel.calibrate`
         # over a pre-window trade slice) and supplied by the operator
         # — usually `cli/_run_window.run_window_in_process`. The
@@ -859,10 +871,25 @@ class SimulatedVenueAdapter:
                     minutes=self._maker_fill_model.lookback_minutes,
                 ),
             )
+        # Tape-walk endpoint: clamp at `window_end_clamp` if set so a
+        # submit near window-end cannot pull fills from after the run
+        # window. Without this, a SELL retry submitted at e.g.
+        # `window_end - 60s` with `trade_window_seconds = kline_size`
+        # would consume up to ~kline_size of post-window tape — silent
+        # lookahead. With the clamp, the walk consumes only what the
+        # honest run window contains; if that's not enough for the qty,
+        # the order surfaces as PARTIAL or PENDING/EXPIRED, which the
+        # strategy and v2.3.1 sweep abort handle loud.
+        walk_end = submit_time + _I.window_seconds(self._trade_window_seconds)
+        if self._window_end_clamp is not None:
+            walk_end = min(walk_end, self._window_end_clamp)
+        effective_lookahead_seconds = max(
+            0, int((walk_end - submit_time).total_seconds()),
+        )
         trades = self._feed.get_trades_for_venue(
             symbol, fetch_start,
-            submit_time + _I.window_seconds(self._trade_window_seconds),
-            venue_lookahead_seconds=self._trade_window_seconds,
+            walk_end,
+            venue_lookahead_seconds=effective_lookahead_seconds,
         )
         # The maker-LIMIT touch-refresh USED to live here (rewrite
         # `price` to last_trade ± tick when a maker model was
