@@ -822,8 +822,23 @@ def _child_main() -> int:
     import logging as _logging
     _level_name = os.environ.get('BTS_RUN_WINDOW_LOG_LEVEL')
     if _level_name:
+        # Copilot caught: `logging.basicConfig(level=...)` is
+        # case-sensitive when given a string — `info` / `debug`
+        # raise ValueError and crash the child. Normalise to
+        # uppercase before handing to logging; reject anything
+        # that is not one of the documented levels with a clear
+        # error rather than letting a typo crash the subprocess.
+        _level_upper = _level_name.strip().upper()
+        _allowed = {'CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG', 'NOTSET'}
+        if _level_upper not in _allowed:
+            msg_level = (
+                f'BTS_RUN_WINDOW_LOG_LEVEL={_level_name!r} is not a '
+                f'recognised stdlib logging level; expected one of '
+                f'{sorted(_allowed)} (case-insensitive).'
+            )
+            raise ValueError(msg_level)
         _logging.basicConfig(
-            level=_level_name,
+            level=_level_upper,
             format='%(levelname)s %(name)s %(message)s',
             force=True,
         )

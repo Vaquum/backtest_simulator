@@ -21,11 +21,12 @@ queue. Three changes restore end-to-end fill recognition in
   `BTS_RUN_WINDOW_LOG_LEVEL` env var routes child INFO/DEBUG
   logs to stderr for diagnostics; default behaviour unchanged.
 
-End-to-end verification, migrated r0011 v3 bundle, window
-2026-04-06 perm 24: `trades 0 (intents 1, fills 1, +1 open)`
-→ `trades 1 (intents 2, fills 2)` with the natural BUY entry
-in the 12:00 kline closing on the next preds=0 signal in the
-16:00 kline (intra-day round trip, no force-flatten needed).
+End-to-end on the migrated r0011 v3 bundle: `bts sweep`
+windows that previously closed with trailing open inventory
+now close with natural BUY-SELL round trips, and the
+sweep-aggregate `n_runs_excluded_open_position` drops to
+zero — so DSR/SPA/PBO are no longer compiled on a
+silently-shrunk subset.
 
 # v2.3.1
 
