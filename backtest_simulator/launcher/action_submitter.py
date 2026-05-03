@@ -22,7 +22,6 @@ from nexus.core.validator.pipeline_models import (
     ValidationAction,
     ValidationDecision,
     ValidationRequestContext,
-    ValidationStage,
 )
 from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
 from nexus.infrastructure.praxis_connector.trade_command import TradeCommand
@@ -37,8 +36,6 @@ from praxis.core.domain.enums import STPMode as _PraxisSTPMode
 from praxis.core.domain.single_shot_params import (
     SingleShotParams as _PraxisSingleShotParams,
 )
-
-from backtest_simulator.honesty.atr import AtrSanityGate
 
 _log = logging.getLogger(__name__)
 
@@ -307,19 +304,10 @@ class SubmitterBindings:
     strategy_budget: Decimal
     touch_provider: Callable[[str], Decimal | None] | None = None
     tick_provider: Callable[[str], Decimal] | None = None
-    # Slice #17 Task 29 — ATR R-denominator gameability gate.
-    # When BOTH non-None, ENTER+BUY whose declared stop is closer
-    # than `gate.k * ATR(window)` from entry is denied at INTAKE
-    # before `validation_pipeline.validate`. Provider closes over
-    # the feed; `compute_atr_from_tape` does the math. Either
-    # being None disables the gate.
-    atr_gate: AtrSanityGate | None = None
-    atr_provider: Callable[[str, datetime], Decimal | None] | None = None
 
 
 ReservationHook = Callable[[str, ValidationDecision, ValidationRequestContext, Action], None]
 SubmitHook = Callable[[str], None]
-AtrRejectHook = Callable[[ValidationDecision, Action], None]
 
 
 def build_action_submitter(
@@ -327,7 +315,6 @@ def build_action_submitter(
     *,
     on_reservation: ReservationHook | None = None,
     on_submit: SubmitHook | None = None,
-    on_atr_reject: AtrRejectHook | None = None,
 ) -> Callable[[list[Action], str], None]:
     """Return a callback for `PredictLoop(action_submit=...)`.
 
@@ -378,10 +365,7 @@ def build_action_submitter(
                     strategy_id, action,
                 )
                 continue
-            result = _submit_translated(
-                bindings, strategy_id, action,
-                on_atr_reject=on_atr_reject,
-            )
+            result = _submit_translated(bindings, strategy_id, action)
             if result is None:
                 continue
             command_id, decision, context = result
@@ -441,39 +425,18 @@ def _submit_translated(
     bindings: SubmitterBindings,
     strategy_id: str,
     action: Action,
-    *,
-    on_atr_reject: AtrRejectHook | None = None,
 ) -> tuple[str, ValidationDecision, ValidationRequestContext] | None:
     context = _build_context(
         config=bindings.nexus_config, state=bindings.state,
         strategy_id=strategy_id, action=action,
         strategy_budget=bindings.strategy_budget,
     )
-    # BTS-side INTAKE pre-hook supplementing the real Nexus INTAKE stage.
-    # Slice #28 lit up the pipeline's INTAKE with real
-    # `validate_intake_stage(...)` checks; these two hooks layer on top
-    # because the data they need (`execution_params['stop_price']`) is
-    # not on `ValidationRequestContext`. Closure path: a Nexus PR
-    # extending `ValidationRequestContext.execution_params`. Long-only
-    # strategy convention — BUY opens a long (requires protective stop),
-    # SELL closes a long (is itself the exit, no new stop).
-    intake_decision = _check_declared_stop(action, context)
-    if intake_decision is None:
-        intake_decision = _check_atr_sanity(
-            action, context,
-            gate=bindings.atr_gate, atr_provider=bindings.atr_provider,
-            touch_provider=bindings.touch_provider,
-        )
-        if intake_decision is not None and on_atr_reject is not None:
-            on_atr_reject(intake_decision, action)
-    if intake_decision is not None:
-        _log.warning(
-            'validation denied: stage=%s reason_code=%s message=%s command_id=%s',
-            intake_decision.failed_stage.value if intake_decision.failed_stage else None,
-            intake_decision.reason_code, intake_decision.message,
-            context.command_id,
-        )
-        return None
+    # No bts-side INTAKE pre-hooks. The Nexus pipeline's
+    # `validate_intake_stage` is the only INTAKE authority; bts must not
+    # silently drop actions on its own grounds. A strategy that emits
+    # un-stopped or under-floored entries is a strategy bug, fixed in
+    # the Nexus strategy file — bts replays whatever the strategy
+    # decides, just as paper/live would.
     # SELL fast-path: long-only convention treats `SELL+ENTER` as the
     # close of an open long. The fast-path bypasses
     # `validation_pipeline.validate` because (a) the bts long-only
@@ -649,174 +612,6 @@ _FEE_ESTIMATE_RATE = Decimal('0.002')
 # drift), the strategy's Kelly% must shrink or the strategy_budget
 # concept needs a formal lift above the current allocated_capital.
 NOTIONAL_RESERVATION_BUFFER = Decimal('0.07')
-
-
-def _check_declared_stop(
-    action: Action, context: ValidationRequestContext,
-) -> ValidationDecision | None:
-    """Deny BUY-ENTER that lacks a declared stop_price.
-
-    BTS-side pre-hook supplementing the real Nexus INTAKE stage.
-    Slice #28 lit up `validate_intake_stage` (order-rate, duplicate-
-    window, reference-integrity, mode, notional, budget). This hook
-    runs in addition because `ValidationRequestContext` does not carry
-    `action.execution_params['stop_price']` and the stop check needs
-    that field. Closure path: a Nexus PR extending
-    `ValidationRequestContext.execution_params` lets this hook
-    collapse into the pipeline's INTAKE stage.
-
-    The long-only strategy template writes stop_price onto
-    `execution_params['stop_price']` for BUYs only (SELLs close an
-    open long and are themselves the exit). A missing stop on a BUY
-    is an honesty violation — without a concrete stop, there is no
-    place for `FillModel.apply_stop` to enforce and no honest
-    `r_per_trade` denominator later.
-    """
-    if action.action_type != ActionType.ENTER:
-        return None
-    if action.direction != OrderSide.BUY:
-        return None
-    params = action.execution_params
-    # `action.execution_params` is a read-only MappingProxy (not a
-    # plain dict) on the Nexus Action dataclass. Use the
-    # `collections.abc.Mapping` protocol instead of `isinstance(dict)`.
-    stop_price = params.get('stop_price') if isinstance(params, Mapping) else None
-    if stop_price is not None and str(stop_price).strip() not in ('', 'None'):
-        return None
-    return ValidationDecision(
-        allowed=False,
-        failed_stage=ValidationStage.INTAKE,
-        reason_code='INTAKE_DECLARED_STOP_MISSING',
-        message=(
-            f'ENTER BUY command_id={context.command_id} lacks a declared '
-            f'stop_price. Part 2 honesty gate: every long-opening entry '
-            f'MUST declare a concrete stop_price so FillModel.apply_stop '
-            f'can enforce it and r_per_trade can be computed honestly.'
-        ),
-    )
-
-
-def _check_atr_sanity(
-    action: Action, context: ValidationRequestContext, *,
-    gate: AtrSanityGate | None,
-    atr_provider: Callable[[str, datetime], Decimal | None] | None,
-    touch_provider: Callable[[str], Decimal | None] | None = None,
-) -> ValidationDecision | None:
-    """Reject ENTER+BUY whose declared stop is closer than `k * ATR(window)`.
-
-    BTS-side pre-hook supplementing the real Nexus INTAKE stage. The
-    pipeline's INTAKE runs `validate_intake_stage` with the standard
-    Praxis hooks; this ATR-floor hook runs in addition because the
-    data it needs (`execution_params['stop_price']` plus the symbol's
-    pre-decision ATR window) is not on `ValidationRequestContext`.
-    Closure path: a Nexus PR extending `ValidationRequestContext` so
-    this floor lands inside `validate_intake_stage` itself.
-
-    Slice #17 Task 29 closes the R-denominator gameability vector
-    `_check_declared_stop` only half-blocks: a 1 bp stop reaches
-    Praxis untouched and the R̄ in `bts sweep` becomes a knob the
-    strategy can dial by tightening stops. Returns `None` when
-    the gate is disabled, when not ENTER+BUY, when stop is
-    missing (caller already handled), or when ATR allows. Else
-    returns a denial with reason_code prefixed `ATR_`.
-
-    BTS-only floor — paper/live measures realized PnL, bts measures
-    R-multiples on R̄, and only the latter is gameable by tightening
-    stops. Upstreaming this floor to paper/live requires either (a)
-    the Nexus context extension above, or (b) moving the floor into
-    the strategy template itself so it runs upstream of any
-    deployment. Both are out of slice scope.
-
-    Entry-price proxy priority (codex round 1 P1: must match the
-    R-denominator's actual entry — a stale seed price drifts vs
-    the declared stop and lets gameability leak through):
-      1. LIMIT `execution_params['price']` when set
-         (`_maybe_refresh_limit_to_touch` may have rewritten this
-         to `touch ± tick` for maker posts).
-      2. `touch_provider(symbol)` — most recent pre-submit trade.
-      3. `action.reference_price` — the baked window-start seed.
-
-    Long-only: only BUY entries are gated; short-side requires
-    intent plumbing (same constraint as strict-impact).
-    """
-    if gate is None or atr_provider is None:
-        return None
-    # `k=0` is the standalone gate's "disabled" knob. Honor it
-    # BEFORE calling `atr_provider` so a disabled gate never
-    # rejects on ATR_UNCALIBRATED for an empty pre-decision
-    # tape. Symmetric to `AtrSanityGate.evaluate`'s own k=0
-    # short-circuit. Codex round 4 P1 caught this.
-    if gate.k == Decimal('0'):
-        return None
-    if action.action_type != ActionType.ENTER or action.direction != OrderSide.BUY:
-        return None
-    params = action.execution_params
-    stop_raw = params.get('stop_price') if isinstance(params, Mapping) else None
-    if stop_raw is None or str(stop_raw).strip() in ('', 'None'):
-        return None
-    # Decimal coercion fails loud on malformed stop_price strings.
-    # `_check_declared_stop` already validates non-blank; a string
-    # that parses-to-blank but is otherwise non-Decimal is a
-    # strategy template bug, not something to silently bypass.
-    stop_price = Decimal(str(stop_raw))
-    entry_price = _resolve_atr_entry_price(action, touch_provider)
-    if entry_price is None:
-        return None
-    atr = atr_provider(_extract_symbol(action), datetime.now(UTC))
-    if atr is None:
-        return ValidationDecision(
-            allowed=False, failed_stage=ValidationStage.INTAKE,
-            reason_code='ATR_UNCALIBRATED',
-            message=(
-                f'ENTER BUY command_id={context.command_id} ATR uncalibrated '
-                f'(empty pre-decision tape over configured window).'
-            ),
-        )
-    decision = gate.evaluate(
-        entry_price=entry_price, stop_price=stop_price, atr=atr,
-    )
-    if decision.allowed:
-        return None
-    return ValidationDecision(
-        allowed=False, failed_stage=ValidationStage.INTAKE,
-        reason_code=f'ATR_{(decision.reason or "denied").upper()}',
-        message=(
-            f'ENTER BUY command_id={context.command_id} stop_distance='
-            f'{decision.stop_distance} < min={decision.min_required_distance} '
-            f'(atr={atr}, k={gate.k}, window={gate.atr_window_seconds}s).'
-        ),
-    )
-
-
-def _resolve_atr_entry_price(
-    action: Action,
-    touch_provider: Callable[[str], Decimal | None] | None,
-) -> Decimal | None:
-    """Best-effort live-entry proxy for the ATR gate.
-
-    Codex round 1 P1: the gate's entry-distance comparison must
-    track the same value R̄'s denominator will use, not the
-    stale window-start seed price. Falls back through (LIMIT
-    rewritten price, current touch, seed) — see
-    `_check_atr_sanity` docstring.
-    """
-    params = action.execution_params if isinstance(action.execution_params, Mapping) else None
-    if action.order_type is not None and action.order_type.name == 'LIMIT' and params is not None:
-        limit_raw = params.get('price')
-        if limit_raw is not None and str(limit_raw).strip() not in ('', 'None'):
-            # Decimal coercion fails loud on malformed LIMIT price.
-            # `execution_params['price']` is set by
-            # `_maybe_refresh_limit_to_touch`'s own Decimal-arithmetic
-            # write or by the strategy template; either way a
-            # non-Decimal string is a template bug.
-            return Decimal(str(limit_raw))
-    if touch_provider is not None and params is not None:
-        symbol = params.get('symbol')
-        if isinstance(symbol, str):
-            touch = touch_provider(symbol)
-            if touch is not None:
-                return touch
-    return action.reference_price
 
 
 def _extract_symbol(action: Action) -> str:

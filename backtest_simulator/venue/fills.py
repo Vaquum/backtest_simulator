@@ -139,16 +139,30 @@ def _walk_market(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpot
         if remaining <= 0:
             break
         px = Decimal(str(row['price']))
-        if stop_price is not None:
+        # Stop-breach is a MID-WALK halt that models gap-through-stop
+        # during entry consumption: the strategy's declared stop
+        # (anchored to the seed price baked at window_start) is
+        # crossed AFTER some qty has already filled, so the residual
+        # is left unbooked. Pre-fix this branch fired on the FIRST
+        # tape tick whenever the seed-anchored stop sat above the
+        # current market — i.e., when the price had merely DRIFTED
+        # between window_start and submit_time (typical for any
+        # multi-hour window). The strategy never entered, the venue
+        # silently returned zero fills, and Praxis's
+        # TradeOutcomeProduced=PENDING fallback (2-min timeout)
+        # surfaced the phantom intent the operator hit on perm-130
+        # 04-17 / 04-24. Real-world MARKET BUYs gap-fill at the
+        # current tape price even when that price is already past
+        # the strategy's stale stop reference; the protective stop
+        # only matters as an EXIT trigger after entry. Gate the
+        # breach halt on `consumed_qty > 0` so the FIRST tick always
+        # enters and only LATER ticks (a true intra-walk dip) halt.
+        if stop_price is not None and consumed_qty > 0:
             breaches = (
                 (order.side == 'BUY' and px <= stop_price)
                 or (order.side == 'SELL' and px >= stop_price)
             )
             if breaches:
-                # Stop breached mid-walk. Halt — return only what was
-                # filled at pre-breach tape prices. The unfilled
-                # residual is released (the caller / capital lifecycle
-                # must handle release-on-partial-fill).
                 stop_halted = True
                 break
         take = min(remaining, Decimal(str(row['qty'])))

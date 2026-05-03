@@ -212,15 +212,6 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
                        'Default: record telemetry only (observability '
                        'mode).'
                    ))
-    # Slice #17 Task 29 — ATR R-denominator gameability gate knobs.
-    p.add_argument('--atr-k', type=str, default='0.5',
-                   help=(
-                       'ATR-floor multiplier — stop must be >= '
-                       'k * ATR(window) from entry. 0 disables. '
-                       'Default: 0.5.'
-                   ))
-    p.add_argument('--atr-window-seconds', type=int, default=900,
-                   help='ATR window in seconds. Default: 900s.')
     p.add_argument('--max-allocation-per-trade-pct', type=str, default=None,
                    help=(
                        'Override Nexus CapitalController default of 0.15. '
@@ -383,10 +374,6 @@ def _run(args: argparse.Namespace) -> int:
     sweep_impact_n_flagged_total = 0
     sweep_impact_n_uncalibrated_total = 0
     sweep_impact_n_rejected_total = 0
-    # ATR R-denominator gameability gate aggregates (slice #17
-    # Task 29). Simple totals across runs.
-    sweep_atr_n_rejected_total = 0
-    sweep_atr_n_uncalibrated_total = 0
     # Slice #17 Task 11 — book-gap aggregates. max-of-max across
     # runs (the worst stop-cross latency the sweep observed) plus
     # total stops (denominator). p95 is intentionally NOT
@@ -432,8 +419,6 @@ def _run(args: argparse.Namespace) -> int:
                     perm_id, kelly, window_start, window_end, exp_dir,
                     maker_preference=bool(getattr(args, 'maker', False)),
                     strict_impact=bool(getattr(args, 'strict_impact', False)),
-                    atr_k=str(getattr(args, 'atr_k', '0.5')),
-                    atr_window_seconds=int(getattr(args, 'atr_window_seconds', 900)),
                     max_allocation_per_trade_pct=(
                         None if raw_max_alloc is None
                         else Decimal(str(raw_max_alloc))
@@ -507,8 +492,6 @@ def _run(args: argparse.Namespace) -> int:
             impact_rejected = int(result.get(
                 'market_impact_n_rejected', 0,
             ))
-            atr_rejected = int(result.get('n_atr_rejected', 0))
-            atr_uncal = int(result.get('n_atr_uncalibrated', 0))
             # Auditor (post-v2.0.3) "parity must not silently skip":
             # the prior round's `if runtime_preds_raw:` guard let a
             # broken capture hook or missing payload reach the
@@ -581,11 +564,7 @@ def _run(args: argparse.Namespace) -> int:
                 market_impact_n_samples=impact_n,
                 market_impact_n_flagged=impact_flagged,
                 market_impact_n_uncalibrated=impact_uncal,
-                n_atr_rejected=atr_rejected,
-                n_atr_uncalibrated=atr_uncal,
             )
-            sweep_atr_n_rejected_total += atr_rejected
-            sweep_atr_n_uncalibrated_total += atr_uncal
             # Book-gap aggregation: max-of-max + total stops.
             run_book_gap_max = float(result.get('book_gap_max_seconds', 0.0))
             run_book_gap_n = int(result.get('book_gap_n_observed', 0))
@@ -695,11 +674,6 @@ def _run(args: argparse.Namespace) -> int:
         sweep_impact_n_uncalibrated_total,
         sweep_impact_n_rejected_total,
         total_runs,
-    )
-    _print_sweep_atr_summary(
-        sweep_atr_n_rejected_total, sweep_atr_n_uncalibrated_total,
-        atr_k=str(getattr(args, 'atr_k', '0.5')),
-        atr_window_seconds=int(getattr(args, 'atr_window_seconds', 900)),
     )
     _print_sweep_book_gap_summary(
         max_seconds=sweep_book_gap_max_seconds,
@@ -1079,33 +1053,6 @@ def _print_sweep_book_gap_summary(
     print(
         f'sweep book_gap   max_seconds={max_seconds:.3f}  '
         f'total_stops={total_stops}',
-    )
-
-
-def _print_sweep_atr_summary(
-    n_rejected_total: int, n_uncalibrated_total: int,
-    atr_k: str, atr_window_seconds: int,
-) -> None:
-    """Sweep-level ATR R-denominator gate summary (slice #17 Task 29).
-
-    Auditor: always surface the FLOOR that produced the counts
-    (`atr_k`, `atr_window_seconds`), even when zero rejections /
-    uncalibrated. Two sweeps with different `--atr-k` /
-    `--atr-window-seconds` would otherwise show different
-    counts with no visible threshold — the bts artifact would
-    not be self-describing for later comparison. Now the line
-    always prints.
-
-    `--atr-k 0` (gate disabled) is annotated explicitly so the
-    operator distinguishes a healthy 0-rejection run with the
-    gate ON from a 0-rejection run with the gate OFF.
-    """
-    gate_state = ' (gate disabled)' if atr_k.strip() in {'0', '0.0'} else ''
-    print(
-        f'sweep atr        k={atr_k}{gate_state}  '
-        f'window={atr_window_seconds}s  '
-        f'rejected={n_rejected_total}  '
-        f'uncalibrated={n_uncalibrated_total}',
     )
 
 

@@ -1,3 +1,59 @@
+# v2.3.5
+
+Drop the two bts-side INTAKE pre-hooks (`_check_declared_stop`,
+`_check_atr_sanity`) that fired BEFORE Nexus's
+`validation_pipeline.validate`. Both silently denied
+ENTER+BUY actions on bts-only grounds and never emitted a
+terminal event, leaving `TradeOutcomeProduced` to settle
+to `status=PENDING` — the second source of "phantom
+intents" surfaced by the r0001 sweep on 2026-04-17 / -24
+(perms 21, 158, 159, 163). The strategy's declared
+stop and R-floor are strategy-file concerns; bts must
+replay whatever the strategy decides.
+
+Removed: `backtest_simulator/honesty/atr.py`, the ATR
+sanity gate plumbing in `BacktestLauncher` (`atr_gate`,
+`atr_provider`, `_n_atr_rejected`, `_n_atr_uncalibrated`,
+`_record_atr_rejection`, `n_atr_rejected`,
+`n_atr_uncalibrated`), `--atr-k` / `--atr-window-seconds`
+CLI flags from both `bts run` and `bts sweep`, the
+`atr_rej=` printout in `_metrics.print_run`, and the
+sweep-level ATR summary line.
+
+Regression gate:
+`tests/launcher/test_no_bts_intake_pre_hooks.py` pins
+the absence at the AST level (no `_check_*` definitions
+or references in `action_submitter.py`), the launcher's
+counter-state absence, the deleted module
+(`ModuleNotFoundError` on import), and the
+`SubmitterBindings` / `build_action_submitter` signature
+shape.
+
+Also fixes the THIRD source of phantom intents: a
+first-tick stop-breach in `venue/fills.py::_walk_market`.
+The launcher wrapper injects the strategy's declared
+stop (anchored to seed_price baked at `window_start`)
+into MARKET-BUY orders. By the time the strategy emits
+the first kline-tick BUY hours after window_start, BTC
+may have drifted >50bps below seed; the very first
+post-submit tape tick was then below the stale stop and
+`_walk_market` halted with `consumed_qty=0`, returning
+zero fills. Praxis surfaced that as
+`TradeOutcomeProduced status=PENDING` after a 2-min
+fallback. Real venues fill MARKETs at the current ask
+regardless of the strategy's declared stop — the stop
+governs EXIT, not entry. The fix gates the stop-breach
+halt on `consumed_qty > 0` so the first tape tick
+always fills, and only mid-walk gap-through-stop halts
+the consumption (the original gap-through model is
+preserved for partial-fill semantics).
+
+Verified on perm 130 across the canonical r0001 14-day
+sweep (2026-04-13..04-26): all 12 trade days now show
+`intents 2, fills 2` (clean BUY+SELL pair) where 04-17
+and 04-24 previously produced `intents 3, fills 2,
+pending 1` phantoms.
+
 # v2.3.4
 
 Venue tape walk now spans one full `kline_size` per submit

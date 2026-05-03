@@ -40,15 +40,11 @@ from nexus.strategy.action import Action, ActionType
 from backtest_simulator.honesty import build_validation_pipeline
 from backtest_simulator.launcher.action_submitter import (
     SubmitterBindings,
-    _check_atr_sanity,
-    _check_declared_stop,
     build_action_submitter,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CAPITAL_PY = REPO_ROOT / 'backtest_simulator' / 'honesty' / 'capital.py'
-
-_PARITY_DIVERGENCE_PHRASE = 'supplementing the real Nexus INTAKE stage'
 
 
 def _ctx(
@@ -436,16 +432,3 @@ def test_sell_fast_path_documented_in_source() -> None:
         assert marker in submitter_src
 
 
-# ---- INTAKE pre-hook divergence is documented, not hidden -----------------
-
-
-def test_intake_pre_hook_docstring_documents_divergence() -> None:
-    """Both pre-hooks cite the parity-divergence phrase in their docstring."""
-    declared_doc = _check_declared_stop.__doc__ or ''
-    atr_doc = _check_atr_sanity.__doc__ or ''
-    assert _PARITY_DIVERGENCE_PHRASE in declared_doc, (
-        '_check_declared_stop docstring must cite the divergence phrase'
-    )
-    assert _PARITY_DIVERGENCE_PHRASE in atr_doc, (
-        '_check_atr_sanity docstring must cite the divergence phrase'
-    )

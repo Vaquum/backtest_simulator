@@ -60,7 +60,6 @@ from backtest_simulator.honesty import (
     build_validation_pipeline,
     capital_totals,
 )
-from backtest_simulator.honesty.atr import AtrSanityGate
 from backtest_simulator.launcher.action_submitter import (
     SubmitterBindings,
     build_action_submitter,
@@ -873,8 +872,6 @@ class BacktestLauncher(Launcher):
         event_spine: EventSpine | None = None,
         db_path: Path | None = None,
         historical_data: HistoricalData | None = None,
-        atr_gate: AtrSanityGate | None = None,
-        atr_provider: Callable[[str, datetime], Decimal | None] | None = None,
         max_allocation_per_trade_pct: Decimal | None = None,
     ) -> None:
         # A backtest run is one window, one set of events — not a live
@@ -906,33 +903,7 @@ class BacktestLauncher(Launcher):
         self._submitted_commands = 0
         self._submit_lock = threading.Lock()
         self._venue_adapter = venue_adapter
-        # Slice #17 Task 29 — ATR R-denominator gameability gate.
-        # Either being None disables the gate; CLI path supplies
-        # both. Counters surface on `bts run` JSON + `bts sweep`.
-        self._atr_gate = atr_gate
-        self._atr_provider = atr_provider
-        self._n_atr_rejected = 0
-        self._n_atr_uncalibrated = 0
         self._max_allocation_per_trade_pct = max_allocation_per_trade_pct
-
-    @property
-    def n_atr_rejected(self) -> int:
-        """Stop-tighter-than `k*ATR(window)` ENTER+BUY denials."""
-        return self._n_atr_rejected
-
-    @property
-    def n_atr_uncalibrated(self) -> int:
-        """ENTER+BUY denials where the ATR provider returned None."""
-        return self._n_atr_uncalibrated
-
-    def _record_atr_rejection(
-        self, decision: ValidationDecision, action: Action,
-    ) -> None:
-        del action
-        if decision.reason_code == 'ATR_UNCALIBRATED':
-            self._n_atr_uncalibrated += 1
-        else:
-            self._n_atr_rejected += 1
 
     def _start_trading(self) -> None:
         """Wire `Trading.route_outcome` into the execution_manager.
@@ -1274,12 +1245,9 @@ class BacktestLauncher(Launcher):
                 strategy_budget=allocated_capital,
                 touch_provider=touch_provider,
                 tick_provider=tick_provider,
-                atr_gate=self._atr_gate,
-                atr_provider=self._atr_provider,
             ),
             on_reservation=self._record_reservation,
             on_submit=self._record_submitted_command,
-            on_atr_reject=self._record_atr_rejection,
         )
 
         def market_data_provider(kline_size: int) -> pl.DataFrame:
