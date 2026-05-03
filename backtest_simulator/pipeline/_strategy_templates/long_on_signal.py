@@ -137,6 +137,21 @@ class Strategy(_StrategyBase):
         # round 2 P2 caught this. Set on SELL emit, cleared in
         # `on_outcome` for SELL outcomes (terminal or fill).
         self._pending_sell: bool = False
+        # `_must_close_outstanding` is the deferred-retry latch.
+        # Set when a SELL outcome leaves the position open
+        # (PARTIAL with residual, or EXPIRED zero-fill); the next
+        # `on_signal` consumes it and re-emits the SELL on the
+        # next clock tick. Operator invariant — exit-only:
+        #   "you keep doing until you have gotten out".
+        # Deferring to next tick (vs returning a retry action
+        # from `on_outcome`) avoids a same-tape walk that would
+        # re-consume already-filled liquidity (PARTIAL) or loop
+        # on the same instant (EXPIRED zero-fill). Cleared on
+        # full close (FILLED, or PARTIAL that brings
+        # `_entry_qty` to zero), or on a hard rejection
+        # (REJECTED/CANCELED) where re-emit would just hit the
+        # same gate.
+        self._must_close_outstanding: bool = False
         _log.info(
             'LongOnSignal startup: symbol=%s capital=%s kelly_pct=%s est_price=%s',
             self._config.symbol, self._config.capital,
@@ -148,18 +163,42 @@ class Strategy(_StrategyBase):
         self, signal: Signal, params: StrategyParams, context: StrategyContext,
     ) -> list[Action]:
         del params, context
-        # Force-flatten at window close runs FIRST — before the
-        # `_preds is None` guard — because the close-by-window-end
-        # invariant is non-negotiable: every BUY filled in this
-        # window MUST be closed before the window ends. Threshold
-        # models (e.g. Limen's `threshold_logreg_binary`) legitimately
-        # emit `_preds=None` on uncertain bars; if the cutoff bar
-        # happens to be one of those, the prior code returned `[]`
-        # immediately and force-flatten never fired, leaving open
-        # inventory at window close. The bts honesty contract
-        # requires the SELL to fire regardless of `_preds` value
-        # whenever `signal.timestamp >= cutoff` and the strategy
-        # holds inventory.
+        # Deferred-retry latch consumes FIRST — before the cutoff
+        # branch and before the `_preds is None` guard. The latch
+        # was set by `on_outcome` when a prior SELL left the
+        # position open (PARTIAL residual, EXPIRED zero-fill,
+        # or PENDING translated to EXPIRED via the launcher); on
+        # the next clock tick we re-emit the SELL for the held
+        # qty regardless of what the model now says (manual close
+        # in intraday wins over a model that flipped bullish).
+        # `_pending_sell` is checked so an in-flight retry is
+        # not double-emitted by a concurrent signal.
+        if (
+            self._must_close_outstanding
+            and self._long
+            and not self._pending_sell
+        ):
+            self._must_close_outstanding = False
+            self._pending_sell = True
+            qty = self._entry_qty
+            _log.info(
+                'CLOSE RETRY: prior SELL did not fully fill; '
+                're-emitting at next tick. qty=%s ts=%s',
+                qty, signal.timestamp,
+            )
+            return [self._build_action(OrderSide.SELL, qty, signal)]
+        # Force-flatten at window close runs SECOND — still before
+        # the `_preds is None` guard — because the close-by-window-
+        # end invariant is non-negotiable: every BUY filled in
+        # this window MUST be closed before the window ends.
+        # Threshold models (e.g. Limen's `threshold_logreg_binary`)
+        # legitimately emit `_preds=None` on uncertain bars; if
+        # the cutoff bar happens to be one of those, the prior
+        # code returned `[]` immediately and force-flatten never
+        # fired, leaving open inventory at window close. The bts
+        # honesty contract requires the SELL to fire regardless
+        # of `_preds` value whenever `signal.timestamp >= cutoff`
+        # and the strategy holds inventory.
         cutoff = self._config.force_flatten_after
         at_cutoff = cutoff is not None and signal.timestamp >= cutoff
         if at_cutoff and self._long and not self._pending_sell:
@@ -328,10 +367,23 @@ class Strategy(_StrategyBase):
             command_id until terminal.
           - REJECTED/EXPIRED/CANCELED + BUY: clear `_pending_buy`;
             don't touch `_long` (no inventory was acquired).
-          - PARTIAL/FILLED + SELL: `_long=False` (exit confirmed).
-          - Any non-fill SELL: leave `_long` alone — exit failed,
-            we still hold inventory. The next preds=0 signal will
-            re-emit.
+          - PARTIAL + SELL with residual (`_entry_qty > 0` post-
+            decrement): `_long` stays True; the
+            `_must_close_outstanding` latch is set so the next
+            `on_signal` re-emits a SELL for the remainder.
+          - FILLED + SELL (or PARTIAL that brings `_entry_qty` to
+            zero): `_long=False`, `_must_close_outstanding=False`
+            (exit confirmed).
+          - EXPIRED + SELL with no fill: `_long` stays True;
+            `_must_close_outstanding` is set so the next
+            `on_signal` re-emits.
+          - REJECTED/CANCELED + SELL: `_long` stays True but
+            `_must_close_outstanding` clears — the outcome
+            carries a real reason (lot-size, dust, exchange
+            filter; or operator abort) that re-emit would just
+            hit again. The position rides until the next
+            preds=0 / cutoff signal, or until the v2.3.1
+            sweep-end open-inventory ParityViolation fires.
         """
         del params, context
         from nexus.infrastructure.praxis_connector.trade_outcome_type import (
@@ -386,28 +438,7 @@ class Strategy(_StrategyBase):
                         self._build_action(OrderSide.SELL, qty, signal=None),
                     ]
             else:
-                # Reduce inventory by the fill_size; only flip
-                # `_long` to False when the SELL has FULLY closed
-                # the position. A PARTIAL SELL (zero/partial-fill
-                # on a MARKET exit when the 60s tape window is
-                # thin) leaves residual long inventory, which the
-                # next preds=0 should still try to close.
-                self._entry_qty -= outcome.fill_size
-                if (
-                    outcome.outcome_type == TradeOutcomeType.FILLED
-                    or self._entry_qty <= Decimal('0')
-                ):
-                    self._long = False
-                    self._entry_qty = Decimal('0')
-                # SELL outcome arrived — re-open the pending-sell
-                # gate so a subsequent preds=0 (e.g. after a
-                # bounce-and-bust signal flip) can re-issue.
-                self._pending_sell = False
-                _log.info(
-                    'on_outcome SELL %s: fill_size=%s entry_qty=%s long=%s',
-                    outcome.outcome_type.value, outcome.fill_size,
-                    self._entry_qty, self._long,
-                )
+                self._reconcile_sell_fill(outcome)
         elif outcome.outcome_type.is_terminal:
             if is_buy:
                 # REJECTED / EXPIRED / CANCELED on a BUY: no fill,
@@ -418,16 +449,87 @@ class Strategy(_StrategyBase):
                     outcome.outcome_type.value,
                 )
             else:
-                # Terminal-no-fill SELL outcome: free the
-                # pending-sell gate so the next preds=0 can
-                # re-attempt the exit. `_long` stays True (the
-                # position was never closed).
+                # Terminal-no-fill SELL outcome.
+                #
+                # EXPIRED with zero fill (the bounded-lookahead
+                # "no liquidity in 60s" path, AND the path
+                # `Praxis PENDING -> Nexus EXPIRED` from the
+                # launcher translator): set the deferred-retry
+                # latch. The next `on_signal` will re-emit a
+                # SELL on the next clock tick — operator-stated
+                # invariant "you keep doing until you have
+                # gotten out of the position".
+                #
+                # REJECTED / CANCELED: hard venue-side rejection
+                # (lot size, dust, exchange filter — bts SELL
+                # submits bypass the Nexus validator pipeline,
+                # see action_submitter.py:494) or operator-side
+                # abort. Re-emitting on the next tick would just
+                # hit the same gate; clear the latch so the
+                # retry loop doesn't spin. The open position
+                # survives the window — caught by either a later
+                # natural preds=0 / cutoff signal, or by
+                # v2.3.1's `n_runs_excluded_open_position > 0`
+                # ParityViolation if no later signal fires.
                 self._pending_sell = False
+                if outcome.outcome_type == TradeOutcomeType.EXPIRED:
+                    self._must_close_outstanding = self._long
+                else:
+                    self._must_close_outstanding = False
                 _log.info(
-                    'on_outcome SELL %s (no fill): pending_sell=False',
+                    'on_outcome SELL %s (no fill): pending_sell=False '
+                    'must_close_outstanding=%s',
                     outcome.outcome_type.value,
+                    self._must_close_outstanding,
                 )
         return []
+
+    def _reconcile_sell_fill(self, outcome: TradeOutcome) -> None:
+        """Apply a SELL fill outcome to internal state + retry latch.
+
+        Reduces `_entry_qty` by `outcome.fill_size`, flips
+        `_long=False` once the residual hits zero (or on FILLED),
+        clears `_pending_sell`, and sets the deferred-retry latch
+        based on the post-fill state. Extracted from `on_outcome`
+        to keep that function under the project's branching budget.
+
+        Latch semantics:
+          - Full close (`_long` flipped False): clear the latch —
+            position is gone, no retry needed.
+          - Residual after PARTIAL (`_long` still True): set the
+            latch so the next `on_signal` re-emits a SELL for the
+            remaining `_entry_qty`. This is the operator-stated
+            invariant ("you keep doing until you have gotten out
+            of the position").
+        """
+        from nexus.infrastructure.praxis_connector.trade_outcome_type import (
+            TradeOutcomeType,
+        )
+        if outcome.fill_size is None:
+            msg = (
+                f'_reconcile_sell_fill: outcome {outcome.outcome_id} '
+                f'is_fill but fill_size is None'
+            )
+            raise ValueError(msg)
+        self._entry_qty -= outcome.fill_size
+        if (
+            outcome.outcome_type == TradeOutcomeType.FILLED
+            or self._entry_qty <= Decimal('0')
+        ):
+            self._long = False
+            self._entry_qty = Decimal('0')
+        # SELL outcome arrived — re-open the pending-sell gate so
+        # a subsequent preds=0 (e.g. after a bounce-and-bust
+        # signal flip) can re-issue.
+        self._pending_sell = False
+        self._must_close_outstanding = self._long
+        _log.info(
+            'on_outcome SELL %s: fill_size=%s entry_qty=%s '
+            'long=%s must_close_outstanding=%s',
+            outcome.outcome_type.value, outcome.fill_size,
+            self._entry_qty, self._long,
+            self._must_close_outstanding,
+        )
 
     def _is_buy_command(self, command_id: str) -> bool:
         """Best-effort side inference for the BUY/SELL state machine.
@@ -462,12 +564,20 @@ class Strategy(_StrategyBase):
         # across runs in this slice.
         self._pending_buy = bool(payload.get('pending_buy', False))
         self._pending_sell = bool(payload.get('pending_sell', False))
+        # `must_close_outstanding` persists across snapshot+restore
+        # so a multi-tick window that snapshots mid-retry-loop
+        # picks up the latch on resume. Defaults False for older
+        # snapshots that pre-date this slice.
+        self._must_close_outstanding = bool(
+            payload.get('must_close_outstanding', False),
+        )
 
     def on_save(self) -> bytes:
         payload = {
             'long': self._long, 'entry_qty': str(self._entry_qty),
             'pending_buy': self._pending_buy,
             'pending_sell': self._pending_sell,
+            'must_close_outstanding': self._must_close_outstanding,
         }
         return json.dumps(payload).encode('utf-8')
 

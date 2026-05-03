@@ -1,3 +1,48 @@
+# v2.3.3
+
+Deferred SELL retry on PARTIAL/EXPIRED until flat or hard reject.
+Operator invariant: "treat getting out of the position exactly
+like we would handle it intraday — keep doing until you have
+gotten out". Two changes:
+
+- `pipeline/_strategy_templates/long_on_signal.py`: a new
+  `_must_close_outstanding` latch is set on PARTIAL with
+  residual or EXPIRED zero-fill (SELL only, `_long=True`),
+  and consumed at the **top** of `on_signal` — before the
+  cutoff branch and the `_preds is None` guard — to re-emit a
+  SELL for the held `_entry_qty` on the **next clock tick**.
+  Deferring to next tick (vs returning a retry action from
+  `on_outcome`) avoids a same-tape walk that would re-consume
+  already-filled liquidity (PARTIAL) or loop on the same
+  instant (EXPIRED zero-fill). The latch is cleared on a full
+  close (FILLED, or PARTIAL that brings `_entry_qty` to zero)
+  and on hard rejections (REJECTED/CANCELED) so the retry
+  loop doesn't spin against a venue gate that won't change.
+  Persisted across `on_save` / `on_load` for snapshot
+  resumption. Override the model: even `preds=1` doesn't
+  suppress the retry — manual close in intraday wins.
+- `launcher/launcher.py::_translate_praxis_outcome`: Praxis
+  EXPIRED with `filled_qty > 0` (the "PARTIAL upgraded to
+  EXPIRED on deadline" path,
+  `praxis/core/execution_manager.py:1032-1045`) translates
+  to Nexus PARTIAL so the strategy's existing fill branch
+  reconciles `_entry_qty` against the actual partial fill.
+  `is_fill` and `reject_reason` now derive from the
+  overridden `nexus_type`, not the Praxis status —
+  otherwise a Nexus PARTIAL would raise on missing
+  `fill_size`, or a non-REJECTED outcome would raise on
+  forwarded `reject_reason='deadline exceeded'`.
+
+Residual risks documented (fail-closed, not "guaranteed
+close"):
+- Dust / min-lot rejection on retry: `_entry_qty < step_size`
+  cannot close. Strategy clears the latch on REJECTED;
+  v2.3.1's `n_runs_excluded_open_position > 0` ParityViolation
+  fires loud at sweep close.
+- Retry latency: bounded by `interval_seconds` (4h for
+  r0011's `kline_size=14400`). Live trading retry is
+  sub-second; the backtest's tick granularity is the ceiling.
+
 # v2.3.2
 
 Praxis fill outcomes now reach the strategy via the launcher
