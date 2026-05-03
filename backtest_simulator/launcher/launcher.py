@@ -9,7 +9,7 @@ import os
 import queue
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -407,21 +407,36 @@ def _finalize_sell_close(
     )
 
 
-def _outcome_queues_for(trading: object) -> dict[str, queue.Queue[NexusTradeOutcome]]:
-    """Return Trading's per-account outcome-queue dict.
+def _make_outcome_router(
+    outcome_queues: dict[str, queue.Queue[NexusTradeOutcome]],
+) -> Callable[[TradeOutcome], Awaitable[None]]:
+    """Return an async router that translates Praxis outcomes into the launcher queue.
 
-    Trading exposes `register_outcome_queue` /
-    `unregister_outcome_queue` publicly but not the dict of queues
-    itself. Read via `vars()` rather than direct private-attr access
-    (the latter trips ruff SLF001) so the wiring stays explicit
-    about reaching into Trading's internals — a known coupling
-    that disappears once Trading exposes the queues publicly.
+    Extracted to module level so the routing path is testable
+    without spinning up a real `BacktestLauncher`. The router
+    closes over `outcome_queues` (the launcher's per-account
+    dict) and:
+
+      1. translates the Praxis outcome via
+         `_translate_praxis_outcome` (returns `None` for unknown
+         status; PENDING is mapped to EXPIRED so a bounded-
+         lookahead non-fill clears `_pending_buy`),
+      2. looks up the account's queue,
+      3. enqueues the Nexus outcome.
+
+    Outcomes for accounts without a registered queue are dropped;
+    that case only arises during shutdown teardown when the
+    launcher has already deregistered the account.
     """
-    raw = vars(trading)['_outcome_queues']
-    return cast(
-        'dict[str, queue.Queue[NexusTradeOutcome]]',
-        raw,
-    )
+    async def _route(praxis_outcome: TradeOutcome) -> None:
+        nexus_outcome = _translate_praxis_outcome(praxis_outcome)
+        if nexus_outcome is None:
+            return
+        account_queue = outcome_queues.get(praxis_outcome.account_id)
+        if account_queue is None:
+            return
+        account_queue.put_nowait(nexus_outcome)
+    return _route
 
 
 def _translate_praxis_outcome(
@@ -916,23 +931,16 @@ class BacktestLauncher(Launcher):
             )
             raise RuntimeError(msg)
         trading = self._trading
-
-        async def _route_and_translate(praxis_outcome: TradeOutcome) -> None:
-            nexus_outcome = _translate_praxis_outcome(praxis_outcome)
-            if nexus_outcome is None:
-                return
-            queues = _outcome_queues_for(trading)
-            account_queue = queues.get(praxis_outcome.account_id)
-            if account_queue is None:
-                return
-            account_queue.put_nowait(nexus_outcome)
-
-        # Praxis's `ExecutionManager._on_trade_outcome` is the documented
-        # hook seam for routing Praxis -> Nexus outcomes; the underscore
-        # is Praxis's "callback slot" naming, not an internal-only flag.
-        # `setattr` keeps pyright's `reportPrivateUsage` happy without
-        # losing the documented contract.
-        setattr(trading.execution_manager, '_on_trade_outcome', _route_and_translate)
+        # Route Praxis outcomes into the launcher's per-account
+        # queues — the dict that `OutcomeLoop.PraxisInbound`
+        # actually consumes from (populated in
+        # `praxis/launcher.py:1122`). `Trading._outcome_queues`
+        # is a separate dict only filled when callers invoke
+        # `Trading.register_outcome_queue`, which Praxis 0.48.0
+        # does not do; reading it would return None and drop the
+        # outcome.
+        router = _make_outcome_router(self._outcome_queues)
+        trading.execution_manager.set_on_trade_outcome(router)
 
     def _start_poller(self) -> None:
         kline_intervals = self._resolve_kline_intervals_from_manifests()

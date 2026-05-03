@@ -1,3 +1,33 @@
+# v2.3.2
+
+Praxis fill outcomes now reach the strategy via the launcher
+queue. Three changes restore end-to-end fill recognition in
+`bts run` and `bts sweep`.
+
+- `launcher.py`: the `_route_and_translate` callback bts
+  installs on `ExecutionManager._on_trade_outcome` now reads
+  the launcher's `self._outcome_queues` (the dict
+  `OutcomeLoop.PraxisInbound` consumes from), not the empty
+  `Trading._outcome_queues` it was reading via the dead
+  `_outcome_queues_for(trading)` helper. The router is
+  extracted to module-level `_make_outcome_router(...)` and
+  installed via `execution_manager.set_on_trade_outcome(...)`
+  rather than raw `setattr`.
+- `cli/commands/run.py`: `_parse_window_arg` promotes naive
+  `--window-start` / `--window-end` to UTC (preserving any
+  explicit offset). `bts sweep` already did this via
+  `datetime.combine(..., tzinfo=UTC)`; `bts run` now matches.
+- `cli/_run_window.py::_child_main`: opt-in
+  `BTS_RUN_WINDOW_LOG_LEVEL` env var routes child INFO/DEBUG
+  logs to stderr for diagnostics; default behaviour unchanged.
+
+End-to-end on the migrated r0011 v3 bundle: `bts sweep`
+windows that previously closed with trailing open inventory
+now close with natural BUY-SELL round trips, and the
+sweep-aggregate `n_runs_excluded_open_position` drops to
+zero — so DSR/SPA/PBO are no longer compiled on a
+silently-shrunk subset.
+
 # v2.3.1
 
 Close-by-window-end honesty invariant. Two related fixes that
