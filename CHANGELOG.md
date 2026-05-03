@@ -1,3 +1,38 @@
+# v2.3.1
+
+Close-by-window-end honesty invariant. Two related fixes that
+restore the operator's most basic expectation: every BUY filled
+inside a sweep window MUST be closed before the window ends —
+either by a natural `preds=0` SELL signal during the day, or by
+force-flatten at window close. Always.
+
+Strategy template: `LongOnSignal.on_signal` now runs the cutoff
+branch BEFORE the `_preds is None` early-return guard. Threshold
+models like Limen's `threshold_logreg_binary` legitimately emit
+`_preds=None` on uncertain bars (probability inside hysteresis
+band, below `min_prob_floor`). Pre-fix, if the cutoff bar happened
+to be one of those, the strategy returned `[]` immediately and
+force-flatten never fired — leaving open inventory carried past
+window close. Post-fix, the SELL fires whenever
+`signal.timestamp >= cutoff` and the strategy holds inventory,
+regardless of the predictor's abstain output.
+
+Sweep contract: `bts sweep` now aborts loud (`ParityViolation`)
+when ANY window ends with open inventory
+(`n_runs_with_trailing_inventory > 0`). The prior behaviour was
+to silently drop open-inventory days from the day-aligned subset
+fed to DSR/SPA/PBO and print the resulting numerical verdict
+without surfacing the exclusion in the headline. Stats compiled
+on the leftover subset after the strategy's most active days
+were silently excluded are not honest — refusing to ship a
+misleading verdict is the more useful answer.
+
+Static contract pinned via `tests/honesty/test_close_by_window_end.py`:
+the cutoff branch must be positioned BEFORE the `_preds is None`
+guard in source, and the sweep abort must raise `ParityViolation`
+on `n_runs_with_trailing_inventory > 0`. Future PRs that re-order
+the strategy branches or remove the sweep abort fail this gate.
+
 # v2.3.0
 
 Layer 1 honest activity readout in the per-run summary line. The

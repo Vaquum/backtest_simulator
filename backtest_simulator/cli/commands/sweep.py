@@ -648,6 +648,29 @@ def _run(args: argparse.Namespace) -> int:
                     )
     t_wall = time.perf_counter() - t_total
     print(f'\ndone   {total_runs} run(s) in {t_wall:.1f}s')
+    # Honesty contract: every BUY filled inside a window MUST close
+    # before the window ends. Open inventory at window close means
+    # the day's PnL is unrealized and the day gets silently dropped
+    # from DSR/SPA/PBO via `daily_return_for_run` returning None.
+    # Stats compiled on the surviving subset are not honest — they
+    # represent the leftover after the most informative days were
+    # excluded. If force-flatten failed for ANY window, the operator
+    # cannot trust the sweep result, so we abort loud rather than
+    # print a numeric verdict on a partial sample.
+    if n_runs_with_trailing_inventory > 0:
+        from backtest_simulator.exceptions import (
+            ParityViolation as _ParityViolation,
+        )
+        msg_open_inventory = (
+            f'sweep aborted: {n_runs_with_trailing_inventory} '
+            f'window(s) ended with open inventory at window close. '
+            f'Honest invariant violated: every BUY filled inside a '
+            f'window must close before the window ends (force-flatten '
+            f'or natural SELL signal). Stats computed on the '
+            f'surviving subset would silently exclude the strategy\'s '
+            f'most active days — refusing to ship a misleading verdict.'
+        )
+        raise _ParityViolation(msg_open_inventory)
     _print_sweep_slippage_summary(
         sweep_slip_costs_weighted,
         sweep_slip_gaps_weighted,
