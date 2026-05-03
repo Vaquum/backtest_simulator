@@ -111,7 +111,10 @@ def print_run(
     perm_id: int, day_label: str,
     trades: list[Trade], declared_stops: dict[str, Decimal],
     *,
-    n_orders: int = 0,
+    n_intents: int = 0,
+    n_fills: int = 0,
+    n_pending: int = 0,
+    n_rejects: int = 0,
     slippage_cost_bps: Decimal | None = None,
     slippage_n_samples: int = 0,
     slippage_n_excluded: int = 0,
@@ -249,23 +252,27 @@ def print_run(
     else:
         atr_str = ''
     # `trades N` counts CLOSED BUY->SELL round trips. A day with
-    # order activity that did not close a round trip (BUY filled
-    # without SELL fill, BUY/SELL submitted but neither filled,
-    # outcome stuck PENDING, etc.) used to read as `trades 0` and
-    # was indistinguishable from a genuinely flat day. Append:
-    #   - `+N open` when there is unmatched filled inventory
-    #     (BUY in `account.trades` with no closing SELL — every
-    #     such position carries real exposure even if the SELL
-    #     side never landed).
-    #   - `orders K` when the venue accepted at least one order
-    #     submit (even a non-fill / PENDING outcome). This is the
-    #     "did anything happen this day" indicator the operator
-    #     needs to distinguish a flat day from a fail-to-fill day.
+    # order activity that did not close a round trip used to read
+    # as `trades 0` and was indistinguishable from a genuinely flat
+    # day. The parenthetical extras below answer the trader's
+    # five-question scan, ordered by lifecycle stage:
+    #   intents  → did my strategy decide to act?
+    #   fills    → did money move?
+    #   pending  → what's still hanging at window close?
+    #   rejects  → what got blocked or expired?
+    #   +N open  → unmatched filled inventory (BUY without closing SELL)
+    # Only non-zero counts are rendered to keep the headline tight.
     activity_extras: list[str] = []
+    if n_intents > 0:
+        activity_extras.append(f'intents {n_intents}')
+    if n_fills > 0:
+        activity_extras.append(f'fills {n_fills}')
+    if n_pending > 0:
+        activity_extras.append(f'pending {n_pending}')
+    if n_rejects > 0:
+        activity_extras.append(f'rejects {n_rejects}')
     if n_open > 0:
         activity_extras.append(f'+{n_open} open')
-    if n_orders > 0:
-        activity_extras.append(f'orders {n_orders}')
     activity_str = (
         f' ({", ".join(activity_extras)})' if activity_extras else ''
     )

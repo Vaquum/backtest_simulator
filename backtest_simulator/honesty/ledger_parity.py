@@ -19,6 +19,7 @@ import sqlite3
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
+from typing import cast
 
 from backtest_simulator.exceptions import ParityViolation
 
@@ -200,5 +201,99 @@ def dump_event_spine_to_jsonl(
                 f.write(line + '\n')
                 count += 1
         return count
+    finally:
+        conn.close()
+
+
+_REJECT_EVENT_TYPES = frozenset({
+    'OrderRejected', 'OrderExpired',
+    'OrderCanceled', 'OrderSubmitFailed',
+})
+
+
+def _trade_outcome_is_pending(payload_blob: object) -> bool:
+    """`TradeOutcomeProduced` payload encodes `status` as JSON bytes."""
+    if not isinstance(payload_blob, bytes):
+        return False
+    try:
+        payload_obj = json.loads(payload_blob)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    if not isinstance(payload_obj, dict):
+        return False
+    payload = cast('dict[str, object]', payload_obj)
+    return payload.get('status') == 'PENDING'
+
+
+def _classify_spine_event(
+    event_type: str, payload_blob: object, counts: dict[str, int],
+) -> None:
+    """Bump the right counter bucket for one event row. Mutates `counts`."""
+    counts['total'] += 1
+    if event_type == 'OrderSubmitIntent':
+        counts['intents'] += 1
+    elif event_type == 'OrderSubmitted':
+        counts['submitted'] += 1
+    elif event_type == 'FillReceived':
+        counts['fills'] += 1
+    elif event_type in _REJECT_EVENT_TYPES:
+        counts['rejects'] += 1
+    elif event_type == 'TradeOutcomeProduced' and _trade_outcome_is_pending(
+        payload_blob,
+    ):
+        counts['pending'] += 1
+
+
+def count_event_spine_events(
+    *,
+    sqlite_path: Path,
+    epoch_id: int | None = None,
+) -> dict[str, int]:
+    """Count operationally-significant events in an EventSpine sqlite DB.
+
+    Returns a dict with keys: `intents`, `submitted`, `fills`,
+    `pending`, `rejects`, `total`. The first five answer the trader's
+    five-question scan after each window:
+      - intents: did my strategy decide to act? (`OrderSubmitIntent`)
+      - submitted: did the venue accept the action? (`OrderSubmitted`)
+      - fills: did money move? (`FillReceived`)
+      - pending: what's still hanging at window close?
+        (`TradeOutcomeProduced` with payload `status == 'PENDING'`)
+      - rejects: what got blocked or expired? (`OrderRejected`,
+        `OrderExpired`, `OrderCanceled`, `OrderSubmitFailed`)
+
+    `total` is the unfiltered event count for cross-checking against
+    `dump_event_spine_to_jsonl`'s return.
+
+    Returns all-zero counts when the file is missing rather than
+    raising — the per-run summary should degrade gracefully when a
+    window's spine wasn't written (e.g. the launcher crashed before
+    flush).
+    """
+    counts: dict[str, int] = {
+        'intents': 0,
+        'submitted': 0,
+        'fills': 0,
+        'pending': 0,
+        'rejects': 0,
+        'total': 0,
+    }
+    if not sqlite_path.is_file():
+        return counts
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        if epoch_id is None:
+            cursor = conn.execute(
+                'SELECT event_type, CAST(payload AS BLOB) FROM events',
+            )
+        else:
+            cursor = conn.execute(
+                'SELECT event_type, CAST(payload AS BLOB) FROM events '
+                'WHERE epoch_id = ?',
+                (epoch_id,),
+            )
+        for event_type, payload_blob in cursor:
+            _classify_spine_event(event_type, payload_blob, counts)
+        return counts
     finally:
         conn.close()
