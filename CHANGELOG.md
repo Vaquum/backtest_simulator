@@ -1,3 +1,29 @@
+# v2.2.3
+
+Drop `uv.lock` from version control and add `tools/refresh_siblings.sh`.
+The Praxis / Nexus / Limen siblings are intentionally unpinned in
+`pyproject.toml` (`git+<url>` without `@ref`) so every install
+tracks each sibling's `main`. `uv.lock` was undermining that
+contract by capturing concrete SHAs — most recently pinning
+`vaquum-nexus 0.31.0` from 2026-04-29, which lacks the 0.35.0+
+kwargs the bts CLI now uses (`max_allocation_per_trade_pct`,
+`produce_signal(lookback=...)`). A reviewer working from the lock
+hit `TypeError` from the older CapitalController signature.
+
+Two changes:
+
+- Remove `uv.lock` from the repo and add it to `.gitignore`. uv
+  users still get a local lock; they just cannot accidentally
+  check it back in. Pip / CI installs were never affected (pip
+  ignores `uv.lock`).
+- Add `tools/refresh_siblings.sh` for one-line local refresh:
+  `pip install --force-reinstall --no-deps` against the three
+  sibling git URLs. Without this, contributors who already had
+  the project installed silently lag — pip's default behaviour
+  skips already-installed packages on subsequent
+  `pip install -e '.[integration]'` runs. Honors `$PYTHON` so it
+  works against any venv.
+
 # v2.2.2
 
 Honest trade-activity readout in the per-run summary line. `trades 0`
