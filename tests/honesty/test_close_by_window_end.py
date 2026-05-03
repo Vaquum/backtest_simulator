@@ -157,7 +157,16 @@ def test_force_flatten_branch_precedes_preds_none_guard() -> None:
         / '_strategy_templates' / 'long_on_signal.py'
     )
     src = template_path.read_text(encoding='utf-8')
-    cutoff_check_pos = src.index('signal.timestamp >= cutoff')
+    # zero-bang + Copilot caught this: the prior assertion used
+    # `'signal.timestamp >= cutoff'` which also appears verbatim in
+    # the file's preceding comment. `src.index()` would hit the
+    # comment first; a future PR could move the executable check
+    # below the preds-None guard while leaving the comment in
+    # place, and the test would still pass silently. Anchor the
+    # assertion on the unique executable line instead.
+    cutoff_check_pos = src.index(
+        'at_cutoff = cutoff is not None and signal.timestamp >= cutoff',
+    )
     preds_none_pos = src.index('preds_raw is None')
     assert cutoff_check_pos < preds_none_pos, (
         f'cutoff check must precede _preds None guard in '
