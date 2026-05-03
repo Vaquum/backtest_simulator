@@ -1,3 +1,49 @@
+# v2.2.2
+
+Honest trade-activity readout in the per-run summary line. `trades 0`
+no longer means "the day was flat" — it means "no closed BUY->SELL
+round trip". Two new parenthetical extras surface real activity that
+used to be invisible:
+
+- `+N open` when there is unmatched filled inventory: a BUY landed
+  in `account.trades` but no closing SELL fill arrived (e.g. the
+  closing SELL had a partial / zero fill, or the force-flatten SELL
+  hit the deadline). `pair_trades`'s trailing list — previously
+  thrown away as `_trailing` — drives this.
+- `orders K` when the venue accepted at least one order submit.
+  This catches the canonical case the canonical r0011 sweep just
+  reproduced on perm 3 2026-04-12: EventSpine carries a complete
+  `CommandAccepted -> OrderSubmitIntent -> OrderSubmitted ->
+  TradeOutcomeProduced(PENDING)` chain — one full submit lifecycle —
+  but the venue's fill ledger is empty so `account.trades=[]`.
+  Pre-fix display: `trades 0`. Post-fix display:
+  `trades 0 (orders 1)` — operator sees activity occurred.
+
+Output examples:
+
+- Genuinely flat day:                `trades 0`
+- 1 closed pair:                     `trades 1 (orders 2)`
+- BUY filled, SELL did not:          `trades 0 (+1 open, orders 2)`
+- 1 BUY submit, no fill (PENDING):   `trades 0 (orders 1)`
+
+`n_orders` defaults to `0`; when a caller does not thread it the
+`orders K` extra is suppressed (legacy headline, no `(orders K)`
+suffix). The `+N open` extra is always derived from `pair_trades`'s
+trailing list and surfaces whenever a BUY landed in `account.trades`
+without a closing SELL fill — independent of the `n_orders` value.
+`bts run` and `bts sweep` both thread
+`int(result.get('orders', 0))` from the `WindowResult.orders` field
+already populated by `run_window_in_process`. Seven tests in
+`tests/cli/test_print_run_activity_readout.py` lock the new format
+and the `pair_trades` trailing-vs-pairs split.
+
+Surfaces:
+- `backtest_simulator/cli/_metrics.py` — `n_orders` kwarg, use
+  `pair_trades` trailing, augment headline
+- `backtest_simulator/cli/commands/sweep.py` — thread `n_orders`
+- `backtest_simulator/cli/commands/run.py` — thread `n_orders`
+- `tests/cli/test_print_run_activity_readout.py` — new
+
 # v2.2.1
 
 Force-flatten at window close. The `long_on_signal` strategy template

@@ -561,6 +561,7 @@ def _run(args: argparse.Namespace) -> int:
             sweep_signals_parity_total += n_signals_compared
             print_run(
                 display_id, day_label, trades, declared_stops,
+                n_orders=int(result.get('orders', 0)),
                 slippage_cost_bps=slip_cost,
                 slippage_n_samples=slip_n,
                 slippage_n_excluded=slip_excl,
