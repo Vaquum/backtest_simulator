@@ -148,6 +148,28 @@ class Strategy(_StrategyBase):
         self, signal: Signal, params: StrategyParams, context: StrategyContext,
     ) -> list[Action]:
         del params, context
+        # Force-flatten at window close runs FIRST — before the
+        # `_preds is None` guard — because the close-by-window-end
+        # invariant is non-negotiable: every BUY filled in this
+        # window MUST be closed before the window ends. Threshold
+        # models (e.g. Limen's `threshold_logreg_binary`) legitimately
+        # emit `_preds=None` on uncertain bars; if the cutoff bar
+        # happens to be one of those, the prior code returned `[]`
+        # immediately and force-flatten never fired, leaving open
+        # inventory at window close. The bts honesty contract
+        # requires the SELL to fire regardless of `_preds` value
+        # whenever `signal.timestamp >= cutoff` and the strategy
+        # holds inventory.
+        cutoff = self._config.force_flatten_after
+        at_cutoff = cutoff is not None and signal.timestamp >= cutoff
+        if at_cutoff and self._long and not self._pending_sell:
+            qty = self._entry_qty
+            self._pending_sell = True
+            _log.info(
+                'FORCE FLATTEN at window close: qty=%s ts=%s cutoff=%s',
+                qty, signal.timestamp, cutoff,
+            )
+            return [self._build_action(OrderSide.SELL, qty, signal)]
         preds_raw = signal.values.get('_preds')
         if preds_raw is None:
             _log.info('signal missing _preds; keys=%s', list(signal.values))
@@ -162,22 +184,12 @@ class Strategy(_StrategyBase):
             'on_signal fired: preds=%s probs=%s was_long=%s',
             preds, signal.values.get('_probs'), was_long,
         )
-        # Force-flatten at window close: if this signal arrives at or
-        # after the configured cutoff (window_end - kline_size), close
-        # any open position immediately and refuse new entries. The
-        # strategy's last in-window signal becomes a guaranteed
-        # exposure-zero point so per-day stats reflect realized PnL
-        # without orphaned positions.
-        cutoff = self._config.force_flatten_after
-        if cutoff is not None and signal.timestamp >= cutoff:
-            if was_long and not self._pending_sell:
-                qty = self._entry_qty
-                self._pending_sell = True
-                _log.info(
-                    'FORCE FLATTEN at window close: qty=%s ts=%s cutoff=%s',
-                    qty, signal.timestamp, cutoff,
-                )
-                return [self._build_action(OrderSide.SELL, qty, signal)]
+        # Past the cutoff but already flat or with a SELL pending: no
+        # new entries. The earlier branch already handled the
+        # `at_cutoff and _long` SELL case; this branch handles the
+        # `at_cutoff and not _long` no-op case so post-cutoff BUYs
+        # never enter the trading path.
+        if at_cutoff:
             return []
         if preds == 1 and not was_long and not self._pending_buy:
             qty_raw = (
