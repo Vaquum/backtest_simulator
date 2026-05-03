@@ -496,7 +496,26 @@ def _translate_praxis_outcome(
     nexus_type = type_map.get(status)
     if nexus_type is None:
         return None
-    is_fill = status in {TradeStatus.FILLED, TradeStatus.PARTIAL}
+    # A `Praxis EXPIRED + filled_qty > 0` is the "PARTIAL upgraded
+    # to EXPIRED on deadline" path
+    # (`praxis/core/execution_manager.py:1032-1045`): the venue did
+    # fill some of the qty, and only the remainder got cancelled.
+    # In bts's bounded-lookahead world that's terminal — no further
+    # updates will arrive for the command. Translate to a Nexus
+    # PARTIAL so the strategy's existing fill branch reconciles
+    # `_entry_qty` against the actual partial fill instead of
+    # treating it as a zero-fill. Nexus rejects fill fields on
+    # `outcome_type.is_fill == False`, so handing the partial
+    # through as Nexus EXPIRED is not an option.
+    if status == TradeStatus.EXPIRED and praxis_outcome.filled_qty > 0:
+        nexus_type = TradeOutcomeType.PARTIAL
+    # Derive `is_fill` and `reject_reason` from the OVERRIDDEN
+    # `nexus_type`, NOT the Praxis status. Otherwise the
+    # deadline-truncated PARTIAL path leaves `fill_size=None` on a
+    # Nexus PARTIAL and `__post_init__` raises; symmetrically,
+    # forwarding `praxis_outcome.reason='deadline exceeded'` as
+    # `reject_reason` on a non-REJECTED Nexus outcome also raises.
+    is_fill = nexus_type.is_fill
     fill_size = praxis_outcome.filled_qty if is_fill else None
     fill_price = praxis_outcome.avg_fill_price if is_fill else None
     fill_notional = (
@@ -505,10 +524,13 @@ def _translate_praxis_outcome(
         else None
     )
     actual_fees = Decimal('0') if is_fill else None
-    reject_reason = (
-        praxis_outcome.reason if praxis_outcome.reason
-        else f'translated-from-praxis-{status.value}'
-    ) if status == TradeStatus.REJECTED else praxis_outcome.reason
+    if nexus_type == TradeOutcomeType.REJECTED:
+        reject_reason = (
+            praxis_outcome.reason if praxis_outcome.reason
+            else f'translated-from-praxis-{status.value}'
+        )
+    else:
+        reject_reason = None
     return NexusTradeOutcome(
         outcome_id=f'{praxis_outcome.command_id}-{status.value}',
         command_id=praxis_outcome.command_id,
