@@ -453,27 +453,45 @@ def _translate_praxis_outcome(
     Mapping:
       - `outcome_id` ← `f'{command_id}-{status.value}'` (Praxis carries
         no outcome_id; deterministic synthetic id from command + status
-        is enough for the strategy state machine to dedup).
-      - `outcome_type`: Praxis FILLED/PARTIAL/REJECTED/EXPIRED/CANCELED
-        map 1:1; Praxis PENDING with `filled_qty==0` after the
-        backtest's bounded lookahead means "no fill in window" —
-        translate to Nexus EXPIRED so the strategy's `_pending_buy`
-        gets cleared (codex P1: leaving PENDING dropped silently let
-        zero-fill LIMITs jam the strategy's pending-buy gate forever).
-      - `fill_size` ← `filled_qty` (delta from prior outcome would be
-        more precise; for our single-outcome-per-command backtest
-        cumulative IS the delta).
-      - `fill_price` ← `avg_fill_price`
-      - `fill_notional` ← `filled_qty * avg_fill_price`
-      - `actual_fees` ← Decimal('0') (Praxis TradeOutcome carries no
-        fee aggregate; the per-fill fees live on the venue's
-        `Account.trades`. The strategy state machine doesn't read
-        actual_fees, so 0 is honest enough for state reconciliation
-        — pinning it here keeps the deeper "real fees on outcomes"
-        slice for a follow-up).
-      - `reject_reason` ← Praxis `reason` (or a synthesized fallback
-        for non-empty validation requirement on REJECTED outcomes;
-        codex P2 caught the post-init blow-up otherwise).
+        is enough for the strategy state machine to dedup; the
+        post-translation Nexus `outcome_id` therefore reflects the
+        Praxis status even when this function overrides
+        `outcome_type` — see the EXPIRED→PARTIAL upgrade below).
+      - `outcome_type`: Praxis FILLED/PARTIAL/REJECTED/CANCELED map
+        1:1. Two backtest-specific upgrades:
+        * `Praxis PENDING + filled_qty==0` → `Nexus EXPIRED`. In the
+          bounded-lookahead world that's terminal — no further
+          updates will arrive — so we hand the strategy a terminal
+          and let `_pending_buy` clear (codex P1: leaving PENDING
+          dropped silently let zero-fill LIMITs jam the gate
+          forever).
+        * `Praxis EXPIRED + filled_qty > 0` → `Nexus PARTIAL`. This
+          is the "PARTIAL upgraded to EXPIRED on deadline" path
+          (`praxis/core/execution_manager.py:1032-1045`); a
+          deadline-truncated partial is terminal in our world, and
+          Nexus rejects fill fields on `outcome_type.is_fill==False`,
+          so we must surface the partial as Nexus PARTIAL for the
+          strategy's existing fill branch to reconcile `_entry_qty`.
+      - `fill_size` ← `filled_qty` when the OVERRIDDEN `nexus_type`
+        is `is_fill==True`, else None (Nexus rejects fill fields on
+        non-fill outcomes; the upgrade rule for EXPIRED+fill above
+        is what makes those visible).
+      - `fill_price` ← `avg_fill_price` (same is_fill gate as
+        `fill_size`).
+      - `fill_notional` ← `filled_qty * avg_fill_price` (same gate).
+      - `actual_fees` ← Decimal('0') on fills, None on non-fills
+        (Praxis TradeOutcome carries no fee aggregate; the per-fill
+        fees live on the venue's `Account.trades`. The strategy
+        state machine doesn't read actual_fees, so 0 is honest
+        enough for state reconciliation — pinning it here keeps the
+        deeper "real fees on outcomes" slice for a follow-up).
+      - `reject_reason` ← Praxis `reason` ONLY when the overridden
+        `nexus_type == REJECTED` (or a synthesized fallback when
+        Praxis emits an empty reason on REJECTED). Otherwise None.
+        Nexus rejects `reject_reason != None` on non-REJECTED
+        outcomes (codex P2 caught the post-init blow-up;
+        forwarding `reason='deadline exceeded'` from Praxis EXPIRED
+        would explode there).
     """
     from nexus.infrastructure.praxis_connector.trade_outcome_type import (
         TradeOutcomeType,

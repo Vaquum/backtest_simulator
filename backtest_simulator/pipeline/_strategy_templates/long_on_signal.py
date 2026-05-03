@@ -367,10 +367,23 @@ class Strategy(_StrategyBase):
             command_id until terminal.
           - REJECTED/EXPIRED/CANCELED + BUY: clear `_pending_buy`;
             don't touch `_long` (no inventory was acquired).
-          - PARTIAL/FILLED + SELL: `_long=False` (exit confirmed).
-          - Any non-fill SELL: leave `_long` alone — exit failed,
-            we still hold inventory. The next preds=0 signal will
-            re-emit.
+          - PARTIAL + SELL with residual (`_entry_qty > 0` post-
+            decrement): `_long` stays True; the
+            `_must_close_outstanding` latch is set so the next
+            `on_signal` re-emits a SELL for the remainder.
+          - FILLED + SELL (or PARTIAL that brings `_entry_qty` to
+            zero): `_long=False`, `_must_close_outstanding=False`
+            (exit confirmed).
+          - EXPIRED + SELL with no fill: `_long` stays True;
+            `_must_close_outstanding` is set so the next
+            `on_signal` re-emits.
+          - REJECTED/CANCELED + SELL: `_long` stays True but
+            `_must_close_outstanding` clears — the outcome
+            carries a real reason (lot-size, dust, exchange
+            filter; or operator abort) that re-emit would just
+            hit again. The position rides until the next
+            preds=0 / cutoff signal, or until the v2.3.1
+            sweep-end open-inventory ParityViolation fires.
         """
         del params, context
         from nexus.infrastructure.praxis_connector.trade_outcome_type import (
