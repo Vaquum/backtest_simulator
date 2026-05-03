@@ -18,6 +18,10 @@ base_budget.json
 .pytest_cache/
 .ruff_cache/
 .venv/
+# Sibling libs (Praxis, Nexus, Limen) are intentionally unpinned in
+# pyproject.toml so every install pulls their latest main. uv.lock
+# would re-pin them to specific SHAs and silently freeze the contract.
+uv.lock
 
 # IDE / OS / agent.
 .DS_Store
