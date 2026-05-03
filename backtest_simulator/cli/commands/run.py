@@ -23,7 +23,7 @@ import argparse
 import json
 import sys
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -191,10 +191,28 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
     p.set_defaults(func=_run)
 
 
+def _parse_window_arg(value: str) -> datetime:
+    """Parse a `--window-start` / `--window-end` value, promoting naive to UTC.
+
+    `datetime.fromisoformat` returns a naive datetime for a date-only
+    string (e.g. `"2026-04-07"`); `ManifestBuilder` then rejects the
+    derived `force_flatten_after = window_end - kline_size` for being
+    effectively-naive. `bts sweep` constructs windows via
+    `datetime.combine(day, hours, tzinfo=UTC)`; this helper brings
+    `bts run` into parity. Inputs that already carry an offset
+    (e.g. `"2026-04-07T00:00:00+00:00"`) are returned unchanged so
+    they don't get double-tagged.
+    """
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
 def _run(args: argparse.Namespace) -> int:
     configure(args.verbose)
-    window_start = datetime.fromisoformat(args.window_start)
-    window_end = datetime.fromisoformat(args.window_end)
+    window_start = _parse_window_arg(args.window_start)
+    window_end = _parse_window_arg(args.window_end)
     if window_end <= window_start:
         sys.stderr.write(
             f'bts run: --window-end ({window_end}) must be > --window-start ({window_start})\n',

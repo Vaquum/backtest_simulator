@@ -806,7 +806,27 @@ def run_window_in_subprocess(
 
 
 def _child_main() -> int:
-    """Child-process entry: read JSON payload from stdin, run, write JSON result."""
+    """Child-process entry: read JSON payload from stdin, run, write JSON result.
+
+    When `BTS_RUN_WINDOW_LOG_LEVEL` is set in the environment, the
+    child configures stdlib logging at that level (typical values:
+    `INFO`, `DEBUG`). The default leaves logging unconfigured so
+    `_log.info(...)` calls in the strategy / launcher / Praxis /
+    Nexus chain are silently dropped — that's the production sweep
+    path where stderr is captured and only surfaced on failure.
+    Set the env var when diagnosing per-window behaviour so the
+    on_signal / on_outcome / FORCE FLATTEN log lines reach
+    `subprocess.run`'s captured stderr (or, with stderr inherited,
+    the operator's terminal).
+    """
+    import logging as _logging
+    _level_name = os.environ.get('BTS_RUN_WINDOW_LOG_LEVEL')
+    if _level_name:
+        _logging.basicConfig(
+            level=_level_name,
+            format='%(levelname)s %(name)s %(message)s',
+            force=True,
+        )
     payload = json.loads(sys.stdin.read())
     raw_max_alloc = payload.get('max_allocation_per_trade_pct')
     raw_lookback = payload.get('predict_lookback')
