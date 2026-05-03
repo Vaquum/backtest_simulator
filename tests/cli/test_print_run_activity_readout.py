@@ -1,4 +1,4 @@
-"""print_run honest activity readout: trades / +open / orders distinguish flat from fail-to-fill."""
+"""print_run honest activity readout — trader's five-question scan."""
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -32,8 +32,8 @@ def test_pair_trades_pairs_buy_sell_round_trip() -> None:
 
 
 def test_print_run_genuinely_flat_day_no_extras(capsys: object) -> None:
-    """trades=0 + orders=0 + no fills => no parenthetical activity extras."""
-    print_run(0, '2026-04-09', [], {}, n_orders=0)
+    """All-zero counters → no parenthetical."""
+    print_run(0, '2026-04-09', [], {})
     captured = capsys.readouterr().out  # type: ignore[attr-defined]
     headline = captured.splitlines()[0]
     assert 'trades 0' in headline
@@ -41,45 +41,78 @@ def test_print_run_genuinely_flat_day_no_extras(capsys: object) -> None:
     assert '+' not in headline.split('PF')[0]
 
 
-def test_print_run_orders_fired_no_fill_shows_orders(capsys: object) -> None:
-    """trades=0 + orders=1 (e.g. PENDING outcome) MUST surface orders count.
+def test_print_run_canonical_expire_lifecycle(capsys: object) -> None:
+    """The canonical 04-12 r0011 case: intent submitted, expired, no fill.
 
-    Reproduces perm 3 2026-04-12 in the canonical r0011 sweep:
-    EventSpine had 1 CommandAccepted + 1 OrderSubmitIntent +
-    1 OrderSubmitted + 1 TradeOutcomeProduced(PENDING). account.trades
-    was empty (no fill landed). Pre-fix this rendered as `trades 0`
-    indistinguishable from a flat day.
+    EventSpine pattern observed: `OrderSubmitIntent → OrderSubmitted →
+    OrderExpired → TradeOutcomeProduced`. Counter helper returns
+    `intents=1 fills=0 pending=0 rejects=1` (OrderExpired counts as
+    a reject — terminal non-fill). The headline must show the
+    activity, not just `trades 0`.
     """
-    print_run(0, '2026-04-12', [], {}, n_orders=1)
-    captured = capsys.readouterr().out  # type: ignore[attr-defined]
-    headline = captured.splitlines()[0]
-    assert 'trades 0 (orders 1)' in headline
-
-
-def test_print_run_open_position_shows_plus_open(capsys: object) -> None:
-    """A BUY filled with no closing SELL fill must show `+1 open`."""
-    print_run(0, '2026-04-12', [_trade('BUY')], {}, n_orders=2)
-    captured = capsys.readouterr().out  # type: ignore[attr-defined]
-    headline = captured.splitlines()[0]
-    assert 'trades 0 (+1 open, orders 2)' in headline
-
-
-def test_print_run_closed_pair_shows_orders_too(capsys: object) -> None:
-    """Standard 1-pair day: trades 1 (orders 2) — order count contextualises."""
     print_run(
-        0, '2026-04-06', [_trade('BUY'), _trade('SELL')], {}, n_orders=2,
+        0, '2026-04-12', [], {},
+        n_intents=1, n_fills=0, n_pending=0, n_rejects=1,
     )
     captured = capsys.readouterr().out  # type: ignore[attr-defined]
     headline = captured.splitlines()[0]
-    assert 'trades 1 (orders 2)' in headline
+    assert 'trades 0 (intents 1, rejects 1)' in headline
 
 
-def test_print_run_orders_default_zero_preserves_legacy_format(
+def test_print_run_pending_at_close(capsys: object) -> None:
+    """1 intent still in flight at window close (PENDING outcome)."""
+    print_run(
+        0, '2026-04-12', [], {},
+        n_intents=1, n_fills=0, n_pending=1, n_rejects=0,
+    )
+    captured = capsys.readouterr().out  # type: ignore[attr-defined]
+    headline = captured.splitlines()[0]
+    assert 'trades 0 (intents 1, pending 1)' in headline
+
+
+def test_print_run_open_position_after_buy_fill(capsys: object) -> None:
+    """BUY filled, no closing SELL fill → unmatched filled inventory."""
+    print_run(
+        0, '2026-04-12', [_trade('BUY')], {},
+        n_intents=2, n_fills=1, n_pending=1, n_rejects=0,
+    )
+    captured = capsys.readouterr().out  # type: ignore[attr-defined]
+    headline = captured.splitlines()[0]
+    assert 'trades 0 (intents 2, fills 1, pending 1, +1 open)' in headline
+
+
+def test_print_run_clean_round_trip(capsys: object) -> None:
+    """Standard 1-pair day: 2 intents, 2 fills, no anomalies."""
+    print_run(
+        0, '2026-04-06', [_trade('BUY'), _trade('SELL')], {},
+        n_intents=2, n_fills=2, n_pending=0, n_rejects=0,
+    )
+    captured = capsys.readouterr().out  # type: ignore[attr-defined]
+    headline = captured.splitlines()[0]
+    assert 'trades 1 (intents 2, fills 2)' in headline
+
+
+def test_print_run_all_blocked_validator(capsys: object) -> None:
+    """Both intents validator-rejected → 0 fills, 0 pending, all rejects."""
+    print_run(
+        0, '2026-04-12', [], {},
+        n_intents=2, n_fills=0, n_pending=0, n_rejects=2,
+    )
+    captured = capsys.readouterr().out  # type: ignore[attr-defined]
+    headline = captured.splitlines()[0]
+    assert 'trades 0 (intents 2, rejects 2)' in headline
+
+
+def test_print_run_default_kwargs_preserve_legacy_format(
     capsys: object,
 ) -> None:
-    """When no caller threads n_orders, output is unchanged from prior behaviour."""
+    """Callers that don't thread the new params get a clean legacy headline."""
     print_run(0, '2026-04-09', [], {})
     captured = capsys.readouterr().out  # type: ignore[attr-defined]
     headline = captured.splitlines()[0]
+    pre_pf = headline.split('PF')[0]
     assert 'trades 0' in headline
-    assert '(' not in headline.split('PF')[0]
+    assert 'intents' not in pre_pf
+    assert 'fills' not in pre_pf
+    assert 'pending' not in pre_pf
+    assert 'rejects' not in pre_pf

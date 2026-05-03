@@ -332,7 +332,10 @@ def _run(args: argparse.Namespace) -> int:
     print_run(
         display_id, window_start.date().isoformat(), trades,
         declared_stops,
-        n_orders=int(result.get('orders', 0)),
+        n_intents=int(result.get('n_intents', 0)),
+        n_fills=int(result.get('n_fills', 0)),
+        n_pending=int(result.get('n_pending', 0)),
+        n_rejects=int(result.get('n_rejects', 0)),
         slippage_cost_bps=slip_cost,
         slippage_n_samples=result['slippage_n_samples'],
         slippage_n_excluded=result['slippage_n_excluded'],

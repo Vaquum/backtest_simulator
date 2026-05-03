@@ -1,3 +1,67 @@
+# v2.3.0
+
+Layer 1 honest activity readout in the per-run summary line. The
+`orders K` extra introduced in v2.2.2 is replaced with a finer-
+grained split of EventSpine event counts, ordered along the trader's
+five-question lifecycle scan:
+
+- `intents N` — did my strategy decide to act? (`OrderSubmitIntent`)
+- `fills N` — did money move? (`FillReceived`)
+- `pending N` — what's still hanging at window close?
+  (`TradeOutcomeProduced` with payload `status == 'PENDING'`)
+- `rejects N` — what got blocked or expired? (`OrderRejected`,
+  `OrderExpired`, `OrderCanceled`, `OrderSubmitFailed`)
+- `+N open` — unmatched filled inventory (`pair_trades` trailing,
+  unchanged from v2.2.2)
+
+Only non-zero counts are rendered. Output examples:
+
+- Genuinely flat day:           `trades 0`
+- Clean round trip:             `trades 1 (intents 2, fills 2)`
+- 1 intent, expired (canonical r0011 04-12 pattern):
+                                `trades 0 (intents 1, rejects 1)`
+- 1 intent still in flight:     `trades 0 (intents 1, pending 1)`
+- BUY filled, SELL did not:     `trades 0 (intents 2, fills 1, pending 1, +1 open)`
+- Both validator-blocked:       `trades 0 (intents 2, rejects 2)`
+
+`run_window_in_process` now calls a new `count_event_spine_events`
+helper (in `backtest_simulator/honesty/ledger_parity.py`) right
+after `dump_event_spine_to_jsonl`. The helper reads the spine sqlite
+and returns the five counters plus a `total` for cross-check. The
+counts ride on `WindowResult` as `n_intents`, `n_submitted`,
+`n_fills`, `n_pending`, `n_rejects`. `bts run` and `bts sweep`
+thread them into `print_run`.
+
+`n_orders` (added in v2.2.2) is removed from `print_run`'s
+signature. Callers using `print_run` from outside this repo will
+need to switch to the new kwargs; the four new params all default
+to `0` so the legacy headline still renders when nothing is
+threaded.
+
+Nine tests in `tests/cli/test_print_run_activity_readout.py` lock
+the lifecycle ordering of extras, the canonical 04-12 expire case,
+the pending-at-close case, the unmatched-fill case, the all-
+rejected case, and the clean round-trip case. The counter helper
+is verified directly against the existing 04-12 spine sqlite
+written by the canonical r0011 sweep; end-to-end sweep
+verification on a fresh tunnel is currently blocked by an
+unrelated Limen 3.0.1 API drift (`Manifest.with_target` removed)
+that needs its own slice on the bundle-shim path.
+
+Surfaces:
+- `backtest_simulator/honesty/ledger_parity.py` — new
+  `count_event_spine_events` helper
+- `backtest_simulator/cli/_run_window.py` — call helper, add five
+  fields to `WindowResult`
+- `backtest_simulator/cli/_metrics.py` — replace `n_orders` with
+  `n_intents` / `n_fills` / `n_pending` / `n_rejects`; update
+  display logic
+- `backtest_simulator/cli/commands/sweep.py` — thread the four
+  counts to `print_run`
+- `backtest_simulator/cli/commands/run.py` — same
+- `tests/cli/test_print_run_activity_readout.py` — rewritten
+  for the new format
+
 # v2.2.3
 
 Drop `uv.lock` from version control and add `tools/refresh_siblings.sh`.

@@ -143,6 +143,11 @@ class WindowResult(TypedDict):
     n_atr_uncalibrated: int
     event_spine_jsonl: str
     event_spine_n_events: int
+    n_intents: int
+    n_submitted: int
+    n_fills: int
+    n_pending: int
+    n_rejects: int
     book_gap_max_seconds: float
     book_gap_n_observed: int
     book_gap_p95_seconds: float
@@ -422,13 +427,22 @@ def run_window_in_process(
     # `--check-parity-vs` is set. Cost is small (one sqlite scan
     # post-run); operator can chain into other parity tooling.
     from backtest_simulator.honesty.ledger_parity import (
+        count_event_spine_events,
         dump_event_spine_to_jsonl,
     )
+    spine_sqlite = work / 'event_spine.sqlite'
     spine_jsonl = work / 'event_spine.jsonl'
     spine_n_events = dump_event_spine_to_jsonl(
-        sqlite_path=work / 'event_spine.sqlite',
+        sqlite_path=spine_sqlite,
         jsonl_path=spine_jsonl,
     )
+    # Per-window event-type counts feed the operator's five-question
+    # scan: did my strategy decide to act (intents)? did the venue
+    # accept (submitted)? did money move (fills)? what's still hanging
+    # (pending)? what got blocked (rejects)? print_run renders these
+    # as parenthetical extras after `trades N` so a trader can tell
+    # a flat day from a fail-to-fill day at a glance.
+    spine_counts = count_event_spine_events(sqlite_path=spine_sqlite)
     book_gap = adapter.book_gap_snapshot()
     account = adapter.history('bts-sweep')
     trade_tuples = [
@@ -553,6 +567,11 @@ def run_window_in_process(
         'n_atr_uncalibrated': launcher.n_atr_uncalibrated,
         'event_spine_jsonl': str(spine_jsonl),
         'event_spine_n_events': spine_n_events,
+        'n_intents': spine_counts['intents'],
+        'n_submitted': spine_counts['submitted'],
+        'n_fills': spine_counts['fills'],
+        'n_pending': spine_counts['pending'],
+        'n_rejects': spine_counts['rejects'],
         # Slice #17 Task 11 — book-gap instrumentation. The venue's
         # BookGapInstrument records the time between the last sub-
         # stop tape tick and the trigger tick on every STOP/TP fill.
