@@ -347,7 +347,21 @@ def run_window_in_process(
         feed=feed,
         filters=BinanceSpotFilters.binance_spot(SYMBOL),
         fees=FeeSchedule(),
-        trade_window_seconds=60,
+        # Walk one full kline of trade tape per submit. The prior
+        # 60s ceiling produced "phantom intents" — orders the venue
+        # could not fill in 60s of tape but a real exchange would
+        # have crossed in microseconds (BTCUSDT books carry
+        # multi-BTC depth at every level). `interval_seconds` is
+        # the bundle's `data_source_config.params['kline_size']`
+        # derived above; using it here keeps the venue's tape walk
+        # aligned with the strategy's signal cadence so an honest
+        # MARKET order fills inside the next signal's worth of
+        # tape. Stop-breach-before-fill remains a real EXPIRED the
+        # strategy correctly does not retry (codex caught that
+        # ambiguity — the "no liquidity" and "stop halted" paths
+        # both surface as zero-fill EXPIRED today; widening the
+        # walk addresses the former without affecting the latter).
+        trade_window_seconds=interval_seconds,
         slippage_model=slippage_model,
         maker_fill_model=maker_fill_model,
         market_impact_bucket_minutes=1,
