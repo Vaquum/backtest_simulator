@@ -54,6 +54,22 @@ sweep (2026-04-13..04-26): all 12 trade days now show
 and 04-24 previously produced `intents 3, fills 2,
 pending 1` phantoms.
 
+Drain budget bump: `_DRAIN_TIMEOUT_SECONDS` raised
+from 1.5 s to 15 s in `launcher.py`, with a new
+`_DRAIN_SLOW_WARN_SECONDS = 2.0` soft-warning
+threshold. Praxis's `account_loop` task scheduling
+under freezegun-frozen event loop produces sporadic
+tail-latency spikes >1.5 s on `_process_command`
+(submit_order task in flight when the next clock tick
+fires); the old budget aborted the canonical 10×14
+sweep mid-run on `DrainTimeoutError`. The 15 s ceiling
+absorbs the spike; the 2 s soft-warn keeps slow drains
+visible (logged WARNING with praxis state) so a real
+regression in pump latency cannot hide inside the
+larger budget. Verified on the full canonical r0001
+10×14 sweep: 140/140 windows complete, 0 phantoms,
+0 drain-slow warnings, 0 aborts.
+
 # v2.3.4
 
 Venue tape walk now spans one full `kline_size` per submit

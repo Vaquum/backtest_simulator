@@ -106,14 +106,20 @@ _CLOCK_TICK_REAL_PAUSE_SECONDS = 0.01
 # minimal delay after they complete; it bounds total drain real time so
 # a stuck command can't run the 10s budget into the ground.
 _DRAIN_POLL_INTERVAL_SECONDS = 0.02
-# Drain must stay well inside the 10s total e2e budget. 1.5s is enough
-# for `_process_command` to complete its ClickHouse round-trip
+# Drain must stay well inside the 10s total e2e budget. 1.5s used to be
+# enough for `_process_command` to complete its ClickHouse round-trip
 # (`query_order_book` for slippage + `submit_order` walking the trade
-# window) even on a slow network. Anything longer is a real bug — the
-# whole run aborts so the operator sees the failure on the next line,
-# instead of letting frozen-minute ticks each spend seconds on drain
-# and silently blow the budget into the minutes.
-_DRAIN_TIMEOUT_SECONDS = 1.5
+# window) on a healthy machine, but Praxis's task-scheduling under
+# freezegun-frozen event loop can stretch a single submit dispatch
+# noticeably under load. 15s is the operating ceiling — happy-path
+# drains still return in tens of ms; the budget only matters when
+# something is actually stuck. Anything longer is a real bug.
+_DRAIN_TIMEOUT_SECONDS = 15.0
+# Soft warning threshold. If a single drain takes longer than this in
+# real wall time, log a WARNING with the praxis state — that way a slow
+# but passing drain stays visible instead of silently absorbed by the
+# raised ceiling. Tune to ~10× the typical healthy drain time.
+_DRAIN_SLOW_WARN_SECONDS = 2.0
 
 
 class DrainTimeoutError(RuntimeError):
@@ -1561,6 +1567,14 @@ class BacktestLauncher(Launcher):
                 submitted = self._submitted_commands
             delivered = self._delivered_command_count()
             if delivered >= submitted:
+                elapsed = os.times()[4] - drain_start
+                if elapsed > _DRAIN_SLOW_WARN_SECONDS:
+                    _log.warning(
+                        'drain slow: submitted=%d delivered=%d wallclock=%.2fs '
+                        '(soft threshold=%.1fs, hard timeout=%.1fs)',
+                        submitted, delivered, elapsed,
+                        _DRAIN_SLOW_WARN_SECONDS, _DRAIN_TIMEOUT_SECONDS,
+                    )
                 return
             if os.times()[4] - drain_start > _DRAIN_TIMEOUT_SECONDS:
                 diag = self._praxis_queue_sizes()

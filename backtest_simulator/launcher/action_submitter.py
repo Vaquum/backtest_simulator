@@ -322,11 +322,22 @@ def build_action_submitter(
     resulting `TradeCommand`.
 
     Contract:
-      - Every non-ABORT action is evaluated against
-        `bindings.validation_pipeline`.
-        A denied decision is logged with the failing stage + reason and
-        the action is dropped without reaching Praxis; upstream Nexus
-        behaviour is the same (`submit_actions` honors the decision).
+      - Every non-ABORT, non-SELL-close action is evaluated against
+        `bindings.validation_pipeline`. A denied decision is logged
+        with the failing stage + reason and the action is dropped
+        without reaching Praxis; upstream Nexus behaviour is the same
+        (`submit_actions` honors the decision).
+      - SELL actions take a long-only fast-path that BYPASSES the
+        pipeline and dispatches the close directly: bts's long-only
+        strategy template emits SELLs without propagating the BUY's
+        `trade_id` (an INTAKE-stage reference-integrity check would
+        deny every close), and `CapitalController` has no
+        `close_position` primitive (a real CAPITAL stage would
+        over-reserve). Close accounting still lands in the launcher's
+        adapter wrapper via `CapitalLifecycleTracker.record_close_position`
+        which mirrors `CapitalController.order_fill`. Pipeline-on-SELL
+        is a follow-up tracked upstream (Nexus `close_position` +
+        template change to propagate `trade_id`).
       - `on_reservation` is called once per allowed decision with the
         freshly minted `command_id`, the decision (whose `reservation`
         carries the CAPITAL stage's reservation_id + notional), and the

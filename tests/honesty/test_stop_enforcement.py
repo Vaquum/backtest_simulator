@@ -158,6 +158,55 @@ def test_stop_does_not_fire_when_stream_never_crosses() -> None:
     assert fills == []
 
 
+def test_market_entry_first_tick_fills_even_when_already_past_stop() -> None:
+    """MARKET BUY whose first tape tick is already below declared_stop fills.
+
+    Behavioral pin for the `consumed_qty > 0` guard in `_walk_market`.
+    Pre-fix the stop-breach branch fired on the FIRST tape tick
+    whenever the seed-anchored declared stop sat above the current
+    market — i.e., whenever the price had merely DRIFTED between
+    `window_start` and `submit_time` (the typical case for any
+    multi-hour window). The strategy never entered, the venue
+    silently returned zero fills, and Praxis's TradeOutcomeProduced
+    PENDING fallback surfaced the resulting phantom intent.
+
+    Real venues honor a MARKET BUY at the current tape price even when
+    that price is already past the strategy's protective stop — the
+    stop only matters as an EXIT trigger after entry. Distinguishes
+    old code (returns `[]`) from new code (returns one VWAP fill at
+    the first tape tick) — under the OLD code this test fails because
+    `consumed_qty == 0` and the stop-breach branch halts the walk
+    before any tick is consumed.
+    """
+    now = datetime(2020, 4, 1, tzinfo=UTC)
+    filters = BinanceSpotFilters.binance_spot('BTCUSDT')
+    config = FillModelConfig(submit_latency_ms=50)
+    # Declared stop at 70000 (anchored to the seed price baked at
+    # window_start). By submit time the market has drifted to 69800 —
+    # the FIRST post-submit tape tick sits BELOW stop_price. Under
+    # live-reality semantics the order fills here; under the old
+    # first-tick-halts code the walk would return `[]` and Praxis
+    # would mint a phantom PENDING outcome.
+    trades = pl.DataFrame({
+        'time': [now + timedelta(seconds=i) for i in (1, 2)],
+        'price': [Decimal('69800'), Decimal('69900')],
+        'qty':   [Decimal('1.0'), Decimal('1.0')],
+    })
+    order = PendingOrder(
+        order_id='OM', side='BUY', order_type='MARKET',
+        qty=Decimal('0.5'), limit_price=None, stop_price=Decimal('70000'),
+        time_in_force='GTC', submit_time=now, symbol='BTCUSDT',
+    )
+    fills = walk_trades(order, trades, config, filters)
+    assert len(fills) == 1
+    # 0.5 BTC fills entirely on the first tick at 69800 (full qty taken
+    # before any further tick is consumed). Reason: a normal VWAP fill,
+    # not a stop-halt.
+    assert fills[0].fill_qty == Decimal('0.5')
+    assert fills[0].fill_price == Decimal('69800.00')
+    assert fills[0].reason == 'market_vwap'
+
+
 def test_market_entry_halts_walk_on_stop_breach_mid_fill() -> None:
     """MARKET BUY with attached stop: walk HALTS on breach, no residual at stop.
 

@@ -115,6 +115,6 @@ def test_build_action_submitter_has_no_on_atr_reject_param() -> None:
     )
     sig = inspect.signature(build_action_submitter)
     assert 'on_atr_reject' not in sig.parameters, (
-        f'build_action_submitter still accepts on_atr_reject; the '
-        f'ATR rejection hook must be removed.'
+        'build_action_submitter still accepts on_atr_reject; the '
+        'ATR rejection hook must be removed.'
     )
