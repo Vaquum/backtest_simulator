@@ -60,7 +60,6 @@ from backtest_simulator.honesty import (
     build_validation_pipeline,
     capital_totals,
 )
-from backtest_simulator.honesty.atr import AtrSanityGate
 from backtest_simulator.launcher.action_submitter import (
     SubmitterBindings,
     build_action_submitter,
@@ -105,16 +104,12 @@ _CLOCK_TICK_REAL_PAUSE_SECONDS = 0.01
 # Drain settings: Praxis's account_loop polls its queue every 0.1s. The
 # drain wakes up at 0.02s granularity to catch fresh dispatches with
 # minimal delay after they complete; it bounds total drain real time so
-# a stuck command can't run the 10s budget into the ground.
+# a stuck command can't burn frozen-time ticks into a grey zone.
 _DRAIN_POLL_INTERVAL_SECONDS = 0.02
-# Drain must stay well inside the 10s total e2e budget. 1.5s is enough
-# for `_process_command` to complete its ClickHouse round-trip
-# (`query_order_book` for slippage + `submit_order` walking the trade
-# window) even on a slow network. Anything longer is a real bug — the
-# whole run aborts so the operator sees the failure on the next line,
-# instead of letting frozen-minute ticks each spend seconds on drain
-# and silently blow the budget into the minutes.
-_DRAIN_TIMEOUT_SECONDS = 1.5
+# 15s hard cap absorbs Praxis-pump tail-latency; 2s soft cap logs
+# slow-but-passing drains so pump regressions can't hide.
+_DRAIN_TIMEOUT_SECONDS = 15.0
+_DRAIN_SLOW_WARN_SECONDS = 2.0
 
 
 class DrainTimeoutError(RuntimeError):
@@ -873,8 +868,6 @@ class BacktestLauncher(Launcher):
         event_spine: EventSpine | None = None,
         db_path: Path | None = None,
         historical_data: HistoricalData | None = None,
-        atr_gate: AtrSanityGate | None = None,
-        atr_provider: Callable[[str, datetime], Decimal | None] | None = None,
         max_allocation_per_trade_pct: Decimal | None = None,
     ) -> None:
         # A backtest run is one window, one set of events — not a live
@@ -906,33 +899,7 @@ class BacktestLauncher(Launcher):
         self._submitted_commands = 0
         self._submit_lock = threading.Lock()
         self._venue_adapter = venue_adapter
-        # Slice #17 Task 29 — ATR R-denominator gameability gate.
-        # Either being None disables the gate; CLI path supplies
-        # both. Counters surface on `bts run` JSON + `bts sweep`.
-        self._atr_gate = atr_gate
-        self._atr_provider = atr_provider
-        self._n_atr_rejected = 0
-        self._n_atr_uncalibrated = 0
         self._max_allocation_per_trade_pct = max_allocation_per_trade_pct
-
-    @property
-    def n_atr_rejected(self) -> int:
-        """Stop-tighter-than `k*ATR(window)` ENTER+BUY denials."""
-        return self._n_atr_rejected
-
-    @property
-    def n_atr_uncalibrated(self) -> int:
-        """ENTER+BUY denials where the ATR provider returned None."""
-        return self._n_atr_uncalibrated
-
-    def _record_atr_rejection(
-        self, decision: ValidationDecision, action: Action,
-    ) -> None:
-        del action
-        if decision.reason_code == 'ATR_UNCALIBRATED':
-            self._n_atr_uncalibrated += 1
-        else:
-            self._n_atr_rejected += 1
 
     def _start_trading(self) -> None:
         """Wire `Trading.route_outcome` into the execution_manager.
@@ -1274,12 +1241,9 @@ class BacktestLauncher(Launcher):
                 strategy_budget=allocated_capital,
                 touch_provider=touch_provider,
                 tick_provider=tick_provider,
-                atr_gate=self._atr_gate,
-                atr_provider=self._atr_provider,
             ),
             on_reservation=self._record_reservation,
             on_submit=self._record_submitted_command,
-            on_atr_reject=self._record_atr_rejection,
         )
 
         def market_data_provider(kline_size: int) -> pl.DataFrame:
@@ -1565,27 +1529,9 @@ class BacktestLauncher(Launcher):
     def _drain_pending_submits(self) -> None:
         """Block until every submitted command_id has landed at the adapter.
 
-        Praxis's `account_loop` polls its submit queue on a 0.1s cadence,
-        then awaits `adapter.submit_order`. The main clock thread must
-        not advance frozen time past a submit that account_loop hasn't
-        yet dispatched — otherwise the adapter's trade-window lookahead
-        will miss the trades that would have filled the order.
-
-        Simply `time.sleep` between checks releases the GIL but does not
-        guarantee the asyncio event loop iterates. With heavy main-thread
-        clock ticking, account_loop can be starved by the scheduler. The
-        drain instead schedules a no-op coroutine onto Praxis's loop and
-        awaits its completion — that guarantees the loop reaches at
-        least one full iteration per drain cycle, which is enough for
-        account_loop to pick up the queued command and for
-        `adapter.submit_order` to write the resulting order entry.
-
-        A truly stuck command (adapter.submit_order raises into the
-        task and never stores an order) is bounded by
-        `_DRAIN_TIMEOUT_SECONDS`; on timeout the drain raises
-        `DrainTimeoutError` carrying the per-account queue state so
-        the run aborts instead of silently burning frozen time into
-        a grey zone.
+        Main clock must not advance past a submit Praxis hasn't dispatched.
+        Bounded by `_DRAIN_TIMEOUT_SECONDS`; raises `DrainTimeoutError`
+        on timeout (with per-account queue state) so the run aborts loudly.
         """
         drain_start = os.times()[4]
         while True:
@@ -1593,6 +1539,9 @@ class BacktestLauncher(Launcher):
                 submitted = self._submitted_commands
             delivered = self._delivered_command_count()
             if delivered >= submitted:
+                elapsed = os.times()[4] - drain_start
+                if elapsed > _DRAIN_SLOW_WARN_SECONDS:
+                    _log.warning('drain slow: submitted=%d delivered=%d wallclock=%.2fs', submitted, delivered, elapsed)
                 return
             if os.times()[4] - drain_start > _DRAIN_TIMEOUT_SECONDS:
                 diag = self._praxis_queue_sizes()

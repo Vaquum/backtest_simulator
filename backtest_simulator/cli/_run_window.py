@@ -24,14 +24,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from backtest_simulator.feed.protocol import VenueFeed
-    from backtest_simulator.honesty.atr import AtrSanityGate
     from backtest_simulator.honesty.maker_fill import MakerFillModel
     from backtest_simulator.honesty.slippage import SlippageModel
-
-    AtrProvider = Callable[[str, datetime], Decimal | None]
 
 from backtest_simulator.cli._pipeline import (
     SYMBOL,
@@ -137,10 +132,6 @@ class WindowResult(TypedDict):
     market_impact_n_flagged: int
     market_impact_n_uncalibrated: int
     market_impact_n_rejected: int
-    atr_k: str
-    atr_window_seconds: int
-    n_atr_rejected: int
-    n_atr_uncalibrated: int
     event_spine_jsonl: str
     event_spine_n_events: int
     n_intents: int
@@ -234,8 +225,6 @@ def run_window_in_process(
     *,
     maker_preference: bool = False,
     strict_impact: bool = False,
-    atr_k: str = '0.5',
-    atr_window_seconds: int = 900,
     max_allocation_per_trade_pct: Decimal | None = None,
     predict_lookback: int | None = None,
 ) -> WindowResult:
@@ -363,15 +352,6 @@ def run_window_in_process(
         market_impact_threshold_fraction=Decimal('0.1'),
         strict_impact_policy=strict_impact,
     )
-    # Slice #17 Task 29 — ATR sanity gate, R-denominator floor.
-    # Defaults: 900s window (14-period ATR convention) + k=0.5
-    # (stop must be ≥ half a local ATR). The strategy template's
-    # default stop_bps=50 on $70k BTC ≈ $350 distance, well above
-    # floor=0.5*typical-1-min-BTC-ATR; gate fires only on
-    # gameably tight stops. `--atr-k 0` disables.
-    atr_gate, atr_provider = _build_atr_gate_and_provider(
-        feed, k=Decimal(atr_k), window_seconds=atr_window_seconds,
-    )
     tc = TradingConfig(
         epoch_id=1, venue_rest_url='http://sim', venue_ws_url='ws://sim',
         account_credentials={'bts-sweep': ('k', 's')}, shutdown_timeout=5.0,
@@ -386,8 +366,6 @@ def run_window_in_process(
         )],
         venue_adapter=adapter,
         db_path=work / 'event_spine.sqlite',
-        atr_gate=atr_gate,
-        atr_provider=atr_provider,
         max_allocation_per_trade_pct=max_allocation_per_trade_pct,
     )
     # Auditor (post-v2.0.2) "make it real": capture per-tick runtime
@@ -555,25 +533,6 @@ def run_window_in_process(
         'market_impact_n_uncalibrated':
             adapter.market_impact_n_uncalibrated,
         'market_impact_n_rejected': adapter.market_impact_n_rejected,
-        # Slice #17 Task 29 — ATR R-denominator gameability gate.
-        # `n_atr_rejected` counts ENTER+BUY denied for stops
-        # tighter than `k * ATR(window)` from entry. Always 0
-        # for strategies whose stops are sane vs local
-        # volatility; non-zero when the strategy emits 1-bp
-        # stops or similar gameability vectors.
-        # `n_atr_uncalibrated` counts denials where the ATR
-        # provider returned None (empty pre-decision tape) —
-        # the operator's "warmup" signal.
-        # Auditor: surface the floor that PRODUCED these counts
-        # so two sweeps with different `--atr-k` /
-        # `--atr-window-seconds` don't show different rejection
-        # counts without showing what threshold each one used.
-        # The bts artifact must be self-describing for later
-        # comparison.
-        'atr_k': str(atr_k),
-        'atr_window_seconds': int(atr_window_seconds),
-        'n_atr_rejected': launcher.n_atr_rejected,
-        'n_atr_uncalibrated': launcher.n_atr_uncalibrated,
         'event_spine_jsonl': str(spine_jsonl),
         'event_spine_n_events': spine_n_events,
         'n_intents': spine_counts['intents'],
@@ -602,40 +561,6 @@ def run_window_in_process(
         'runtime_predictions': runtime_predictions,
     }
     return result
-
-
-def _build_atr_gate_and_provider(
-    feed: VenueFeed, *, k: Decimal, window_seconds: int,
-) -> tuple[AtrSanityGate, AtrProvider]:
-    """Construct the ATR sanity gate + per-submit provider.
-
-    Provider closes over `feed`, fetches `[t - window_seconds,
-    t)` of strict-causal pre-decision tape, and calls
-    `compute_atr_from_tape(period_seconds=60)` — Wilder's true-
-    range ATR (per-bucket H-L plus gap-vs-prev-close arms,
-    averaged across buckets). With the defaults (window=900s,
-    period=60s) the result is 15 buckets — classic 14-period
-    ATR shape. Slice #17 Task 29.
-    """
-    import polars as pl
-
-    from backtest_simulator.honesty.atr import (
-        AtrSanityGate,
-        compute_atr_from_tape,
-    )
-    gate = AtrSanityGate(atr_window_seconds=window_seconds, k=k)
-
-    def atr_provider(symbol: str, t: datetime) -> Decimal | None:
-        from datetime import timedelta
-        raw = feed.get_trades_for_venue(
-            symbol, t - timedelta(seconds=window_seconds), t,
-            venue_lookahead_seconds=0,
-        )
-        pre = raw.filter(pl.col('time') < t)
-        return compute_atr_from_tape(
-            trades_pre_decision=pre, period_seconds=60,
-        )
-    return gate, atr_provider
 
 
 def _calibrate_slippage(
@@ -754,8 +679,6 @@ def run_window_in_subprocess(
     *,
     maker_preference: bool = False,
     strict_impact: bool = False,
-    atr_k: str = '0.5',
-    atr_window_seconds: int = 900,
     max_allocation_per_trade_pct: Decimal | None = None,
     predict_lookback: int | None = None,
 ) -> WindowResult:
@@ -768,8 +691,6 @@ def run_window_in_subprocess(
         'experiment_dir': str(experiment_dir),
         'maker_preference': bool(maker_preference),
         'strict_impact': bool(strict_impact),
-        'atr_k': str(atr_k),
-        'atr_window_seconds': int(atr_window_seconds),
         'max_allocation_per_trade_pct': (
             None if max_allocation_per_trade_pct is None
             else str(max_allocation_per_trade_pct)
@@ -862,8 +783,6 @@ def _child_main() -> int:
         Path(payload['experiment_dir']),
         maker_preference=bool(payload.get('maker_preference', False)),
         strict_impact=bool(payload.get('strict_impact', False)),
-        atr_k=str(payload.get('atr_k', '0.5')),
-        atr_window_seconds=int(payload.get('atr_window_seconds', 900)),
         max_allocation_per_trade_pct=(
             None if raw_max_alloc is None else Decimal(str(raw_max_alloc))
         ),

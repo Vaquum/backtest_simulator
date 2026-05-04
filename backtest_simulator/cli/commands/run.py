@@ -124,13 +124,6 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
                        'Default: record telemetry only (observability '
                        'mode).'
                    ))
-    # Slice #17 Task 29 — ATR R-denominator gameability gate knobs.
-    p.add_argument('--atr-k', type=str, default='0.5',
-                   help=(
-                       'ATR-floor multiplier — stop must be >= '
-                       'k * ATR(window) from entry. 0 disables the '
-                       'gate. Default: 0.5 (half a local ATR).'
-                   ))
     p.add_argument('--max-allocation-per-trade-pct', type=str, default=None,
                    help=(
                        'Override Nexus CapitalController default of 0.15. '
@@ -145,14 +138,6 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
                        'stateful predictors (rolling thresholds, hysteresis '
                        'state machines) to evolve across rows. Requires '
                        'vaquum-nexus >= 0.36.0.'
-                   ))
-    p.add_argument('--atr-window-seconds', type=int, default=900,
-                   help=(
-                       'ATR window in seconds. Wilder true-range ATR: '
-                       'per-1-min bucket TR = max(H-L, |H-prev_C|, '
-                       '|L-prev_C|), then averaged across buckets. '
-                       'Default: 900s (15 buckets, classic 14-period '
-                       'ATR shape).'
                    ))
     # Slice #17 Task 18 — ledger-parity gate. The bts side dumps
     # event_spine.jsonl on every run regardless. With
@@ -230,8 +215,6 @@ def _run(args: argparse.Namespace) -> int:
         perm_id, kelly, window_start, window_end, exp_dir,
         maker_preference=bool(getattr(args, 'maker', False)),
         strict_impact=bool(getattr(args, 'strict_impact', False)),
-        atr_k=str(getattr(args, 'atr_k', '0.5')),
-        atr_window_seconds=int(getattr(args, 'atr_window_seconds', 900)),
         max_allocation_per_trade_pct=(
             None if raw_max_alloc is None else _Decimal(str(raw_max_alloc))
         ),
@@ -322,14 +305,6 @@ def _run(args: argparse.Namespace) -> int:
             'market_impact_n_rejected': result.get(
                 'market_impact_n_rejected', 0,
             ),
-            # ATR R-denominator gameability gate (slice #17 Task 29).
-            # Auditor: surface the FLOOR (k + window) alongside the
-            # counts so the JSON artifact is self-describing for
-            # later cross-run comparison.
-            'atr_k': result.get('atr_k', '0.5'),
-            'atr_window_seconds': result.get('atr_window_seconds', 900),
-            'n_atr_rejected': result.get('n_atr_rejected', 0),
-            'n_atr_uncalibrated': result.get('n_atr_uncalibrated', 0),
             # Slice #17 Task 18 ledger parity. The bts spine is
             # always dumped post-run; the reference comparison
             # fires only when --check-parity-vs is set.

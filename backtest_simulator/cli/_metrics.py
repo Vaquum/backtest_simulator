@@ -7,8 +7,8 @@
 # `R multiple` is `(sell-buy)*qty / |buy-stop|*qty` — the strict-live-
 # reality measurement: net PnL divided by declared risk (the absolute
 # distance from entry to declared stop). `None` when no stop was
-# declared on the BUY (defensive — `_check_declared_stop` should have
-# rejected it before submission).
+# declared on the BUY — the strategy is responsible for emitting a
+# stop-bearing action; bts no longer pre-checks this on the INTAKE side.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -131,8 +131,6 @@ def print_run(
     market_impact_n_samples: int = 0,
     market_impact_n_flagged: int = 0,
     market_impact_n_uncalibrated: int = 0,
-    n_atr_rejected: int = 0,
-    n_atr_uncalibrated: int = 0,
 ) -> None:
     """One-line headline + per-pair detail.
 
@@ -243,14 +241,6 @@ def print_run(
         impact_str = impact_core
     else:
         impact_str = ''
-    # ATR R-denominator gameability gate (slice #17 Task 29).
-    # Only surfaces when at least one ENTER+BUY was denied;
-    # silent on healthy runs where the strategy's stops sit
-    # comfortably above `k * ATR(window)`.
-    if n_atr_rejected > 0 or n_atr_uncalibrated > 0:
-        atr_str = f'  atr_rej={n_atr_rejected}/uncal={n_atr_uncalibrated}'
-    else:
-        atr_str = ''
     # `trades N` counts CLOSED BUY->SELL round trips. A day with
     # order activity that did not close a round trip used to read
     # as `trades 0` and was indistinguishable from a genuinely flat
@@ -283,8 +273,7 @@ def print_run(
         f'total {fmt_dec(total_pct, 2)}%  '
         f'{slip_str}'
         f'{maker_str}'
-        f'{impact_str}'
-        f'{atr_str}',
+        f'{impact_str}',
     )
     for buy, sell in pairs:
         declared = declared_stops.get(buy.client_order_id)

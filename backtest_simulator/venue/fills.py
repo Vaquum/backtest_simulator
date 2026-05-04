@@ -38,10 +38,15 @@ class WalkContext:
 # denominator, never a *promise* about where fills land.
 #
 # Concretely:
-#   - MARKET entry walks the tape. If the tape breaches the order's
-#     attached `stop_price` mid-walk, the walk HALTS. Residual qty is
-#     never booked at the declared stop (that would be a phantom fill
-#     at a price the tape did not offer). Partial fill is returned as-is.
+#   - MARKET entry walks the tape. The FIRST post-submit tick ALWAYS
+#     enters at its actual tape price, even if that price is already
+#     past the order's attached `stop_price` (a stale seed-anchored
+#     stop is not a live veto: a MARKET BUY gap-fills at the current
+#     market in real venues, and the protective stop only matters as
+#     an EXIT trigger after entry). If a LATER tape tick breaches the
+#     declared stop after some qty has filled, the walk HALTS and the
+#     residual is left unbooked — never written at the declared stop
+#     (that would be a phantom fill at a price the tape did not offer).
 #   - STOP_LOSS / STOP_LOSS_LIMIT / TAKE_PROFIT orders fill at the FIRST
 #     tape tick at or past `stop_price` — at the tick's ACTUAL price,
 #     not at the declared stop. A gapping tape produces gap slippage
@@ -63,9 +68,14 @@ def walk_trades(
     """Match `order` against the historical `trades` stream — strict-live-reality.
 
     MARKET walks trades from `submit_time + submit_latency` until qty is
-    filled OR the tape breaches the order's attached `stop_price`. On
-    breach the walk HALTS and only the pre-breach qty fills at its
-    actual tape prices; no residual is booked at the declared stop.
+    filled OR a MID-WALK tape tick (after `consumed_qty > 0`) breaches
+    the order's attached `stop_price`. The FIRST post-submit tick
+    always enters at its actual tape price even if already past the
+    declared stop — a stale seed-anchored stop is not a live entry
+    veto; protective stops only matter as exit triggers after entry.
+    On a true mid-walk breach the walk HALTS and only the pre-breach
+    qty fills at its actual tape prices; no residual is booked at the
+    declared stop.
 
     LIMIT — when `maker_model` is supplied, the maker engine walks the
     queue against post-submit aggressors and emits fills as queue
@@ -139,16 +149,30 @@ def _walk_market(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpot
         if remaining <= 0:
             break
         px = Decimal(str(row['price']))
-        if stop_price is not None:
+        # Stop-breach is a MID-WALK halt that models gap-through-stop
+        # during entry consumption: the strategy's declared stop
+        # (anchored to the seed price baked at window_start) is
+        # crossed AFTER some qty has already filled, so the residual
+        # is left unbooked. Pre-fix this branch fired on the FIRST
+        # tape tick whenever the seed-anchored stop sat above the
+        # current market — i.e., when the price had merely DRIFTED
+        # between window_start and submit_time (typical for any
+        # multi-hour window). The strategy never entered, the venue
+        # silently returned zero fills, and Praxis's
+        # TradeOutcomeProduced=PENDING fallback (2-min timeout)
+        # surfaced the phantom intent the operator hit on perm-130
+        # 04-17 / 04-24. Real-world MARKET BUYs gap-fill at the
+        # current tape price even when that price is already past
+        # the strategy's stale stop reference; the protective stop
+        # only matters as an EXIT trigger after entry. Gate the
+        # breach halt on `consumed_qty > 0` so the FIRST tick always
+        # enters and only LATER ticks (a true intra-walk dip) halt.
+        if stop_price is not None and consumed_qty > 0:
             breaches = (
                 (order.side == 'BUY' and px <= stop_price)
                 or (order.side == 'SELL' and px >= stop_price)
             )
             if breaches:
-                # Stop breached mid-walk. Halt — return only what was
-                # filled at pre-breach tape prices. The unfilled
-                # residual is released (the caller / capital lifecycle
-                # must handle release-on-partial-fill).
                 stop_halted = True
                 break
         take = min(remaining, Decimal(str(row['qty'])))
