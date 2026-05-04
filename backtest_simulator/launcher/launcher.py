@@ -104,7 +104,7 @@ _CLOCK_TICK_REAL_PAUSE_SECONDS = 0.01
 # Drain settings: Praxis's account_loop polls its queue every 0.1s. The
 # drain wakes up at 0.02s granularity to catch fresh dispatches with
 # minimal delay after they complete; it bounds total drain real time so
-# a stuck command can't run the 10s budget into the ground.
+# a stuck command can't burn frozen-time ticks into a grey zone.
 _DRAIN_POLL_INTERVAL_SECONDS = 0.02
 # 15s hard cap absorbs Praxis-pump tail-latency; 2s soft cap logs
 # slow-but-passing drains so pump regressions can't hide.

@@ -7,8 +7,8 @@
 # `R multiple` is `(sell-buy)*qty / |buy-stop|*qty` — the strict-live-
 # reality measurement: net PnL divided by declared risk (the absolute
 # distance from entry to declared stop). `None` when no stop was
-# declared on the BUY (defensive — `_check_declared_stop` should have
-# rejected it before submission).
+# declared on the BUY — the strategy is responsible for emitting a
+# stop-bearing action; bts no longer pre-checks this on the INTAKE side.
 from __future__ import annotations
 
 from dataclasses import dataclass
