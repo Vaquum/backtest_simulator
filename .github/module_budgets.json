@@ -10,7 +10,6 @@
   "backtest_simulator/exceptions.py": 40,
   "backtest_simulator/wall_clock.py": 40,
   "backtest_simulator/honesty/__init__.py": 40,
-  "backtest_simulator/honesty/atr.py": 150,
   "backtest_simulator/honesty/book_gap.py": 100,
   "backtest_simulator/honesty/capital.py": 540,
   "backtest_simulator/honesty/conservation.py": 200,
