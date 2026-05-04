@@ -118,7 +118,7 @@ _DRAIN_TIMEOUT_SECONDS = 15.0
 # Soft warning threshold. If a single drain takes longer than this in
 # real wall time, log a WARNING with the praxis state — that way a slow
 # but passing drain stays visible instead of silently absorbed by the
-# raised ceiling. Tune to ~10× the typical healthy drain time.
+# raised ceiling. Tune to ~10x the typical healthy drain time.
 _DRAIN_SLOW_WARN_SECONDS = 2.0
 
 
