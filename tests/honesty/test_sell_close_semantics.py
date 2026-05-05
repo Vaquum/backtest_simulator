@@ -1,16 +1,15 @@
-"""SELL close semantics — the Part 2 exit leg does NOT reserve capital.
+"""SELL close semantics — slice #38 EXIT routing.
 
-Long-only convention: BUY opens a long (CAPITAL stage reserves notional);
-SELL with `ActionType.ENTER` closes the open long. A SELL submitted
-through the action-submitter must:
+Long-only convention: BUY opens a long; SELL closes it. After slice
+#38, SELL emits with `ActionType.EXIT` and `trade_id` propagated from
+the BUY's fill. The action_submitter routes EXITs through
+`validation_pipeline.validate`; the Nexus pipeline_executor bypasses
+CAPITAL/HEALTH/PLATFORM_LIMITS for `ValidationAction.EXIT`, so:
 
-  - bypass the CAPITAL reservation (no double-commit on exit),
-  - still flow through `translate_to_trade_command` and Praxis send,
-  - still fire the `on_submit` drain hook.
-
-Nexus's `ActionType.EXIT` is the long-run correct tag but requires
-`trade_id`-linked lifecycle that exceeds Part 2 scope — documented in
-the action_submitter. The test here pins the agreed Part 2 behavior.
+  - INTAKE/RISK/PRICE run on EXITs (parity with deployed Praxis),
+  - the CAPITAL substitute on EXIT lives at fill time via
+    `CapitalLifecycleTracker.record_close_position`,
+  - `on_submit` still fires so the launcher's drain advances.
 """
 from __future__ import annotations
 
@@ -18,6 +17,7 @@ from decimal import Decimal
 from typing import cast
 
 from nexus.core.domain.enums import OrderSide
+from nexus.core.domain.instance_state import Position
 from nexus.core.domain.order_types import ExecutionMode, OrderType
 from nexus.core.validator.pipeline_models import InstanceState
 from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
@@ -27,6 +27,7 @@ from nexus.strategy.action import Action, ActionType
 from backtest_simulator.honesty import build_validation_pipeline
 from backtest_simulator.launcher.action_submitter import (
     SubmitterBindings,
+    _CommandRegistry,
     build_action_submitter,
 )
 
@@ -44,30 +45,42 @@ class _OutboundStub:
         pass
 
 
-def _sell_close_action() -> Action:
+def _seed_open_position(state: InstanceState, trade_id: str) -> None:
+    """Pre-populate `state.positions[trade_id]` so EXIT INTAKE finds it."""
+    state.positions[trade_id] = Position(
+        trade_id=trade_id, strategy_id='long_on_signal',
+        symbol='BTCUSDT', side=OrderSide.BUY,
+        size=Decimal('0.001'), entry_price=Decimal('50000'),
+    )
+
+
+def _sell_exit_action(trade_id: str) -> Action:
     return Action(
-        action_type=ActionType.ENTER,
+        action_type=ActionType.EXIT,
         direction=OrderSide.SELL,
         size=Decimal('0.001'),
         execution_mode=ExecutionMode.SINGLE_SHOT,
         order_type=OrderType.MARKET,
         execution_params={'symbol': 'BTCUSDT'},
         deadline=60,
-        trade_id=None, command_id=None,
+        trade_id=trade_id, command_id=None,
         maker_preference=None, reference_price=Decimal('50000'),
     )
 
 
 def test_sell_close_does_not_reserve_capital() -> None:
-    # Baseline: capital state's reservation_notional starts at zero.
-    # After a SELL close, reservation_notional MUST still be zero (no
-    # double-commit).
+    # EXIT routes through validate() but the pipeline_executor
+    # bypasses CAPITAL for ValidationAction.EXIT. So no reservation
+    # is created and `capital_state.reservation_notional` stays at 0.
     outbound = _OutboundStub()
     pipeline, controller, capital_state = build_validation_pipeline(
-        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
+        nexus_config=NexusInstanceConfig(
+            account_id='bts-test', venue='binance_spot_simulated',
+        ),
         capital_pool=Decimal('100000'),
     )
     state = InstanceState(capital=capital_state)
+    _seed_open_position(state, 'open-trade-1')
     reservations_captured: list[tuple[str, object, Action]] = []
 
     def on_reservation(
@@ -86,17 +99,15 @@ def test_sell_close_does_not_reserve_capital() -> None:
             validation_pipeline=pipeline,
             capital_controller=controller,
             strategy_budget=Decimal('100000'),
+            command_registry=_CommandRegistry(),
         ),
         on_reservation=on_reservation,
     )
-    submit([_sell_close_action()], 'long_on_signal')
+    submit([_sell_exit_action('open-trade-1')], 'long_on_signal')
     # Command reached Praxis.
     assert len(outbound.commands) == 1
-    # No reservation captured — `on_reservation` is only fired when
-    # the decision has a reservation. The action_submitter short-
-    # circuits the CAPITAL stage for SELL and returns a reservation-
-    # less decision.
-    assert reservations_captured == [] or reservations_captured[0][1].reservation is None
+    # No reservation captured — EXIT bypasses CAPITAL stage entirely.
+    assert reservations_captured == []
     # CapitalState unchanged — zero reservation_notional, zero deployed.
     assert capital_state.reservation_notional == Decimal('0')
     assert capital_state.in_flight_order_notional == Decimal('0')
@@ -104,15 +115,17 @@ def test_sell_close_does_not_reserve_capital() -> None:
 
 
 def test_sell_close_still_fires_on_submit() -> None:
-    # The drain hook must fire for SELL closes too — the launcher's
-    # drain counter is how we know the venue fill completed. Skipping
-    # the drain for SELL would hang the clock.
+    # The drain hook must fire for EXITs too — the launcher's
+    # drain counter is how we know the venue fill completed.
     outbound = _OutboundStub()
     pipeline, controller, capital_state = build_validation_pipeline(
-        nexus_config=NexusInstanceConfig(account_id='bts-test', venue='binance_spot_simulated'),
+        nexus_config=NexusInstanceConfig(
+            account_id='bts-test', venue='binance_spot_simulated',
+        ),
         capital_pool=Decimal('100000'),
     )
     state = InstanceState(capital=capital_state)
+    _seed_open_position(state, 'open-trade-1')
     submitted: list[str] = []
     submit = build_action_submitter(
         SubmitterBindings(
@@ -124,8 +137,9 @@ def test_sell_close_still_fires_on_submit() -> None:
             validation_pipeline=pipeline,
             capital_controller=controller,
             strategy_budget=Decimal('100000'),
+            command_registry=_CommandRegistry(),
         ),
         on_submit=submitted.append,
     )
-    submit([_sell_close_action()], 'long_on_signal')
+    submit([_sell_exit_action('open-trade-1')], 'long_on_signal')
     assert len(submitted) == 1

@@ -140,7 +140,7 @@ def test_force_flatten_fires_when_preds_is_none(tmp_path: Path) -> None:
         f'expected 1 SELL action at cutoff with _preds=None, got '
         f'{len(actions)} actions: {actions!r}'
     )
-    assert actions[0].action_type == ActionType.ENTER
+    assert actions[0].action_type == ActionType.EXIT
     assert actions[0].direction == OrderSide.SELL
 
 

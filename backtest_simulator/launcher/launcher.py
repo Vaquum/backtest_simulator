@@ -19,10 +19,12 @@ from typing import cast
 
 import polars as pl
 from limen import HistoricalData
+from nexus.core.capital_controller.capital_controller import CapitalController
 from nexus.core.domain.capital_state import CapitalState
 from nexus.core.domain.enums import OperationalMode
 from nexus.core.domain.instance_state import InstanceState
 from nexus.core.outcome_loop import ActionSubmitter, OutcomeLoop
+from nexus.core.validator import ValidationPipeline
 from nexus.core.validator.pipeline_models import (
     ValidationDecision,
     ValidationRequestContext,
@@ -62,7 +64,12 @@ from backtest_simulator.honesty import (
 )
 from backtest_simulator.launcher.action_submitter import (
     SubmitterBindings,
+    _CommandRegistry,
+    apply_buy_fill_to_state,
+    apply_sell_close_to_state,
     build_action_submitter,
+    build_validation_rejected_outcome,
+    release_sell_pending_exit,
 )
 from backtest_simulator.launcher.clock import accelerated_clock
 from backtest_simulator.launcher.poller import BacktestMarketDataPoller
@@ -182,6 +189,8 @@ class _LifecycleContext:
     tracker: CapitalLifecycleTracker
     capital_state: CapitalState
     initial_pool: Decimal
+    state: InstanceState
+    command_registry: _CommandRegistry
 
 
 def _check_tracker_match_required(
@@ -340,6 +349,9 @@ def _finalize_successful_fill(
         entry_fees=fill_fees,
         entry_qty=fill_qty,
     )
+    apply_buy_fill_to_state(ctx.state, ctx.command_registry,
+        command_id=command_id, strategy_id=pending_strategy_id or 'unknown',
+        fill_qty=fill_qty, fill_notional=fill_notional)
     _log.info(
         'capital lifecycle: command_id=%s reserve->send->ack->fill%s '
         'venue_order_id=%s fill_notional=%s fees=%s open_positions=%d',
@@ -390,6 +402,7 @@ def _finalize_sell_close(
         ctx.capital_state, ctx.initial_pool,
         context=f'sell_close sell_command_id={sell_command_id}',
     )
+    apply_sell_close_to_state(ctx.state, ctx.command_registry, sell_command_id, sell_qty)
     _log.info(
         'capital lifecycle: SELL close sell_command_id=%s '
         'paired_buy_command_id=%s released_cost_basis=%s '
@@ -618,6 +631,8 @@ def _install_capital_adapter_wrapper(
     capital_state: CapitalState,
     initial_pool: Decimal,
     declared_stops: dict[str, Decimal],
+    state: InstanceState | None = None,
+    command_registry: _CommandRegistry | None = None,
 ) -> None:
     """Wrap `adapter.submit_order` so the capital lifecycle completes in-line.
 
@@ -636,8 +651,13 @@ def _install_capital_adapter_wrapper(
     each transition so any drift fails loud at the offending boundary.
     """
     original_submit = adapter.submit_order
+    # Optional state/registry keep BUY-side test fixtures working;
+    # real launcher wiring always supplies both (slice #38).
+    resolved_state = state if state is not None else InstanceState(capital=capital_state)
+    resolved_registry = command_registry if command_registry is not None else _CommandRegistry()
     ctx = _LifecycleContext(
         tracker=tracker, capital_state=capital_state, initial_pool=initial_pool,
+        state=resolved_state, command_registry=resolved_registry,
     )
 
     async def wrapped_submit(
@@ -679,53 +699,20 @@ def _install_capital_adapter_wrapper(
         venue_order_id = result.venue_order_id
         status_name = result.status.name
         if command_id is None:
-            # SELL exits don't go through the BUY reservation
-            # tracker (no `record_reservation` call) — the
-            # action_submitter's SELL fast-path skips
-            # validation_pipeline.validate (see TODO Task 27 for
-            # the architectural decision: CapitalController has
-            # no close_position primitive, so the close
-            # lifecycle is BTS-side via
-            # `record_close_position`). The CLOSE half releases
-            # the matched BUY's `cost_basis + entry_fees` from
-            # `position_notional` and decrements
-            # `per_strategy_deployed[strategy_id]` by the same
-            # amount; `capital_pool` stays untouched (it's the
-            # immutable strategy budget, not a cash ledger).
-            # Codex round 4 P0: pre-fix this branch just
-            # logged-and-returned, so `position_notional` and
-            # the per-strategy attribution dict went
-            # permanently out of sync after every close.
-            # `.name` comparison instead of `is` / `==` against
-            # Praxis's OrderSide so the branch still fires when
-            # callers pass the Nexus-side OrderSide enum (the
-            # adapter Protocol type-annotates Praxis but Nexus's
-            # action_submitter and several tests use Nexus's
-            # enum — both have `.name == 'SELL'` on the SELL
-            # member). Identity comparison on `is`/`==` returns
-            # False across the two distinct Enum classes even
-            # though they're behaviourally identical.
-            if (
-                side.name == 'SELL'
-                and status_name in ('FILLED', 'PARTIALLY_FILLED')
-                and result.immediate_fills
-            ):
-                # Both FILLED and PARTIALLY_FILLED feed the close
-                # flow; `record_close_position` releases the
-                # proportional share of the matched BUY's cost
-                # basis (sold qty / entry qty) and leaves the
-                # residual open if any. The strategy's
-                # `_pending_sell` clears on the outcome dispatch
-                # so the next preds=0 can finish the residual.
-                _finalize_sell_close(
-                    ctx, result, client_order_id or 'unknown',
-                )
+            # SELL EXITs go through the EXIT capital substitute seam.
+            sell_id = (resolved_registry.match_command_id_from_client_order_id(client_order_id)
+                       or client_order_id or 'unknown')
+            is_sell = side.name == 'SELL'
+            if is_sell and status_name in ('FILLED', 'PARTIALLY_FILLED') and result.immediate_fills:
+                _finalize_sell_close(ctx, result, sell_id)
+            elif is_sell and status_name in ('REJECTED', 'EXPIRED', 'OPEN'):
+                release_sell_pending_exit(resolved_state, resolved_registry, sell_id)
+                _log.info('capital lifecycle: SELL %s (no fill) client_order_id=%s',
+                          status_name, client_order_id)
             else:
-                _log.info(
-                    'capital lifecycle: no pending command matches '
-                    'client_order_id=%s; pending_count=%d',
-                    client_order_id, tracker.pending_count,
-                )
+                _log.info('capital lifecycle: no pending command matches '
+                          'client_order_id=%s; pending_count=%d',
+                          client_order_id, tracker.pending_count)
             return result
         # REJECTED (filter rejection, never reached the venue) and
         # EXPIRED (validated, sent to the venue, didn't fill in window)
@@ -1215,35 +1202,32 @@ class BacktestLauncher(Launcher):
         # Populated at reservation time; read by `compute_r_per_trade`
         # post-run to produce the Part 2 honest-R metric.
         self._declared_stops: dict[str, Decimal] = {}
+        self._command_registry = _CommandRegistry()
+        self._account_id = inst.account_id
+        self._instance_state = state
         _install_capital_adapter_wrapper(
-            adapter=self._venue_adapter,
-            tracker=self._capital_tracker,
+            adapter=self._venue_adapter, tracker=self._capital_tracker,
             capital_state=capital_state,
             initial_pool=self._capital_initial_pool,
             declared_stops=self._declared_stops,
+            state=state, command_registry=self._command_registry,
         )
-        # Touch + tick providers feed the action_submitter's
-        # LIMIT-touch-refresh hook. The hook rewrites a LIMIT
-        # action's `execution_params['price']` to `touch ± tick`
-        # before validation. `SimulatedVenueAdapter` exposes both
-        # providers; non-sim adapters fall back to None (action
-        # submitter's no-touch path).
         from backtest_simulator.venue.simulated import SimulatedVenueAdapter
         sva = self._venue_adapter if isinstance(self._venue_adapter, SimulatedVenueAdapter) else None
-        touch_provider = sva.touch_for_symbol if sva is not None else None
-        tick_provider = sva.tick_for_symbol if sva is not None else None
         action_submit = build_action_submitter(
             SubmitterBindings(
                 nexus_config=nexus_config, state=state,
                 praxis_outbound=praxis_outbound,
-                validation_pipeline=pipeline,
-                capital_controller=controller,
+                validation_pipeline=cast('ValidationPipeline', pipeline),
+                capital_controller=cast('CapitalController', controller),
                 strategy_budget=allocated_capital,
-                touch_provider=touch_provider,
-                tick_provider=tick_provider,
+                command_registry=self._command_registry,
+                touch_provider=sva.touch_for_symbol if sva is not None else None,
+                tick_provider=sva.tick_for_symbol if sva is not None else None,
             ),
             on_reservation=self._record_reservation,
             on_submit=self._record_submitted_command,
+            on_action_denied=self._dispatch_validation_denied,
         )
 
         def market_data_provider(kline_size: int) -> pl.DataFrame:
@@ -1463,6 +1447,17 @@ class BacktestLauncher(Launcher):
         del command_id
         with self._submit_lock:
             self._submitted_commands += 1
+
+    def _dispatch_validation_denied(
+        self, command_id: str, decision: ValidationDecision, action: Action,
+    ) -> None:
+        del action
+        account_queue = self._outcome_queues.get(self._account_id)
+        if account_queue is None:
+            return
+        account_queue.put_nowait(cast('NexusTradeOutcome', build_validation_rejected_outcome(
+            command_id=command_id, decision=decision, timestamp=datetime.now(UTC),
+        )))
 
     def _record_reservation(
         self,

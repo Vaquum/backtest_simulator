@@ -98,19 +98,29 @@ def _enter_action() -> Action:
 
 
 def _sell_action() -> Action:
-    """SELL exit — no stop_price, per Part 2 long-only convention."""
+    """SELL exit — slice #38 routes via `ActionType.EXIT` with trade_id."""
     return Action(
-        action_type=ActionType.ENTER,
+        action_type=ActionType.EXIT,
         direction=OrderSide.SELL,
         size=Decimal('0.001'),
         execution_mode=ExecutionMode.SINGLE_SHOT,
         order_type=OrderType.MARKET,
         execution_params={'symbol': 'BTCUSDT'},
         deadline=60,
-        trade_id=None,
+        trade_id='open-trade-1',
         command_id=None,
         maker_preference=None,
         reference_price=Decimal('50000'),
+    )
+
+
+def _seed_open_position(state: InstanceState, trade_id: str = 'open-trade-1') -> None:
+    """Pre-populate `state.positions[trade_id]` so EXIT INTAKE finds it."""
+    from nexus.core.domain.instance_state import Position
+    state.positions[trade_id] = Position(
+        trade_id=trade_id, strategy_id='long_on_signal',
+        symbol='BTCUSDT', side=OrderSide.BUY,
+        size=Decimal('0.001'), entry_price=Decimal('50000'),
     )
 
 
@@ -138,9 +148,12 @@ def test_enter_with_declared_stop_passes_validation_and_sends() -> None:
 
 def test_sell_exit_without_stop_is_accepted() -> None:
     # Long-only convention — SELL closes an existing long and is itself
-    # the risk close, so no stop_price is required.
+    # the risk close, so no stop_price is required. Slice #38 routes
+    # SELL via `ActionType.EXIT` with `trade_id` propagated from the
+    # BUY's fill outcome.
     outbound = _OutboundStub()
     pipeline, controller, state = _pipeline_and_state()
+    _seed_open_position(state)
     submit = build_action_submitter(_make_bindings(outbound, pipeline, controller, state))
     submit([_sell_action()], 'long_on_signal')
     assert len(outbound.commands) == 1
@@ -219,6 +232,7 @@ def test_on_submit_hook_fires_with_command_id() -> None:
     # must fire exactly once per action that reached Praxis.
     outbound = _OutboundStub()
     pipeline, controller, state = _pipeline_and_state()
+    _seed_open_position(state)
     submitted: list[str] = []
     submit = build_action_submitter(
         _make_bindings(outbound, pipeline, controller, state),
@@ -283,9 +297,10 @@ def test_maybe_refresh_limit_to_touch_buy_biases_below() -> None:
 
 
 def test_maybe_refresh_limit_to_touch_sell_biases_above() -> None:
-    """LIMIT SELL action's price gets rewritten to `touch + tick`."""
+    """LIMIT SELL EXIT action's price gets rewritten to `touch + tick`."""
     outbound = _OutboundStub()
     pipeline, controller, state = _pipeline_and_state()
+    _seed_open_position(state)
     bindings = SubmitterBindings(
         nexus_config=_nexus_config(), state=state,
         praxis_outbound=cast(PraxisOutbound, outbound),
@@ -297,14 +312,14 @@ def test_maybe_refresh_limit_to_touch_sell_biases_above() -> None:
     )
     submit = build_action_submitter(bindings)
     sell_limit = Action(
-        action_type=ActionType.ENTER,
+        action_type=ActionType.EXIT,
         direction=OrderSide.SELL,
         size=Decimal('0.001'),
         execution_mode=ExecutionMode.SINGLE_SHOT,
         order_type=OrderType.LIMIT,
         execution_params={'symbol': 'BTCUSDT', 'price': '10000'},
         deadline=60,
-        trade_id=None, command_id=None,
+        trade_id='open-trade-1', command_id=None,
         maker_preference=None,
         reference_price=Decimal('10000'),
     )

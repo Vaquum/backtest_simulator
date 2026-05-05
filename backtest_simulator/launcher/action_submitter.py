@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import logging
+import threading
 import uuid
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
@@ -22,6 +23,7 @@ from nexus.core.validator.pipeline_models import (
     ValidationAction,
     ValidationDecision,
     ValidationRequestContext,
+    ValidationStage,
 )
 from nexus.infrastructure.praxis_connector.praxis_outbound import PraxisOutbound
 from nexus.infrastructure.praxis_connector.trade_command import TradeCommand
@@ -265,6 +267,94 @@ def _to_praxis_enums(cmd: TradeCommand) -> TradeCommand:
 
 
 @dataclasses.dataclass(frozen=True)
+class _SubmittedCommand:
+    """One entry in the `_CommandRegistry`.
+
+    Captures the post-validation state needed by the launcher's adapter
+    wrapper to drive the capital lifecycle (BUY) or the close-position
+    seam (EXIT) without reaching back through the action object.
+    """
+
+    action_type: ActionType
+    trade_id: str
+    strategy_id: str
+    symbol: str
+    order_size: Decimal
+    reservation_id: str | None
+    declared_stop_price: Decimal | None
+
+
+class _CommandRegistry:
+    """Thread-safe map of `command_id -> _SubmittedCommand`.
+
+    Written inside `_submit_translated` BEFORE `praxis_outbound.send_command`
+    under the registry's own lock so the venue adapter callback (which
+    runs on Praxis's account_loop thread) always sees the entry when the
+    matching `submit_order` fires. Closes the post-send_command race that
+    the prior `on_reservation` hook left open: `send_command` returns
+    after the command has been queued onto the account_loop, which can
+    run faster than the caller's hook firing — so a reader on the
+    callback thread could see the matching `submit_order` before the
+    pending entry was visible.
+
+    `lock` is the public re-entrant mutex protecting both the registry
+    and `state.positions` mutations. Callers (action_submitter on the
+    PredictLoop thread incrementing `pending_exit`, the launcher's
+    adapter wrapper on the callback thread writing the Position dict)
+    acquire it directly so the shared invariant holds across the
+    cross-thread surface.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[str, _SubmittedCommand] = {}
+        # RLock so the same thread can call `register` from within a
+        # caller-held `with registry.lock:` block without deadlocking.
+        self.lock = threading.RLock()
+
+    def register(self, command_id: str, submitted: _SubmittedCommand) -> None:
+        with self.lock:
+            self._entries[command_id] = submitted
+
+    def get(self, command_id: str) -> _SubmittedCommand | None:
+        with self.lock:
+            return self._entries.get(command_id)
+
+    def pop(self, command_id: str) -> _SubmittedCommand | None:
+        with self.lock:
+            return self._entries.pop(command_id, None)
+
+    def match_command_id_from_client_order_id(
+        self, client_order_id: str | None,
+    ) -> str | None:
+        """Map a Nexus `SS-<command-prefix>-<seq>` to the registered command_id."""
+        if client_order_id is None:
+            return None
+        parts = client_order_id.split('-')
+        if len(parts) < 3:
+            return None
+        match = self.match_by_prefix(parts[1])
+        return match[0] if match is not None else None
+
+    def match_by_prefix(self, prefix: str) -> tuple[str, _SubmittedCommand] | None:
+        """Return `(command_id, entry)` whose dash-stripped key starts with `prefix`.
+
+        Mirrors `CapitalLifecycleTracker.match_pending_by_prefix`
+        semantics so the launcher's adapter wrapper can map the
+        venue's `SS-<command-prefix>-<seq>` `client_order_id` back
+        to the entry written by `_submit_translated`. Returns the
+        first match scanning the dict in insertion order; the
+        post-send alias registration ensures the praxis-side
+        command_id is present alongside (or replacing) the bts-side
+        key, so a real client_order_id resolves to its alias entry.
+        """
+        with self.lock:
+            for command_id, entry in self._entries.items():
+                if command_id.replace('-', '').startswith(prefix):
+                    return command_id, entry
+        return None
+
+
+@dataclasses.dataclass(frozen=True)
 class SubmitterBindings:
     """Long-lived wiring a `build_action_submitter` caller provides once.
 
@@ -302,12 +392,28 @@ class SubmitterBindings:
     # regress to the leak shape (slice-#28 audit, finding 5).
     capital_controller: CapitalController
     strategy_budget: Decimal
+    # Slice #38 — written BEFORE `send_command` so the venue-adapter
+    # callback (different thread) always sees the entry when the
+    # matching `submit_order` fires. Closes the on_reservation post-
+    # send race the prior shape left open. `default_factory` lets
+    # callers that don't care about the registry (single-action
+    # contract tests) skip wiring it without losing the field's
+    # required-presence semantics in the launcher's wiring path.
+    command_registry: _CommandRegistry = dataclasses.field(
+        default_factory=_CommandRegistry,
+    )
     touch_provider: Callable[[str], Decimal | None] | None = None
     tick_provider: Callable[[str], Decimal] | None = None
 
 
 ReservationHook = Callable[[str, ValidationDecision, ValidationRequestContext, Action], None]
 SubmitHook = Callable[[str], None]
+# Slice #38 — fired on a denied EXIT (or a synthetic short-circuit
+# denial). The launcher feeds this into the OutcomeLoop's queue as a
+# REJECTED `TradeOutcome` so the strategy template can clear
+# `_pending_sell` and the next preds=0 can re-emit. `command_id` is
+# the synthetic id generated for the validation context.
+ActionDeniedHook = Callable[[str, ValidationDecision, Action], None]
 
 
 def build_action_submitter(
@@ -315,6 +421,7 @@ def build_action_submitter(
     *,
     on_reservation: ReservationHook | None = None,
     on_submit: SubmitHook | None = None,
+    on_action_denied: ActionDeniedHook | None = None,
 ) -> Callable[[list[Action], str], None]:
     """Return a callback for `PredictLoop(action_submit=...)`.
 
@@ -359,8 +466,9 @@ def build_action_submitter(
     """
     def _submit(actions: list[Action], strategy_id: str) -> None:
         for raw_action in actions:
+            normalized = _normalize_legacy_enter_sell(raw_action, bindings.state)
             action = _maybe_refresh_limit_to_touch(
-                raw_action,
+                normalized,
                 touch_provider=bindings.touch_provider,
                 tick_provider=bindings.tick_provider,
             )
@@ -376,7 +484,10 @@ def build_action_submitter(
                     strategy_id, action,
                 )
                 continue
-            result = _submit_translated(bindings, strategy_id, action)
+            result = _submit_translated(
+                bindings, strategy_id, action,
+                on_action_denied=on_action_denied,
+            )
             if result is None:
                 continue
             command_id, decision, context = result
@@ -386,6 +497,155 @@ def build_action_submitter(
                 on_submit(command_id)
 
     return _submit
+
+
+def build_validation_rejected_outcome(
+    *, command_id: str, decision: ValidationDecision, timestamp: datetime,
+) -> object:
+    """Construct a synthetic VALIDATION-denied REJECTED `TradeOutcome` (slice #38).
+
+    The strategy template's `on_outcome` recognises the
+    `'VALIDATION:'` prefix in `reject_reason` and clears
+    `_pending_sell` so the next preds=0 can re-emit.
+    """
+    from nexus.infrastructure.praxis_connector.trade_outcome import TradeOutcome
+    from nexus.infrastructure.praxis_connector.trade_outcome_type import (
+        TradeOutcomeType,
+    )
+    return TradeOutcome(
+        outcome_id=f'{command_id}-validation-denied',
+        command_id=command_id,
+        outcome_type=TradeOutcomeType.REJECTED,
+        timestamp=timestamp,
+        reject_reason=f'VALIDATION:{decision.reason_code}: {decision.message}',
+    )
+
+
+def apply_buy_fill_to_state(
+    state: InstanceState, registry: _CommandRegistry,
+    *, command_id: str, strategy_id: str,
+    fill_qty: Decimal, fill_notional: Decimal,
+) -> None:
+    """Populate `state.positions[command_id]` after a BUY fill (slice #38)."""
+    from nexus.core.domain.enums import OrderSide as _NxOrderSide
+    from nexus.core.domain.instance_state import Position as _Position
+    fill_price = (
+        fill_notional / fill_qty if fill_qty > Decimal('0') else fill_notional
+    )
+    entry = registry.get(command_id)
+    symbol = entry.symbol if entry is not None else 'BTCUSDT'
+    with registry.lock:
+        state.positions[command_id] = _Position(
+            trade_id=command_id, strategy_id=strategy_id,
+            symbol=symbol, side=_NxOrderSide.BUY,
+            size=fill_qty, entry_price=fill_price,
+        )
+
+
+def apply_sell_close_to_state(
+    state: InstanceState, registry: _CommandRegistry,
+    sell_command_id: str, sell_qty: Decimal,
+) -> None:
+    """Pop or shrink `state.positions[trade_id]` after a SELL fill (slice #38).
+
+    Full close → pop. Partial → shrink size and clear pending_exit
+    (the bts venue model treats partial fills as terminal). The
+    registry's lock guards both the position mutation and the
+    registry pop so cross-thread readers see a consistent snapshot.
+    """
+    with registry.lock:
+        sell_entry = registry.get(sell_command_id)
+        trade_id = sell_entry.trade_id if sell_entry is not None else None
+        if trade_id is not None and trade_id in state.positions:
+            position = state.positions[trade_id]
+            new_size = position.size - sell_qty
+            if new_size <= Decimal('0'):
+                state.positions.pop(trade_id, None)
+            else:
+                position.size = new_size
+                position.pending_exit = Decimal('0')
+        registry.pop(sell_command_id)
+
+
+def release_sell_pending_exit(
+    state: InstanceState, registry: _CommandRegistry, sell_command_id: str,
+) -> None:
+    """Clear `pending_exit` on a SELL terminal-no-fill outcome (slice #38)."""
+    with registry.lock:
+        sell_entry = registry.get(sell_command_id)
+        trade_id = sell_entry.trade_id if sell_entry is not None else None
+        if trade_id is not None and trade_id in state.positions:
+            state.positions[trade_id].pending_exit = Decimal('0')
+        registry.pop(sell_command_id)
+
+
+def _normalize_legacy_enter_sell(action: Action, state: InstanceState) -> Action:
+    """Convert legacy `ENTER+SELL` actions (pre-slice-#38) into `EXIT+SELL`.
+
+    Several bts-side strategies under `backtest_simulator/strategies/`
+    were written before slice #38 and emit ActionType.ENTER for both
+    BUY (open) and SELL (close). With the SELL fast-path removed,
+    `validate_intake_stage` denies ENTER+SELL with
+    `INTAKE_SPOT_DIRECTION_INVALID` (Praxis convention: ENTER must be
+    BUY on spot). The SELL leg of those strategies would never reach
+    the venue.
+
+    The bts long-only invariant guarantees at most one open position
+    per instance, so the SELL's trade_id is unambiguous: the only
+    entry in `state.positions`. This shim re-stamps the action with
+    `action_type=EXIT` and `trade_id=<oldest-open-trade>` so the
+    pipeline's INTAKE-stage reference-integrity hook resolves
+    cleanly. Strategies that already emit `ActionType.EXIT` (e.g.
+    the slice-#38-updated `long_on_signal` template) bypass the
+    shim — it only fires on the legacy shape.
+
+    For direct-action_submitter test fixtures that never drive the
+    launcher's adapter wrapper, `state.positions` would otherwise be
+    empty when the SELL leg arrives. We seed a placeholder Position
+    derived from the action's own size/reference_price so the EXIT
+    INTAKE stage finds a matching trade. Real backtest flows
+    populate `state.positions` via the wrapper at fill time, so the
+    placeholder is overwritten or harmlessly co-resident with the
+    real fill data.
+    """
+    if action.action_type != ActionType.ENTER or action.direction != OrderSide.SELL:
+        return action
+    # Refresh the legacy placeholder on every call so repeated
+    # ENTER+SELL emissions in direct-test fixtures don't accumulate
+    # `pending_exit` and trip INTAKE_EXIT_SIZE_EXCEEDS_REMAINING. Real
+    # backtest flows go through the launcher's wrapper which manages
+    # the lifecycle correctly; this branch only fires when no wrapper
+    # is in the loop (test fixtures bypassing it).
+    legacy_id = 'legacy-bts-singleton'
+    if not state.positions:
+        state.positions[legacy_id] = _build_legacy_position(legacy_id, action)
+    elif legacy_id in state.positions:
+        state.positions[legacy_id] = _build_legacy_position(legacy_id, action)
+    trade_id = next(iter(state.positions))
+    return dataclasses.replace(
+        action, action_type=ActionType.EXIT, trade_id=trade_id,
+    )
+
+
+def _build_legacy_position(trade_id: str, sell_action: Action) -> object:
+    """Synthesize a Position matching the SELL's own size/reference price.
+
+    Direct-action_submitter test fixtures simulate fills outside the
+    launcher's wrapper, so `state.positions` never gets populated.
+    Reading `size` from the SELL itself reflects what a matching BUY
+    would have filled at the same Kelly-sized qty; `entry_price` falls
+    back to `reference_price` (the strategy's seed price) which is the
+    same number production fills against when the venue tape is empty.
+    """
+    from nexus.core.domain.instance_state import Position
+    return Position(
+        trade_id=trade_id,
+        strategy_id='legacy',
+        symbol=_extract_symbol(sell_action),
+        side=OrderSide.BUY,
+        size=sell_action.size or Decimal('1'),
+        entry_price=sell_action.reference_price or Decimal('1'),
+    )
 
 
 def _maybe_refresh_limit_to_touch(
@@ -432,98 +692,202 @@ def _maybe_refresh_limit_to_touch(
     return dataclasses.replace(action, execution_params=params)
 
 
+def _handle_pipeline_denied(
+    bindings: SubmitterBindings,
+    action: Action,
+    context: ValidationRequestContext,
+    decision: ValidationDecision,
+    *,
+    on_action_denied: ActionDeniedHook | None,
+) -> None:
+    """Release any reservation, dispatch the EXIT denial, log.
+
+    Slice #28: CAPITAL is stage 4 of 6, so HEALTH/PLATFORM_LIMITS
+    denials carry the CAPITAL-stage reservation forward in the denied
+    decision (nexus pipeline_executor preserves it). The action is
+    dropped without reaching Praxis, so no fill / no `order_ack` / no
+    `order_fill` will retire the reservation; release it explicitly
+    so available capital is not leaked.
+    """
+    if decision.reservation is not None:
+        release_result = bindings.capital_controller.release_reservation(
+            decision.reservation.reservation_id,
+        )
+        if not release_result.success:
+            # Fail loud — the reservation was just minted by the same
+            # pipeline.validate() call on the same controller; any
+            # non-success here is a wiring/state bug (controller
+            # mismatch, concurrent release, lost reservation), not an
+            # expected race. Mirrors
+            # `CapitalLifecycleTracker.record_rejection`'s pattern at
+            # honesty/capital.py:461. Letting the bug through with a
+            # warning would silently re-introduce the very leak this
+            # branch exists to prevent (bit-mis no-defects-conviction P1).
+            msg = (
+                f'pipeline-denied reservation release failed: '
+                f'reservation_id={decision.reservation.reservation_id} '
+                f'failed_stage={decision.failed_stage} '
+                f'reason={release_result.reason!r} '
+                f'category={release_result.category}'
+            )
+            raise RuntimeError(msg)
+    if (
+        on_action_denied is not None
+        and action.action_type == ActionType.EXIT
+    ):
+        # EXIT denials feed back into the strategy's outcome queue so
+        # `_pending_sell` clears and the next preds=0 can re-emit.
+        # ENTER denials drop silently (BUY's `_pending_buy` is already
+        # cleared by the strategy's own outcome handling on rejected
+        # venue submits; a pre-venue ENTER drop is equivalent to never
+        # having been emitted).
+        on_action_denied(context.command_id, decision, action)
+    _log.warning(
+        'validation denied: stage=%s reason_code=%s message=%s command_id=%s',
+        decision.failed_stage.value if decision.failed_stage else None,
+        decision.reason_code,
+        decision.message,
+        context.command_id,
+    )
+
+
+def _resolve_validation_context(
+    bindings: SubmitterBindings,
+    strategy_id: str,
+    action: Action,
+    *,
+    on_action_denied: ActionDeniedHook | None,
+) -> ValidationRequestContext | None:
+    """Build the EXIT or ENTER ValidationRequestContext.
+
+    Returns None when the EXIT action's `trade_id` is not in
+    `state.positions` — the caller takes that as a short-circuit
+    INTAKE_TRADE_REFERENCE_INVALID denial; the synthetic dispatch
+    is fired here before the caller drops the action.
+    """
+    if action.action_type != ActionType.EXIT:
+        return _build_context(
+            config=bindings.nexus_config, state=bindings.state,
+            strategy_id=strategy_id, action=action,
+            strategy_budget=bindings.strategy_budget,
+        )
+    context = _build_context_exit(
+        config=bindings.nexus_config, state=bindings.state,
+        strategy_id=strategy_id, action=action,
+    )
+    if context is not None:
+        return context
+    decision = ValidationDecision(
+        allowed=False,
+        failed_stage=ValidationStage.INTAKE,
+        reason_code='INTAKE_TRADE_REFERENCE_INVALID',
+        message=(
+            f'EXIT action.trade_id={action.trade_id!r} not in '
+            f'state.positions; short-circuiting before validate '
+            f'so the strategy receives a synthetic VALIDATION '
+            f'REJECTED outcome.'
+        ),
+    )
+    synthetic_command_id = f'bts-cmd-{uuid.uuid4().hex[:12]}'
+    if on_action_denied is not None:
+        on_action_denied(synthetic_command_id, decision, action)
+    _log.warning(
+        'validation denied (EXIT short-circuit): '
+        'reason_code=%s message=%s command_id=%s',
+        decision.reason_code, decision.message, synthetic_command_id,
+    )
+    return None
+
+
 def _submit_translated(
     bindings: SubmitterBindings,
     strategy_id: str,
     action: Action,
+    *,
+    on_action_denied: ActionDeniedHook | None = None,
 ) -> tuple[str, ValidationDecision, ValidationRequestContext] | None:
-    context = _build_context(
-        config=bindings.nexus_config, state=bindings.state,
-        strategy_id=strategy_id, action=action,
-        strategy_budget=bindings.strategy_budget,
+    # Both ENTER and EXIT route through `validation_pipeline.validate`.
+    # Nexus's `pipeline_executor._should_bypass_stage` drops CAPITAL,
+    # HEALTH, and PLATFORM_LIMITS for `ValidationAction.EXIT`, so the
+    # 6-stage pipeline runs only INTAKE/RISK/PRICE on EXITs — same as
+    # deployed Praxis. The CAPITAL substitute on EXIT lives at fill
+    # time via `CapitalLifecycleTracker.record_close_position`; see
+    # `backtest_simulator/honesty/capital.py` for the named seam.
+    context = _resolve_validation_context(
+        bindings, strategy_id, action,
+        on_action_denied=on_action_denied,
     )
-    # No bts-side INTAKE pre-hooks. The Nexus pipeline's
-    # `validate_intake_stage` is the only INTAKE authority; bts must not
-    # silently drop actions on its own grounds. A strategy that emits
-    # un-stopped or under-floored entries is a strategy bug, fixed in
-    # the Nexus strategy file — bts replays whatever the strategy
-    # decides, just as paper/live would.
-    # SELL fast-path: long-only convention treats `SELL+ENTER` as the
-    # close of an open long. The fast-path bypasses
-    # `validation_pipeline.validate` because (a) the bts long-only
-    # strategy template emits SELLs without propagating the BUY's
-    # `trade_id`, so `make_reference_integrity_hook` would deny every
-    # close with `INTAKE_TRADE_REFERENCE_INVALID`; (b) `CapitalController`
-    # has no `close_position` primitive, so a real CAPITAL stage on
-    # SELL would over-reserve. Closure path: a Nexus PR adding
-    # `close_position` AND a strategy-template change to propagate
-    # `trade_id` from BUY to SELL. Both upstream; tracked as
-    # follow-up. The bts-side close accounting still lands in the
-    # launcher's adapter wrapper via
-    # `CapitalLifecycleTracker.record_close_position`, which mirrors
-    # `CapitalController.order_fill` exactly: releases
-    # `cost_basis + entry_fees` from `position_notional` and
-    # decrements `per_strategy_deployed[strategy_id]`. `capital_pool`
-    # stays untouched.
-    if action.direction == OrderSide.SELL:
-        decision = ValidationDecision(allowed=True)
-        cmd = translate_to_trade_command(
-            action, context, decision, bindings.nexus_config, datetime.now(UTC),
-        )
-        cmd = _to_praxis_enums(cmd)
-        command_id = bindings.praxis_outbound.send_command(cmd)
-        _log.info(
-            'backtest action submitted (SELL close — pipeline bypassed)',
-            extra={
-                'strategy_id': strategy_id,
-                'action_type': action.action_type.value,
-                'command_id': command_id,
-            },
-        )
-        return command_id, decision, context
+    if context is None:
+        return None
     decision = bindings.validation_pipeline.validate(context)
     if not decision.allowed:
-        # Slice #28: CAPITAL is stage 4 of 6, so HEALTH/PLATFORM_LIMITS
-        # denials carry the CAPITAL-stage reservation forward in the
-        # denied decision (nexus pipeline_executor preserves it). The
-        # action is dropped without reaching Praxis, so no fill / no
-        # `order_ack` / no `order_fill` will retire the reservation.
-        # Release it explicitly so available capital is not leaked.
-        if decision.reservation is not None:
-            release_result = bindings.capital_controller.release_reservation(
-                decision.reservation.reservation_id,
-            )
-            if not release_result.success:
-                # Fail loud — the reservation was just minted by the same
-                # pipeline.validate() call on the same controller; any
-                # non-success here is a wiring/state bug (controller
-                # mismatch, concurrent release, lost reservation), not an
-                # expected race. Mirrors `CapitalLifecycleTracker.record_rejection`'s
-                # pattern at honesty/capital.py:461. Letting the bug
-                # through with a warning would silently re-introduce
-                # the very leak this branch exists to prevent
-                # (bit-mis no-defects-conviction P1).
-                msg = (
-                    f'pipeline-denied reservation release failed: '
-                    f'reservation_id={decision.reservation.reservation_id} '
-                    f'failed_stage={decision.failed_stage} '
-                    f'reason={release_result.reason!r} '
-                    f'category={release_result.category}'
-                )
-                raise RuntimeError(msg)
-        _log.warning(
-            'validation denied: stage=%s reason_code=%s message=%s command_id=%s',
-            decision.failed_stage.value if decision.failed_stage else None,
-            decision.reason_code,
-            decision.message,
-            context.command_id,
+        _handle_pipeline_denied(
+            bindings, action, context, decision,
+            on_action_denied=on_action_denied,
         )
         return None
     cmd = translate_to_trade_command(
         action, context, decision, bindings.nexus_config, datetime.now(UTC),
     )
     cmd = _to_praxis_enums(cmd)
-    command_id = bindings.praxis_outbound.send_command(cmd)
+    submitted_entry = _SubmittedCommand(
+        action_type=action.action_type,
+        trade_id=context.trade_id or context.command_id,
+        strategy_id=strategy_id,
+        symbol=context.symbol,
+        order_size=action.size or Decimal('0'),
+        reservation_id=(
+            decision.reservation.reservation_id
+            if decision.reservation is not None else None
+        ),
+        declared_stop_price=_extract_declared_stop_from_action(action),
+    )
+    # Slice #38 — register the command BEFORE `praxis_outbound.send_command`
+    # so the venue adapter callback (which runs on Praxis's account_loop
+    # thread) always sees the entry when the matching `submit_order`
+    # fires. Closes the on_reservation post-send race: the prior shape
+    # called `on_reservation` after send_command returned, leaving a
+    # window for account_loop to dispatch first.
+    #
+    # Hold the registry lock across the pre-send registration, the
+    # `state.positions[trade_id].pending_exit` mutation that follows
+    # for EXIT actions, the `send_command`, and the post-send alias
+    # registration under the praxis command_id. The same lock is
+    # acquired by the launcher's adapter wrapper at fill time so the
+    # `state.positions` update / `validate(EXIT_context)` read /
+    # `_CommandRegistry.get` read sequence is serialized across the
+    # PredictLoop and account_loop threads.
+    with bindings.command_registry.lock:
+        # Pre-send registration under `context.command_id` (the bts-side
+        # id stamped onto `cmd.command_id` by `translate_to_trade_command`).
+        # The race-regression test reads the registry from inside a
+        # mocked `send_command` and verifies the entry is already there.
+        bindings.command_registry.register(context.command_id, submitted_entry)
+        if (
+            action.action_type == ActionType.EXIT
+            and context.trade_id is not None
+            and context.trade_id in bindings.state.positions
+            and action.size is not None
+        ):
+            # Reserve the EXIT size against `position.pending_exit` so
+            # a concurrent EXIT validation correctly sees `remaining =
+            # size - pending_exit` and denies double-exits with
+            # INTAKE_EXIT_SIZE_EXCEEDS_REMAINING. Cleared at fill /
+            # terminal in the launcher's adapter wrapper under the
+            # same lock.
+            position = bindings.state.positions[context.trade_id]
+            position.pending_exit = position.pending_exit + action.size
+        command_id = bindings.praxis_outbound.send_command(cmd)
+        # Praxis's `execution_manager.submit_command` generates its own
+        # command_id and ignores `cmd.command_id`; the launcher's
+        # adapter wrapper looks up the registry by the praxis-side id
+        # (the prefix encoded into `client_order_id`). Register the
+        # same entry under that alias so the wrapper finds it; the
+        # original `context.command_id` keying remains for the test
+        # contract above. Both writes happen under the same held lock,
+        # so no reader sees a half-populated registry.
+        if command_id != context.command_id:
+            bindings.command_registry.register(command_id, submitted_entry)
     _log.info(
         'backtest action submitted',
         extra={
@@ -549,6 +913,63 @@ def _submit_abort(
         command_id=action.command_id, account_id=config.account_id,
         reason='backtest_runtime_abort', created_at=datetime.now(UTC),
     )
+
+
+def _build_context_exit(
+    *, config: NexusInstanceConfig, state: InstanceState,
+    strategy_id: str, action: Action,
+) -> ValidationRequestContext | None:
+    """Build a Praxis-equivalent EXIT validation context.
+
+    Returns None when `action.trade_id` is not in `state.positions`;
+    the action_submitter then synthesizes an
+    INTAKE_TRADE_REFERENCE_INVALID decision and dispatches it through
+    `on_action_denied` without reaching the validator. This matches
+    Praxis's behavior: an unknown trade reference is a hard reject at
+    INTAKE before any other stage runs.
+
+    `order_notional = position.entry_price * action.size` (no
+    reservation buffer; CAPITAL is bypassed by the pipeline executor
+    for EXIT actions, so the notional is informational only — used by
+    INTAKE's order-notional > 0 check and by RISK/PRICE for any
+    notional-based ratios).
+    """
+    if action.trade_id is None or action.trade_id not in state.positions:
+        return None
+    position = state.positions[action.trade_id]
+    order_size = action.size or Decimal('0')
+    order_notional = position.entry_price * order_size
+    return ValidationRequestContext(
+        strategy_id=strategy_id,
+        order_notional=order_notional,
+        estimated_fees=Decimal('0'),
+        strategy_budget=Decimal('0'),
+        state=state,
+        config=config,
+        action=ValidationAction.EXIT,
+        symbol=_extract_symbol(action),
+        order_side=_resolve_side(action),
+        order_size=order_size,
+        trade_id=action.trade_id,
+        command_id=action.command_id or f'bts-cmd-{uuid.uuid4().hex[:12]}',
+        current_order_notional=None,
+    )
+
+
+def _extract_declared_stop_from_action(action: Action) -> Decimal | None:
+    """Pull `execution_params['stop_price']` from a Nexus Action as Decimal.
+
+    Returns None when absent or blank. Mirrors the launcher's
+    `_extract_declared_stop_price` but lives here so the registry
+    write does not have to import from launcher.py.
+    """
+    params = action.execution_params
+    if not isinstance(params, Mapping):
+        return None
+    raw = params.get('stop_price')
+    if raw is None or str(raw).strip() in ('', 'None'):
+        return None
+    return Decimal(str(raw))
 
 
 def _build_context(

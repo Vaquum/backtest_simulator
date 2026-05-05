@@ -1,3 +1,34 @@
+# v2.3.6
+
+SELL-exit validator-parity slice — kill the SELL fast-path. ENTER and
+EXIT both flow through `validation_pipeline.validate`; Nexus's
+`pipeline_executor._should_bypass_stage` drops CAPITAL/HEALTH/
+PLATFORM_LIMITS for `ValidationAction.EXIT`, so the 6-stage pipeline
+runs only INTAKE/RISK/PRICE on EXITs — same as deployed Praxis.
+
+The bts long-only strategy template now emits SELL with
+`action_type=EXIT` and `trade_id=self._open_trade_id` (captured from
+`outcome.command_id` at BUY fill). The launcher's adapter wrapper
+populates `state.positions[command_id]` on BUY fill so the EXIT
+INTAKE stage's reference-integrity hook resolves cleanly. Validation-
+denied SELLs feed back through the per-account outcome queue as
+synthetic `TradeOutcome(REJECTED, reject_reason='VALIDATION:<code>:
+<msg>')` so `_pending_sell` clears and the next preds=0 can re-emit.
+
+The new `_CommandRegistry` (in `launcher/action_submitter.py`) is
+written BEFORE `praxis_outbound.send_command` under a shared lock so
+the venue adapter callback always sees the entry when the matching
+`submit_order` fires — closes the post-send race the prior
+`on_reservation` hook left open. The same lock guards
+`state.positions` mutations (BUY-fill writes / SELL-emit `pending_exit`
+increment / SELL-fill pop) across the PredictLoop and account_loop
+threads.
+
+`CapitalLifecycleTracker.record_close_position` is now explicitly
+named the EXIT capital substitute seam in its docstring; the upstream
+closure path (`CapitalController.close_position`) is referenced in-
+line so the seam can be retired the moment that PR lands.
+
 # v2.3.5
 
 Drop the two bts-side INTAKE pre-hooks (`_check_declared_stop`,
