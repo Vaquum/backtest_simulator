@@ -642,3 +642,9 @@ class Strategy(_StrategyBase):
     ) -> list[Action]:
         del params, context
         return []
+
+
+# Slice #38 MVC name. Nexus's strategy loader binds to the exact
+# attribute `Strategy` (see class docstring), so this is a pure
+# alias kept alongside that loader-mandated name.
+LongOnSignalStrategy = Strategy
