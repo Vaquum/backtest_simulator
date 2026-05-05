@@ -149,6 +149,9 @@ def _strategy_in_long_state(
     strategy._pending_buy = False
     strategy._pending_sell = pending_sell
     strategy._must_close_outstanding = must_close
+    # Slice #38 — SELL EXITs require trade_id; mirror the value the
+    # strategy normally captures from outcome.command_id at BUY fill.
+    strategy._open_trade_id = 'fixture-buy-cmd'
     return strategy
 
 

@@ -515,6 +515,17 @@ class CapitalLifecycleTracker:
     ) -> tuple[Decimal, _OpenPosition]:
         """FIFO-match a SELL fill against the oldest open position.
 
+        This is the **EXIT capital substitute seam**. Nexus's
+        `CapitalController` has no `close_position` primitive, so
+        calling `order_fill` on a SELL would double-deploy capital
+        and `check_and_reserve(EXIT_notional)` would over-reserve.
+        bts substitutes this method to invert the BUY's deployment
+        exactly. The pipeline_executor's bypass of CAPITAL on EXIT
+        is upstream behavior; this seam is the matching closure on
+        the bts side. The closure path is a
+        `CapitalController.close_position` PR upstream in Nexus;
+        once landed, this seam can be retired.
+
         Returns `(realized_pnl, closed_position)`. Mutates
         `capital_state` to reverse the BUY's deployment exactly:
           - `position_notional -= (cost_basis + entry_fees)` —

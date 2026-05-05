@@ -411,24 +411,30 @@ def test_release_reservation_failure_fails_loud() -> None:
 
 
 def test_sell_fast_path_documented_in_source() -> None:
-    """The bts-only SELL fast-path's bypass reasons are visible in source.
+    """Slice #38 — SELL exits route through `validation_pipeline.validate`.
 
-    Slice #28 deliberately leaves the SELL close path bypassing
-    `validation_pipeline.validate` because (a) the long-only strategy
-    template does not propagate `Action.trade_id` from BUY to SELL, so
-    Nexus's `make_reference_integrity_hook` would deny every close on
-    `INTAKE_TRADE_REFERENCE_INVALID`, and (b) `CapitalController` has
-    no `close_position` primitive. Both follow-ups are upstream
-    Nexus/strategy work tracked at slice merge. The divergence stays
-    explicit in the source comment so a future reviewer sees the
-    debt rather than an unexplained `if action.direction == OrderSide.SELL:`.
+    The earlier SELL fast-path is gone; the source comment now names
+    the executor-side EXIT bypass (CAPITAL/HEALTH/PLATFORM_LIMITS) and
+    the bts-side capital substitute seam at fill time. Future reviewers
+    see the parity-with-Praxis posture in the comment instead of the
+    pre-fix `if action.direction == OrderSide.SELL:` shortcut.
     """
     submitter_src = (
         Path(__file__).resolve().parents[2]
         / 'backtest_simulator' / 'launcher' / 'action_submitter.py'
     ).read_text(encoding='utf-8')
-    assert 'pipeline bypassed' in submitter_src
-    for marker in ('trade_id', 'close_position'):
-        assert marker in submitter_src
+    assert 'pipeline bypassed' not in submitter_src, (
+        'SELL fast-path comment must not return — slice #38 routes EXITs '
+        'through validation_pipeline.validate.'
+    )
+    # The replacement comment at the same site names the executor's
+    # EXIT-stage bypass and the capital substitute seam.
+    for marker in (
+        'pipeline_executor', '_should_bypass_stage',
+        'record_close_position', 'EXIT',
+    ):
+        assert marker in submitter_src, (
+            f'expected slice-#38 marker {marker!r} in action_submitter.py'
+        )
 
 

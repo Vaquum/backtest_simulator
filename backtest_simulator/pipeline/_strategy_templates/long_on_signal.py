@@ -19,8 +19,15 @@ _log = logging.getLogger(__name__)
 
 # Baked-in config. ManifestBuilder substitutes this literal JSON string
 # when copying the template; before substitution the strategy would
-# still parse cleanly but would exit early at on_startup.
-_BAKED_CONFIG: dict[str, object] = json.loads('__BTS_PARAMS__')
+# still parse cleanly but would exit early at on_startup. The unparsed
+# raw form is held on the module so importing the template directly
+# (e.g. for unit tests that monkey-patch the class) does not try to
+# json.loads the placeholder.
+_BAKED_CONFIG_RAW = '__BTS_PARAMS__'
+
+
+def _load_baked_config() -> dict[str, object]:
+    return json.loads(_BAKED_CONFIG_RAW)
 
 
 class _Config:
@@ -85,7 +92,8 @@ class Strategy(_StrategyBase):
         # the mechanism ManifestBuilder uses to carry per-instance config
         # to each strategy file.
         del params, context
-        force_flatten_raw = _BAKED_CONFIG.get('force_flatten_after')
+        baked = _load_baked_config()
+        force_flatten_raw = baked.get('force_flatten_after')
         force_flatten_after = (
             None if force_flatten_raw is None
             else datetime.fromisoformat(str(force_flatten_raw))
@@ -106,15 +114,13 @@ class Strategy(_StrategyBase):
             )
             raise ValueError(msg)
         self._config = _Config(
-            symbol=str(_BAKED_CONFIG['symbol']),
-            capital=Decimal(str(_BAKED_CONFIG['capital'])),
-            kelly_pct=Decimal(str(_BAKED_CONFIG['kelly_pct'])),
-            estimated_price=Decimal(str(_BAKED_CONFIG['estimated_price'])),
-            stop_bps=Decimal(str(_BAKED_CONFIG['stop_bps'])),
+            symbol=str(baked['symbol']),
+            capital=Decimal(str(baked['capital'])),
+            kelly_pct=Decimal(str(baked['kelly_pct'])),
+            estimated_price=Decimal(str(baked['estimated_price'])),
+            stop_bps=Decimal(str(baked['stop_bps'])),
             force_flatten_after=force_flatten_after,
-            maker_preference=bool(
-                _BAKED_CONFIG.get('maker_preference', False),
-            ),
+            maker_preference=bool(baked.get('maker_preference', False)),
         )
         # Fresh-start defaults; `on_load` overwrites if persisted state exists.
         self._long: bool = False
@@ -137,20 +143,21 @@ class Strategy(_StrategyBase):
         # round 2 P2 caught this. Set on SELL emit, cleared in
         # `on_outcome` for SELL outcomes (terminal or fill).
         self._pending_sell: bool = False
+        # Slice #38 — captured from `outcome.command_id` at the BUY
+        # fill so SELL emits with `trade_id=self._open_trade_id` for
+        # `state.positions` lookup at EXIT validation. Praxis
+        # convention: BUY emits with `trade_id=None` (runtime assigns
+        # via cmd.command_id); the strategy then mirrors the assigned
+        # id forward onto the matching SELL. Without this propagation
+        # the EXIT INTAKE stage denies every close with
+        # `INTAKE_TRADE_REFERENCE_INVALID`.
+        self._open_trade_id: str | None = None
         # `_must_close_outstanding` is the deferred-retry latch.
         # Set when a SELL outcome leaves the position open
         # (PARTIAL with residual, or EXPIRED zero-fill); the next
         # `on_signal` consumes it and re-emits the SELL on the
         # next clock tick. Operator invariant — exit-only:
         #   "you keep doing until you have gotten out".
-        # Deferring to next tick (vs returning a retry action
-        # from `on_outcome`) avoids a same-tape walk that would
-        # re-consume already-filled liquidity (PARTIAL) or loop
-        # on the same instant (EXPIRED zero-fill). Cleared on
-        # full close (FILLED, or PARTIAL that brings
-        # `_entry_qty` to zero), or on a hard rejection
-        # (REJECTED/CANCELED) where re-emit would just hit the
-        # same gate.
         self._must_close_outstanding: bool = False
         _log.info(
             'LongOnSignal startup: symbol=%s capital=%s kelly_pct=%s est_price=%s',
@@ -322,8 +329,21 @@ class Strategy(_StrategyBase):
         )
         if is_buy_maker:
             execution_params['price'] = str(self._config.estimated_price)
+        # Slice #38: BUY emits with `action_type=ENTER, trade_id=None`
+        # (Praxis convention; runtime assigns the trade_id via
+        # `cmd.command_id`). SELL emits with `action_type=EXIT,
+        # trade_id=self._open_trade_id` (captured from the BUY's fill
+        # outcome) so the EXIT INTAKE stage finds
+        # `state.positions[trade_id]` and the close routes through
+        # the same Praxis-equivalent validators (INTAKE/RISK/PRICE).
+        if side == OrderSide.SELL:
+            action_type_value = ActionType.EXIT
+            trade_id_value = self._open_trade_id
+        else:
+            action_type_value = ActionType.ENTER
+            trade_id_value = None
         return Action(
-            action_type=ActionType.ENTER,
+            action_type=action_type_value,
             direction=side, size=qty,
             execution_mode=ExecutionMode.SINGLE_SHOT,
             order_type=order_type_value,
@@ -334,7 +354,7 @@ class Strategy(_StrategyBase):
             # `timeout = action.deadline` via Nexus's praxis_outbound.
             # 60s is a reasonable fill window for a backtest MARKET order.
             deadline=60,
-            trade_id=None, command_id=None,
+            trade_id=trade_id_value, command_id=None,
             maker_preference=None,
             # `reference_price` is what the action-submitter multiplies
             # by `size` to produce the order's notional for the CAPITAL
@@ -389,6 +409,27 @@ class Strategy(_StrategyBase):
         from nexus.infrastructure.praxis_connector.trade_outcome_type import (
             TradeOutcomeType,
         )
+        # Slice #38 — synthetic VALIDATION-denied REJECTED outcomes
+        # arrive when the action_submitter denies an EXIT (e.g. trade
+        # reference invalid, size exceeds remaining, RISK/PRICE stage
+        # denial) and dispatches a synthetic
+        # `TradeOutcome(REJECTED, reject_reason='VALIDATION:<code>: <msg>')`
+        # so the strategy's `_pending_sell` gate clears. Without this
+        # branch a denied SELL would leave `_pending_sell=True` forever
+        # (no `on_outcome` ever fires for the synthetic command_id) and
+        # the next preds=0 would never re-emit. The `_open_trade_id`
+        # is preserved so the next emit still references the same
+        # open position.
+        if (
+            outcome.outcome_type == TradeOutcomeType.REJECTED
+            and (outcome.reject_reason or '').startswith('VALIDATION:')
+        ):
+            self._pending_sell = False
+            _log.info(
+                'SELL denied at validation: %s; cleared _pending_sell',
+                outcome.reject_reason,
+            )
+            return []
         is_buy = self._is_buy_command(outcome.command_id)
         if outcome.outcome_type.is_fill:
             if outcome.fill_size is None:
@@ -401,6 +442,16 @@ class Strategy(_StrategyBase):
             if is_buy:
                 self._long = True
                 self._entry_qty += outcome.fill_size
+                # Slice #38 — capture the runtime-assigned trade_id
+                # from the BUY fill so the matching SELL can emit
+                # with `trade_id=self._open_trade_id`. Praxis sets
+                # `cmd.command_id` to a fresh uuid in
+                # `execution_manager.submit_command`, so this is the
+                # ID the EXIT INTAKE stage will look up in
+                # `state.positions`. The launcher's adapter wrapper
+                # populates `state.positions[command_id]` on the
+                # same fill so the read at SELL time is consistent.
+                self._open_trade_id = outcome.command_id
                 # Codex P1 caught: in this backtest the maker
                 # engine evaluates the entire post-submit lookahead
                 # in one shot, so a PARTIAL outcome is TERMINAL
@@ -411,9 +462,10 @@ class Strategy(_StrategyBase):
                 # `_is_buy_command`. Clear pending on any fill.
                 self._pending_buy = False
                 _log.info(
-                    'on_outcome BUY %s: fill_size=%s entry_qty=%s long=True',
+                    'on_outcome BUY %s: fill_size=%s entry_qty=%s long=True '
+                    'open_trade_id=%s',
                     outcome.outcome_type.value, outcome.fill_size,
-                    self._entry_qty,
+                    self._entry_qty, self._open_trade_id,
                 )
                 # Force-flatten edge case: a maker LIMIT BUY emitted
                 # before the cutoff can fill (via on_outcome) AFTER
@@ -518,6 +570,9 @@ class Strategy(_StrategyBase):
         ):
             self._long = False
             self._entry_qty = Decimal('0')
+            # Slice #38 — position fully closed, drop the captured
+            # trade_id so the next BUY fill captures a fresh one.
+            self._open_trade_id = None
         # SELL outcome arrived — re-open the pending-sell gate so
         # a subsequent preds=0 (e.g. after a bounce-and-bust
         # signal flip) can re-issue.
@@ -564,10 +619,10 @@ class Strategy(_StrategyBase):
         # across runs in this slice.
         self._pending_buy = bool(payload.get('pending_buy', False))
         self._pending_sell = bool(payload.get('pending_sell', False))
-        # `must_close_outstanding` persists across snapshot+restore
-        # so a multi-tick window that snapshots mid-retry-loop
-        # picks up the latch on resume. Defaults False for older
-        # snapshots that pre-date this slice.
+        open_trade_id_raw = payload.get('open_trade_id')
+        self._open_trade_id = (
+            str(open_trade_id_raw) if open_trade_id_raw else None
+        )
         self._must_close_outstanding = bool(
             payload.get('must_close_outstanding', False),
         )
@@ -577,6 +632,7 @@ class Strategy(_StrategyBase):
             'long': self._long, 'entry_qty': str(self._entry_qty),
             'pending_buy': self._pending_buy,
             'pending_sell': self._pending_sell,
+            'open_trade_id': self._open_trade_id,
             'must_close_outstanding': self._must_close_outstanding,
         }
         return json.dumps(payload).encode('utf-8')
@@ -586,3 +642,9 @@ class Strategy(_StrategyBase):
     ) -> list[Action]:
         del params, context
         return []
+
+
+# Slice #38 MVC name. Nexus's strategy loader binds to the exact
+# attribute `Strategy` (see class docstring), so this is a pure
+# alias kept alongside that loader-mandated name.
+LongOnSignalStrategy = Strategy

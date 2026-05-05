@@ -109,7 +109,7 @@ def test_force_flatten_emits_sell_at_cutoff_signal_when_long(
     )
 
     assert len(actions) == 1
-    assert actions[0].action_type == ActionType.ENTER
+    assert actions[0].action_type == ActionType.EXIT
     assert actions[0].direction == OrderSide.SELL
 
 
