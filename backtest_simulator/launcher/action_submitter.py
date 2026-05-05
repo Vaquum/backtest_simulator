@@ -466,7 +466,9 @@ def build_action_submitter(
     """
     def _submit(actions: list[Action], strategy_id: str) -> None:
         for raw_action in actions:
-            normalized = _normalize_legacy_enter_sell(raw_action, bindings.state)
+            normalized = _normalize_legacy_enter_sell(
+                raw_action, bindings.state, strategy_id=strategy_id,
+            )
             action = _maybe_refresh_limit_to_touch(
                 normalized,
                 touch_provider=bindings.touch_provider,
@@ -579,7 +581,9 @@ def release_sell_pending_exit(
         registry.pop(sell_command_id)
 
 
-def _normalize_legacy_enter_sell(action: Action, state: InstanceState) -> Action:
+def _normalize_legacy_enter_sell(
+    action: Action, state: InstanceState, *, strategy_id: str,
+) -> Action:
     """Convert legacy `ENTER+SELL` actions (pre-slice-#38) into `EXIT+SELL`.
 
     Several bts-side strategies under `backtest_simulator/strategies/`
@@ -602,11 +606,12 @@ def _normalize_legacy_enter_sell(action: Action, state: InstanceState) -> Action
     For direct-action_submitter test fixtures that never drive the
     launcher's adapter wrapper, `state.positions` would otherwise be
     empty when the SELL leg arrives. We seed a placeholder Position
-    derived from the action's own size/reference_price so the EXIT
-    INTAKE stage finds a matching trade. Real backtest flows
-    populate `state.positions` via the wrapper at fill time, so the
-    placeholder is overwritten or harmlessly co-resident with the
-    real fill data.
+    derived from the action's own size/reference_price and stamp the
+    caller's `strategy_id` onto it so the EXIT-stage strategy
+    consistency check (`INTAKE_EXIT_STRATEGY_MISMATCH`) accepts the
+    cross-thread close. Real backtest flows populate `state.positions`
+    via the wrapper at fill time, so the placeholder is overwritten
+    or harmlessly co-resident with the real fill data.
     """
     if action.action_type != ActionType.ENTER or action.direction != OrderSide.SELL:
         return action
@@ -617,17 +622,19 @@ def _normalize_legacy_enter_sell(action: Action, state: InstanceState) -> Action
     # the lifecycle correctly; this branch only fires when no wrapper
     # is in the loop (test fixtures bypassing it).
     legacy_id = 'legacy-bts-singleton'
-    if not state.positions:
-        state.positions[legacy_id] = _build_legacy_position(legacy_id, action)
-    elif legacy_id in state.positions:
-        state.positions[legacy_id] = _build_legacy_position(legacy_id, action)
+    if not state.positions or legacy_id in state.positions:
+        state.positions[legacy_id] = _build_legacy_position(
+            legacy_id, action, strategy_id=strategy_id,
+        )
     trade_id = next(iter(state.positions))
     return dataclasses.replace(
         action, action_type=ActionType.EXIT, trade_id=trade_id,
     )
 
 
-def _build_legacy_position(trade_id: str, sell_action: Action) -> object:
+def _build_legacy_position(
+    trade_id: str, sell_action: Action, *, strategy_id: str,
+) -> object:
     """Synthesize a Position matching the SELL's own size/reference price.
 
     Direct-action_submitter test fixtures simulate fills outside the
@@ -636,11 +643,13 @@ def _build_legacy_position(trade_id: str, sell_action: Action) -> object:
     would have filled at the same Kelly-sized qty; `entry_price` falls
     back to `reference_price` (the strategy's seed price) which is the
     same number production fills against when the venue tape is empty.
+    `strategy_id` is the caller's strategy id so the EXIT-stage
+    `INTAKE_EXIT_STRATEGY_MISMATCH` check accepts the close.
     """
     from nexus.core.domain.instance_state import Position
     return Position(
         trade_id=trade_id,
-        strategy_id='legacy',
+        strategy_id=strategy_id,
         symbol=_extract_symbol(sell_action),
         side=OrderSide.BUY,
         size=sell_action.size or Decimal('1'),
