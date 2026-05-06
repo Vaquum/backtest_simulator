@@ -62,6 +62,10 @@
             "integration_id": 15368
           },
           {
+            "context": "pr_checks_golden_sweep",
+            "integration_id": 15368
+          },
+          {
             "context": "pr_checks_typing",
             "integration_id": 15368
           },

@@ -1,3 +1,51 @@
+# v2.6.0
+
+Slice 1 (The-Plan.md) — canonical golden sweep gate. The deterministic
+contract slice 0 unlocked is now mechanically protected: `bts sweep`
+runs against locked fixtures (`tests/fixtures/canonical/bundle.zip` +
+`klines.parquet` + `trades.parquet`, all SHA256-pinned) twice per CI
+job, and the four normalized artefact streams (stdout, stderr,
+sweep_per_window.csv, sweep_per_tick.csv) must be byte-equal across
+the two runs AND byte-equal to `tests/fixtures/canonical/expected/*`.
+Any code change that shifts a price, a trade count, a decoder pick,
+or a stats-summary line surfaces here as a fail. Wired into branch
+protection via the new required check `pr_checks_golden_sweep`.
+
+`bts sweep` gains one operator-facing arg: `--trades-tape PATH`.
+When set, sweep treats the parquet at PATH as the canonical trade
+tape for the replay window and skips every ClickHouse round-trip
+(preflight + prefetch + per-day buy-hold seed-price lookups). The
+golden test uses this to run hermetically — verified end-to-end with
+junk CH credentials (`CLICKHOUSE_HOST=invalid.example.com
+CLICKHOUSE_PASSWORD=junk`) and 8/8 pass. Default behaviour (no flag)
+is byte-identical to before.
+
+Files:
+
+- `backtest_simulator/cli/commands/sweep.py` — `--trades-tape`
+  argparse option + three branches inside `_run`: skip
+  `preflight_tunnel()` when set, use the path directly instead of
+  `prefetch_sweep_trades` cache + CH query, and build a
+  parquet-backed seed-price callable for the buy-hold benchmark.
+- `tests/golden/test_bts_sweep_canonical.py` — runs `bts sweep`
+  twice with `--trades-tape <fixture>` and `--session-id <unique>`,
+  isolated `HOME` / `XDG_CACHE_HOME` / `HF_HOME`. SHA256-checks
+  every input fixture before launching. 8 byte-equal assertions
+  total (2 axes × 4 streams).
+- `tools/normalize_sweep_outputs.py` — scrubs `[X.XXs]` durations,
+  klines-cache `age=`, session paths/ids, parallel completion
+  index `(N/M, ...)`, total wall-time `done N run(s) in X.Xs`, the
+  `trained` vs `cached` filter-pool first-run/cache-warm split.
+  Sorts CSV rows + stdout lines so parallel-completion order does
+  not drive byte-equality.
+- `tests/fixtures/canonical/{bundle.zip, klines.parquet,
+  trades.parquet, checksums.sha256, expected/*}` — locked canonical
+  inputs and the matching expected outputs.
+- `.github/workflows/pr_checks_golden_sweep.yml` — CI job (Python
+  3.12 + integration extra; no CH / HF secrets needed).
+- `.github/rulesets/main.json` + `tests/fixtures/github/ruleset_*` —
+  add `pr_checks_golden_sweep` as a required status check.
+
 # v2.5.0
 
 Slice 0 (#64) — replace the racy `threading.Timer` clock with a

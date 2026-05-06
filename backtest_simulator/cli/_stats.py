@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from datetime import time as dtime
 from decimal import Decimal
+from pathlib import Path
 
 import polars as pl
 from scipy.stats import kurtosis, skew
@@ -117,6 +118,51 @@ def fetch_buy_hold_benchmark(
         close_p = seed_price_at(we)
         out.append(float((close_p - open_p) / open_p))
     return out
+
+
+def make_seed_price_from_parquet(
+    tape_path: Path,
+) -> Callable[[datetime], Decimal]:
+    """Return a `seed_price_at`-shape callable backed by a local trades
+    parquet — same `time` + `price` columns the live ClickHouse query
+    `SELECT price FROM origo.binance_daily_spot_trades WHERE
+    datetime >= %s ORDER BY datetime LIMIT 1` would return, no
+    network round-trip. Used by `bts sweep --trades-tape PATH` to
+    skip the per-day buy-hold seed-price CH calls.
+    """
+    import polars as _pl
+    frame = _pl.read_parquet(str(tape_path)).set_sorted('time')
+    def _seed(ts: datetime) -> Decimal:
+        rows = frame.filter(_pl.col('time') >= ts).head(1)
+        if rows.is_empty():
+            msg = (
+                f'--trades-tape {tape_path} has no tick at or after '
+                f'{ts.isoformat()}; tape must cover every replay day '
+                f'open + close.'
+            )
+            raise RuntimeError(msg)
+        return Decimal(str(rows['price'][0]))
+    return _seed
+
+
+def announce_operator_trades_tape(tape_path: Path, t_start: float) -> str:
+    """Validate the operator-supplied `--trades-tape` parquet exists
+    and emit the standard `trades tape ready: ... (operator-supplied)`
+    line on stdout. Returns the path string for downstream subprocess
+    handoff. Raises `FileNotFoundError` on missing path so the caller
+    can fail loud with a clean exit.
+    """
+    import time as _time
+    if not tape_path.is_file():
+        msg = f'bts sweep: --trades-tape file not found: {tape_path}'
+        raise FileNotFoundError(msg)
+    elapsed = _time.perf_counter() - t_start
+    print(
+        f'[{elapsed:7.2f}s] trades tape ready: {tape_path.name} '
+        f'(operator-supplied)',
+        flush=True,
+    )
+    return str(tape_path)
 
 
 def compute_sweep_stats(

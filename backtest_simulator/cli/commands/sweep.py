@@ -62,10 +62,12 @@ from backtest_simulator.cli._signals_builder import (
     build_signals_table_for_decoder,
 )
 from backtest_simulator.cli._stats import (
+    announce_operator_trades_tape,
     compute_sweep_stats,
     cpcv_pbo,
     daily_return_for_run,
     fetch_buy_hold_benchmark,
+    make_seed_price_from_parquet,
 )
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
 from backtest_simulator.honesty.cpcv import CpcvPaths
@@ -300,17 +302,7 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
                        'within this many seconds AFTER each test '
                        'block (Lopez de Prado direction). Default: 0.'
                    ))
-    p.add_argument('--trades-tape', type=Path, default=None,
-                   help=(
-                       'Path to a pre-captured trades parquet covering '
-                       'the replay window (`time` + `price` + `qty` + '
-                       '`is_buyer_maker` + `trade_id`, time-sorted). '
-                       'When set, sweep skips the ClickHouse tunnel '
-                       'preflight + trades prefetch and reads every '
-                       'price lookup (slippage calibration, per-window '
-                       'feed, buy-hold benchmark) from this file. '
-                       'Default: None (live ClickHouse, default behaviour).'
-                   ))
+    p.add_argument('--trades-tape', type=Path, default=None, help='Pre-captured trades parquet covering the replay window. When set, skips CH preflight + prefetch + seed-price lookups.')
     add_verbosity_arg(p)
     p.set_defaults(func=_run)
 
@@ -453,15 +445,8 @@ def _run(args: argparse.Namespace) -> int:
         return 2
     hours_start, hours_end = _resolve_hours(args)
     days = _resolve_days(args)
-    # `--trades-tape` lets the operator hand sweep a pre-captured trade
-    # parquet for the replay window — skipping the live ClickHouse
-    # tunnel preflight + the upstream trades fetch. Default behaviour
-    # (no flag) is unchanged.
-    _operator_tape: Path | None = (
-        Path(args.trades_tape).expanduser().resolve()
-        if args.trades_tape is not None
-        else None
-    )
+    # `--trades-tape` short-circuits CH; default flow preflights as before.
+    _operator_tape: Path | None = Path(args.trades_tape).expanduser().resolve() if args.trades_tape else None
     if _operator_tape is None:
         preflight_tunnel()
     exp_code_path = Path(args.exp_code).expanduser().resolve()
@@ -664,33 +649,18 @@ def _run(args: argparse.Namespace) -> int:
     _t_trades = time.perf_counter()
     _trade_fetch_start = replay_start - timedelta(minutes=30)
     _trade_fetch_end = replay_end + timedelta(seconds=600)
-    _trades_parquet_path: str | None
+    _trades_parquet_path: str | None = None
     if _operator_tape is not None:
-        # Operator-supplied tape — no ClickHouse round-trip needed.
-        if not _operator_tape.is_file():
-            sys.stderr.write(
-                f'bts sweep: --trades-tape file not found: {_operator_tape}\n',
-            )
+        try:
+            _trades_parquet_path = announce_operator_trades_tape(_operator_tape, _t_trades)
+        except FileNotFoundError as exc:
+            sys.stderr.write(f'{exc}\n')
             return 2
-        print(
-            f'[{time.perf_counter()-_t_trades:7.2f}s] '
-            f'trades tape ready: {_operator_tape.name} (operator-supplied)',
-            flush=True,
-        )
-        _trades_parquet_path = str(_operator_tape)
     else:
-        # ClickHouse env may be missing in CI / unit-test contexts that
-        # mock `run_window_in_subprocess` and never actually read the
-        # parquet. `_ChCfg.from_env()` raises `RuntimeError` on ANY
-        # missing required var (HOST/PORT/USER/PASSWORD), so we catch
-        # the RuntimeError directly rather than spot-checking one
-        # variable. The catch is narrow (RuntimeError, with the same
-        # message shape the env validator already produces) and the
-        # handler surfaces the reason to stderr before falling back to
-        # `trades_parquet_path=None`. Real CLI usage always has the env
-        # set so the except branch never fires in production sweeps;
-        # the (mocked) subprocess path in unit tests reaches the
-        # parity-check assertions instead of crashing on env init.
+        # `_ChCfg.from_env()` raises `RuntimeError` on any missing CH
+        # var; catch it narrowly so unit-test contexts that mock
+        # `run_window_in_subprocess` reach the parity-check assertions
+        # instead of crashing on env init.
         try:
             _ch_config = _ChCfg.from_env()
         except RuntimeError as _ch_exc:
@@ -1203,35 +1173,11 @@ def _run(args: argparse.Namespace) -> int:
     n_search_trials = max(
         int(args.n_permutations), int(candidate_pool_size),
     )
-    # Buy-hold benchmark needs the first BTCUSDT trade price at-or-after
-    # `hours_start` and `hours_end` for each clean day. With
-    # `--trades-tape` set, route the lookup to the operator's local
-    # tape — same `time` + `price` columns the live CH query would
-    # return, no network round-trip. Default flow uses the CH-backed
-    # `seed_price_at`.
-    _seed_price_callable: Callable[[datetime], Decimal]
-    if _operator_tape is not None:
-        import polars as _pl
-        _tape_frame = _pl.read_parquet(str(_operator_tape)).set_sorted('time')
-        _tape_path_for_msg = _operator_tape
-        def _seed_from_tape(ts: datetime) -> Decimal:
-            rows = _tape_frame.filter(_pl.col('time') >= ts).head(1)
-            if rows.is_empty():
-                msg = (
-                    f'--trades-tape {_tape_path_for_msg} has no tick '
-                    f'at or after {ts.isoformat()}; the tape window '
-                    f'must cover every replay day open + close.'
-                )
-                raise RuntimeError(msg)
-            return Decimal(str(rows['price'][0]))
-        _seed_price_callable = _seed_from_tape
-    else:
-        _seed_price_callable = seed_price_at
     _print_sweep_stats_summary(
         per_decoder_returns, clean_days, hours_start, hours_end,
         n_search_trials=n_search_trials,
         n_runs_with_trailing_inventory=n_runs_with_trailing_inventory,
-        seed_price_at=_seed_price_callable,
+        seed_price_at=make_seed_price_from_parquet(_operator_tape) if _operator_tape is not None else seed_price_at,
     )
     _print_cpcv_pbo_summary(
         per_decoder_returns=per_decoder_returns,
