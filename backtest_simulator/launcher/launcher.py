@@ -1703,17 +1703,6 @@ class BacktestLauncher(Launcher):
                     # and grant the asyncio chain a generous pause.
                     tick_amt = min(margin_s + 1.0, end_dist_s)
                     pause_s = _BOUNDARY_PAUSE_S
-                # Cap at `end_dist_s` but allow a 1s minimum so the
-                # final boundary-tick can fire — the grace drain
-                # below explicitly tolerates one frozen-second of
-                # overshoot. The capture filter
-                # (`capture_runtime_prediction`) drops any tick
-                # whose ts is `> window_end`, so the overshoot
-                # cannot leak ticks into the parity-checked window.
-                # (Copilot P1 was a real concern but the overshoot
-                # is the seam that lets the closing boundary tick
-                # fire under the smart cadence; reverting the
-                # strict clamp.)
                 tick_amt = min(tick_amt, max(end_dist_s, 1.0))
                 tick_fn(timedelta(seconds=tick_amt))
                 time.sleep(pause_s)

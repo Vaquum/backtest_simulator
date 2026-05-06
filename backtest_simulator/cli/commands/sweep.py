@@ -84,36 +84,55 @@ def _atomic_index_update(
     index_path: Path,
     mutate: Callable[[list[dict[str, object]]], None],
 ) -> None:
-    """Read-modify-write `index.json` under a `flock(LOCK_EX)`.
+    """Read-modify-write `index.json` under a flock + atomic temp+replace.
 
-    Concurrency: serialises start-of-sweep `append` and end-of-sweep
-    `ended_at` updates from concurrent `bts sweep` processes against a
-    shared `~/sweep/sessions/index.json`. Without the lock the two
-    processes' read-modify-write windows can overlap and the loser's
-    update is silently lost (bit-mis P1).
+    Concurrency:
+      - flock is taken on a SEPARATE `index.json.lock` file (not on
+        the data file itself), so the lock survives the
+        rename-into-place that the writer performs.
+      - The new JSON is written to `<path>.tmp` first, then
+        `Path.replace`d into place. Readers (the dashboard, anyone
+        else that opens `index.json` without holding the lock) see
+        either the OLD complete file or the NEW complete file —
+        never the partial in-place truncate-then-write window of a
+        single open file (Copilot P1).
+
+    Serialises start-of-sweep `append` and end-of-sweep `ended_at`
+    updates from concurrent `bts sweep` processes against a shared
+    `~/sweep/sessions/index.json`. Without the lock the two
+    processes' read-modify-write windows can overlap and the
+    loser's update is silently lost (bit-mis P1).
 
     Failure modes are explicit:
       - missing file → seed with `{"sessions": []}` and proceed.
       - malformed JSON or unreadable file → write to stderr and BAIL
         without rewriting (do NOT clobber other operators' sessions
         with `{"sessions": []}`; bit-mis P1 silent-data-loss).
-      - mutate raises → propagate (caller decides; we still drop the
-        lock via the context manager exit).
+      - mutate raises → propagate; the temp file is left on disk
+        for diagnostics but `index_path` is never overwritten.
     """
     index_path.parent.mkdir(parents=True, exist_ok=True)
     if not index_path.is_file():
         index_path.write_text('{"sessions": []}', encoding='utf-8')
+    lock_path = index_path.with_suffix(index_path.suffix + '.lock')
     try:
-        fp = index_path.open('r+', encoding='utf-8')
+        lock_fp = lock_path.open('w', encoding='utf-8')
     except OSError as exc:
         sys.stderr.write(
-            f'bts sweep: cannot open sessions index at {index_path} '
-            f'({exc}); leaving manifest unchanged.\n',
+            f'bts sweep: cannot open sessions index lock at '
+            f'{lock_path} ({exc}); leaving manifest unchanged.\n',
         )
         return
     try:
-        fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
-        raw = fp.read()
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        try:
+            raw = index_path.read_text(encoding='utf-8')
+        except OSError as exc:
+            sys.stderr.write(
+                f'bts sweep: cannot read sessions index at '
+                f'{index_path} ({exc}); leaving manifest unchanged.\n',
+            )
+            return
         if not raw.strip():
             data: dict[str, object] = {'sessions': []}
         else:
@@ -142,12 +161,11 @@ def _atomic_index_update(
             ]
         mutate(sessions_list)
         data['sessions'] = sessions_list
-        fp.seek(0)
-        fp.truncate()
-        fp.write(_index_json.dumps(data, indent=2))
-        fp.flush()
+        tmp_path = index_path.with_suffix(index_path.suffix + '.tmp')
+        tmp_path.write_text(_index_json.dumps(data, indent=2), encoding='utf-8')
+        tmp_path.replace(index_path)
     finally:
-        fp.close()
+        lock_fp.close()
 
 
 def _finalize_session(index_path: Path, session_id: str) -> None:
