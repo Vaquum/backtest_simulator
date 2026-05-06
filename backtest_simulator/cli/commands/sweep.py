@@ -320,11 +320,15 @@ def _run(args: argparse.Namespace) -> int:
         _loaded: object = None
         try:
             _loaded = _json2.loads(_index_path.read_text(encoding='utf-8'))
-        except _json2.JSONDecodeError:
-            # Corrupted manifest -> start fresh; the file is operator-
-            # facing only (dashboard manifest), no other downstream
-            # consumer reads it strictly.
-            pass
+        except _json2.JSONDecodeError as _exc_idx:
+            # Corrupted manifest -> warn the operator and start fresh.
+            # The file is operator-facing only (dashboard manifest); no
+            # other downstream consumer reads it strictly. The new
+            # session will rewrite it cleanly.
+            sys.stderr.write(
+                f'bts sweep: ignoring malformed sessions index at '
+                f'{_index_path} ({_exc_idx}); starting fresh.\n',
+            )
         if isinstance(_loaded, dict):
             _loaded_d = cast('dict[str, object]', _loaded)
             _raw_sessions = _loaded_d.get('sessions')
@@ -595,7 +599,7 @@ def _run(args: argparse.Namespace) -> int:
     # Captured by `_run_one_window` below as concrete typed values so
     # `run_window_in_subprocess` is called with named arguments and
     # pyright can check each one. Avoids the `dict[str, object]`
-    # unpacking that needed `# type: ignore[arg-type]`.
+    # unpacking that the typing-budget ratchet rejected.
     _maker_preference = bool(getattr(args, 'maker', False))
     _strict_impact = bool(getattr(args, 'strict_impact', False))
     _trades_parquet_path = str(_trades_parquet)
@@ -1096,8 +1100,15 @@ def _run(args: argparse.Namespace) -> int:
     _loaded_end: object = None
     try:
         _loaded_end = _json2.loads(_index_path.read_text(encoding='utf-8'))
-    except (_json2.JSONDecodeError, OSError):
-        pass
+    except (_json2.JSONDecodeError, OSError) as _exc_end:
+        # Manifest disappeared or got corrupted between session start
+        # and finish. Warn loudly and rewrite — the operator's
+        # dashboard would otherwise show this session stuck `live`
+        # forever even though it finished.
+        sys.stderr.write(
+            f'bts sweep: cannot read sessions index for ended_at '
+            f'update at {_index_path} ({_exc_end}); rewriting.\n',
+        )
     _end_sessions: list[dict[str, object]] = []
     if isinstance(_loaded_end, dict):
         _end_d = cast('dict[str, object]', _loaded_end)
