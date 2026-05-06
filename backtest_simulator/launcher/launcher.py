@@ -5,14 +5,13 @@ import asyncio
 import importlib
 import json
 import logging
-import math
 import os
 import queue
 import threading
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import FrameType
@@ -67,6 +66,7 @@ from backtest_simulator.launcher.action_submitter import (
 )
 from backtest_simulator.launcher.clock import accelerated_clock
 from backtest_simulator.launcher.poller import BacktestMarketDataPoller
+from backtest_simulator.launcher.replay_clock import ReplayClock
 
 NexusTradeOutcome = _nexus_trade_outcome_mod.TradeOutcome
 
@@ -405,6 +405,7 @@ def _finalize_sell_close(
 
 def _make_outcome_router(
     outcome_queues: dict[str, queue.Queue[NexusTradeOutcome]],
+    on_routed: Callable[[], None] | None = None,
 ) -> Callable[[TradeOutcome], Awaitable[None]]:
     """Return an async router that translates Praxis outcomes into the launcher queue.
 
@@ -418,11 +419,19 @@ def _make_outcome_router(
          status; PENDING is mapped to EXPIRED so a bounded-
          lookahead non-fill clears `_pending_buy`),
       2. looks up the account's queue,
-      3. enqueues the Nexus outcome.
+      3. enqueues the Nexus outcome,
+      4. invokes `on_routed()` once the outcome has landed in the
+         queue so the launcher's drain can wait for routed == delivered
+         (closes the delivered-but-not-routed gap that `delivered_count`
+         alone leaves open).
 
     Outcomes for accounts without a registered queue are dropped;
     that case only arises during shutdown teardown when the
-    launcher has already deregistered the account.
+    launcher has already deregistered the account. The `on_routed`
+    callback is NOT fired for dropped outcomes — drained code can
+    distinguish "delivered, then translated to None / dropped" from
+    "delivered, awaiting routing" via the per-account queue length
+    (the diagnostic in `_praxis_queue_sizes`).
     """
     async def _route(praxis_outcome: TradeOutcome) -> None:
         nexus_outcome = _translate_praxis_outcome(praxis_outcome)
@@ -432,6 +441,8 @@ def _make_outcome_router(
         if account_queue is None:
             return
         account_queue.put_nowait(nexus_outcome)
+        if on_routed is not None:
+            on_routed()
     return _route
 
 
@@ -926,6 +937,18 @@ class BacktestLauncher(Launcher):
         self._submit_lock = threading.Lock()
         self._venue_adapter = venue_adapter
         self._max_allocation_per_trade_pct = max_allocation_per_trade_pct
+        # Routed-outcome counter incremented by `_make_outcome_router` after
+        # a translated Nexus outcome lands in the per-account queue. Paired
+        # with `_delivered_command_count` in `_drain_pending_submits` so
+        # the synchronous replay drain waits for delivered == routed,
+        # closing the asyncio router's tail.
+        self._routed_outcomes = 0
+        # Runtime handles populated by `_run_my_nexus_instance`. The
+        # synchronous replay path (`run_window` → `ReplayClock.drive_window`)
+        # reaches them via these attributes.
+        self._predict_loop: PredictLoop | None = None
+        self._outcome_loop: OutcomeLoop | None = None
+        self._wired_sensors: tuple[WiredSensor, ...] | None = None
 
     def _start_trading(self) -> None:
         """Wire `Trading.route_outcome` into the execution_manager.
@@ -972,8 +995,16 @@ class BacktestLauncher(Launcher):
         # `Trading.register_outcome_queue`, which Praxis 0.48.0
         # does not do; reading it would return None and drop the
         # outcome.
-        router = _make_outcome_router(self._outcome_queues)
+        router = _make_outcome_router(self._outcome_queues, on_routed=self._record_routed_outcome)
         trading.execution_manager.set_on_trade_outcome(router)
+
+    def _record_routed_outcome(self) -> None:
+        # Called by `_make_outcome_router` after a Nexus-shaped outcome
+        # has been put into the per-account queue. The lock guards the
+        # counter only; `_drain_pending_submits` reads it under the same
+        # lock to wait for routed == delivered.
+        with self._submit_lock:
+            self._routed_outcomes += 1
 
     def _start_poller(self) -> None:
         kline_intervals = self._resolve_kline_intervals_from_manifests()
@@ -1285,22 +1316,38 @@ class BacktestLauncher(Launcher):
                 operational_mode=OperationalMode.ACTIVE,
             )
 
+        # Fail-loud on strategy-authored timers in the synchronous replay
+        # path. `TimerLoop` is a `threading.Timer`-based scheduler; the
+        # replay clock owns the synchronous predict cadence and has no
+        # public seam for `on_timer` callbacks. Extending the
+        # synchronous path to TimerLoop is a future RFC, not this slice.
+        # The f-string is inlined into the `RuntimeError(...)` call so
+        # the slice MVC AST predicate (search for a RuntimeError raise
+        # whose argument tree contains the substring `timer_specs`)
+        # finds the marker without traversing through a `msg = ...`
+        # local.
+        if sequencer.timer_specs:
+            raise RuntimeError(
+                f'BacktestLauncher: sequencer declares non-empty '
+                f'timer_specs ({list(sequencer.timer_specs)}); '
+                f'TimerLoop is not supported in the synchronous replay '
+                f'path. Strategy-authored on_timer callbacks require a '
+                f'follow-up RFC adding tick_once-style entry points to '
+                f'TimerLoop.'
+            )
+
         predict_loop = PredictLoop(
             runner=runner, wired_sensors=sequencer.wired_sensors,
             market_data_provider=market_data_provider,
             context_provider=context_provider,
             action_submit=action_submit,
         )
-        predict_loop.start()
-
-        timer_loop: TimerLoop | None = None
-        if sequencer.timer_specs:
-            timer_loop = TimerLoop(
-                runner=runner, strategy_timers=sequencer.timer_specs,
-                context_provider=context_provider,
-                action_submit=action_submit,
-            )
-            timer_loop.start()
+        # Do NOT call `predict_loop.start()`. The synchronous replay
+        # path (`run_window` → `ReplayClock.drive_window`) drives
+        # `predict_loop.tick_once(wired)` per pre-computed kline
+        # boundary; starting the Timer-driven loop would compete for
+        # the same frozen-clock writes and reintroduce the race this
+        # slice exists to remove.
 
         # PraxisInbound and praxis.Launcher use distinct TradeOutcome
         # classes from different modules but the same shape; assign
@@ -1309,19 +1356,40 @@ class BacktestLauncher(Launcher):
         nexus_outcome_queue: queue.Queue[NexusTradeOutcome] = cast(
             'queue.Queue[NexusTradeOutcome]', outcome_queue,
         )
-        praxis_inbound = PraxisInbound(outcome_queue=nexus_outcome_queue)
+        # `poll_timeout=0.0` makes `OutcomeLoop.tick_once()` return
+        # immediately when the queue is empty (nonblocking
+        # `queue.get(block=False)` semantics). The synchronous drain
+        # in `ReplayClock._drain_to_quiescence` repeats the loop until
+        # `tick_once` returns False, so a 100ms blocking poll would
+        # cost 100ms per drain pass with nothing to show for it.
+        praxis_inbound = PraxisInbound(outcome_queue=nexus_outcome_queue, poll_timeout=0.0)
         outcome_loop = _build_outcome_loop(
             runner=runner, praxis_inbound=praxis_inbound, state=state,
             context_provider=context_provider,
             wired_sensors=sequencer.wired_sensors,
             action_submit=action_submit,
         )
-        outcome_loop.start()
+        # Do NOT call `outcome_loop.start()`. ReplayClock drains the
+        # outcome queue synchronously via `outcome_loop.tick_once()`
+        # in the same thread that drives predicts; running a worker
+        # thread alongside would interleave `on_outcome` with
+        # `tick_once` and break the deterministic schedule.
+
+        # Stash the runtime handles so `BacktestLauncher.run_window`
+        # (running on the main thread) can pass them to
+        # `ReplayClock.drive_window`. The launch thread owns construction
+        # but never operates the loops.
+        self._predict_loop = predict_loop
+        self._outcome_loop = outcome_loop
+        self._wired_sensors = tuple(sequencer.wired_sensors)
+
         # Direct event signal — no log-message interception. The running
         # event is initialised in `run_window` on `self._nexus_running`.
         self._nexus_running.set()
         self._stop_event.wait()
-        outcome_loop.stop()
+        # ShutdownSequencer below tolerates `timer_loop=None`; the
+        # synchronous replay path never constructs one.
+        timer_loop: TimerLoop | None = None
 
         # `sequencer.start()` has returned, so `manifest` and
         # `instance_state` are both populated — but the public
@@ -1422,10 +1490,17 @@ class BacktestLauncher(Launcher):
         try:
             with accelerated_clock(start) as freezer:
                 try:
-                    self._advance_clock_until(end, freezer)
+                    pl, ol, ws = self._predict_loop, self._outcome_loop, self._wired_sensors
+                    if pl is None or ol is None or ws is None:
+                        raise RuntimeError('run_window: predict_loop / outcome_loop / wired_sensors were not stashed by _run_my_nexus_instance')
+                    ReplayClock().drive_window(
+                        window_start=start, window_end=end, wired_sensors=ws,
+                        predict_loop=pl, outcome_loop=ol,
+                        drain_pending_submits=self._drain_pending_submits, freezer=freezer,
+                    )
                 finally:
                     # Always request_stop so the launch thread exits,
-                    # even when the clock advancer raised (e.g. the
+                    # even when the replay driver raised (e.g. the
                     # drain timed out). Without this, DrainTimeoutError
                     # would leak while the launch thread keeps running
                     # until the daemon shuts down — pushing the e2e
@@ -1553,27 +1628,44 @@ class BacktestLauncher(Launcher):
                sum(len(a.orders) for a in history.values())
 
     def _drain_pending_submits(self) -> None:
-        """Block until every submitted command_id has landed at the adapter.
+        """Block until every submitted command_id has been delivered AND routed.
 
-        Main clock must not advance past a submit Praxis hasn't dispatched.
-        Bounded by `_DRAIN_TIMEOUT_SECONDS`; raises `DrainTimeoutError`
-        on timeout (with per-account queue state) so the run aborts loudly.
+        Two-phase barrier:
+          1. Wait until `_delivered_command_count() >= submitted` — every
+             `adapter.submit_order` coroutine has completed.
+          2. Wait until `_routed_outcomes >= delivered` — every translated
+             Nexus outcome has landed in its per-account queue. Without
+             this, the synchronous replay schedule could advance past a
+             boundary while the asyncio outcome router still has work
+             pending; the on_outcome chain would then fire one tick late.
+
+        Main clock must not advance past a submit Praxis hasn't dispatched
+        OR an outcome the router hasn't enqueued. Bounded by
+        `_DRAIN_TIMEOUT_SECONDS`; raises `DrainTimeoutError` on timeout
+        (with per-account queue state) so the run aborts loudly.
         """
         drain_start = os.times()[4]
         while True:
             with self._submit_lock:
                 submitted = self._submitted_commands
+                routed = self._routed_outcomes
             delivered = self._delivered_command_count()
-            if delivered >= submitted:
+            if delivered >= submitted and routed >= delivered:
                 elapsed = os.times()[4] - drain_start
                 if elapsed > _DRAIN_SLOW_WARN_SECONDS:
-                    _log.warning('drain slow: submitted=%d delivered=%d wallclock=%.2fs', submitted, delivered, elapsed)
+                    _log.warning(
+                        'drain slow: submitted=%d delivered=%d routed=%d '
+                        'wallclock=%.2fs',
+                        submitted, delivered, routed, elapsed,
+                    )
                 return
             if os.times()[4] - drain_start > _DRAIN_TIMEOUT_SECONDS:
                 diag = self._praxis_queue_sizes()
                 msg = (
-                    f'drain timeout: submitted={submitted} delivered={delivered} '
-                    f'after {_DRAIN_TIMEOUT_SECONDS:.2f}s; praxis_state={diag}'
+                    f'drain timeout: submitted={submitted} '
+                    f'delivered={delivered} routed={routed} '
+                    f'after {_DRAIN_TIMEOUT_SECONDS:.2f}s; '
+                    f'praxis_state={diag}'
                 )
                 raise DrainTimeoutError(msg)
             self._yield_to_loop_once()
@@ -1636,89 +1728,3 @@ class BacktestLauncher(Launcher):
             out[aid] = entry
         return out
 
-    def _advance_clock_until(self, end: datetime, freezer: object) -> None:
-        # PredictLoop schedules its ticks via `threading.Timer`, whose
-        # wait loop uses real monotonic time regardless of freezegun.
-        # `accelerated_clock` patches `threading.Timer.run` to poll the
-        # frozen clock instead, so the timer fires when enough frozen
-        # time has elapsed — but that requires someone to actually
-        # advance the frozen clock.
-        #
-        # Two modes:
-        #   - Uniform mode (`_clock_tick_seconds <= 120s`): tick by
-        #     a fixed step (default 120s), pause 10ms, drain. Safe
-        #     for any cadence; default for callers that don't pass
-        #     `clock_tick_seconds`. Cost: 720 iters/day at 120s x 10ms
-        #     ≈ 7s of pure `time.sleep` per day.
-        #   - Smart kline-aware mode (`_clock_tick_seconds > 120s`):
-        #     `_clock_tick_seconds` is interpreted as the bundle's
-        #     `kline_size`. Far from a kline boundary the loop jumps
-        #     big (`margin - 60s`), preserving the 60s buffer; near a
-        #     boundary it crosses with a generous 250ms real-time
-        #     pause so the `produce_signal → on_signal → submit →
-        #     fill` chain has wall-clock time to complete BEFORE the
-        #     next freezer tick. Reduces 720 iters/day to ~20-25 for
-        #     a 4h kline; pause budget around each boundary stays in
-        #     the 250-300ms range that uniform mode delivered via 120
-        #     x 10ms.
-        real_start = os.times()[4]
-        kline_size_s = self._clock_tick_seconds.total_seconds()
-        use_smart = kline_size_s > 120.0
-        # Buffer before a boundary where we slow down to single-tick
-        # crossings; >= the largest realistic asyncio-chain latency we
-        # need to absorb (300ms ClickHouse fetch + Praxis pump + drain).
-        _BOUNDARY_BUFFER_S = 60
-        # Real-time pause used when a tick CROSSES a kline boundary —
-        # gives the asyncio event loop, Praxis pump, venue adapter
-        # and `_drain_pending_submits` enough wall-clock to ferry the
-        # produce_signal → fill chain through before we tick again.
-        _BOUNDARY_PAUSE_S = 0.25
-        while datetime.now(UTC) < end:
-            if os.times()[4] - real_start > _REAL_TIME_CAP_SECONDS:
-                _log.warning(
-                    'backtest window exceeded %ds of real wall time without '
-                    'reaching end=%s; forcing stop at frozen %s',
-                    _REAL_TIME_CAP_SECONDS, end, datetime.now(UTC),
-                )
-                return
-            tick_fn = getattr(freezer, 'tick')
-            if use_smart:
-                frozen_now = datetime.now(UTC)
-                secs = frozen_now.timestamp()
-                # Next kline boundary aligned to UNIX epoch (matches
-                # the cadence the strategy's PredictLoop schedules
-                # against — Timer interval = `kline_size`).
-                next_boundary = (
-                    math.ceil((secs + 1e-6) / kline_size_s) * kline_size_s
-                )
-                margin_s = next_boundary - secs
-                end_dist_s = (end - frozen_now).total_seconds()
-                if margin_s > _BOUNDARY_BUFFER_S * 2:
-                    # Far from boundary — jump big, leave one buffer
-                    # behind so we approach the boundary with margin.
-                    tick_amt = margin_s - _BOUNDARY_BUFFER_S
-                    pause_s = _CLOCK_TICK_REAL_PAUSE_SECONDS
-                else:
-                    # In or near the boundary buffer — cross by 1s
-                    # and grant the asyncio chain a generous pause.
-                    tick_amt = min(margin_s + 1.0, end_dist_s)
-                    pause_s = _BOUNDARY_PAUSE_S
-                tick_amt = min(tick_amt, max(end_dist_s, 1.0))
-                tick_fn(timedelta(seconds=tick_amt))
-                time.sleep(pause_s)
-            else:
-                tick_fn(self._clock_tick_seconds)
-                time.sleep(_CLOCK_TICK_REAL_PAUSE_SECONDS)
-            self._drain_pending_submits()
-        # Grace drain: frozen time drifts because multiple threads
-        # (main + per-Timer conditional-sleep) tick it concurrently, so
-        # the Timer chain can fire a last strategy tick at a frozen
-        # instant slightly past `end` — right as the main loop is
-        # exiting. Pause briefly for any such late tick to reach
-        # `send_command` (the strategy thread blocks on
-        # `future.result()` until the coroutine enqueues), then drain
-        # so the command lands at the venue adapter before we
-        # `request_stop`. Without this, the last ENTER/SELL of the
-        # window is lost and the trade summary undercounts.
-        time.sleep(_CLOCK_TICK_REAL_PAUSE_SECONDS)
-        self._drain_pending_submits()
