@@ -1,3 +1,56 @@
+# v2.5.0
+
+Slice 0 (#64) — replace the racy `threading.Timer` clock with a
+schedule-driven replay clock that drives Nexus's public
+`PredictLoop.tick_once(wired)` per pre-computed kline boundary.
+
+The legacy `threading.Timer.run` monkey-patch in
+`backtest_simulator/launcher/clock.py` is gone; `_advance_clock_until`
+in `backtest_simulator/launcher/launcher.py` is gone. Window replay is
+now single-threaded: `BacktestLauncher.run_window` constructs a
+`ReplayClock` and calls `drive_window(...)`, which jumps frozen time
+to each epoch-aligned boundary, calls `predict_loop.tick_once(wired)`
+per sensor, and drains submits + outcomes to quiescence
+(repeat-until-fixed-point) before advancing. `PredictLoop` and
+`OutcomeLoop` are no longer started on the launch thread; the
+synchronous drive owns both via their public `tick_once` entries.
+`PraxisInbound` is constructed with `poll_timeout=0.0` so the
+nonblocking outcome drain costs no real time per empty pass. The
+launch thread fails loud if the sequencer declares non-empty
+`timer_specs` (TimerLoop is not supported in the synchronous replay
+path; future RFC required to add `tick_once`-style entry points).
+
+The launcher's `_drain_pending_submits` now waits for
+`routed >= delivered` (not only `delivered >= submitted`); a routed
+counter incremented inside the per-account outcome router closes the
+asyncio "delivered != routed" gap.
+
+Surfaces:
+- `backtest_simulator/launcher/replay_clock.py` (new) — owns
+  `compute_kline_boundaries(*, window_start, window_end, interval_seconds)`
+  and `class ReplayClock` with one method `drive_window(*, ...)`.
+  Fail-loud on heterogeneous-cadence wired sensors and on entry
+  while either loop's `running` is True.
+- `backtest_simulator/launcher/clock.py` — drops `_frozen_aware_timer_run`
+  and the `setattr(threading.Timer, 'run', ...)` patch; keeps
+  `accelerated_clock` (freezegun wrapper) and `tick_frozen_time`.
+- `backtest_simulator/launcher/launcher.py` — adds the `ReplayClock`
+  import and the `run_window` delegation; removes
+  `_advance_clock_until`, `predict_loop.start()`, `outcome_loop.start()`,
+  and the conditional `TimerLoop` construction; adds the
+  `timer_specs` fail-loud raise; constructs `PraxisInbound` with
+  `poll_timeout=0.0`; threads a routed-outcomes counter through
+  `_make_outcome_router`.
+- `tests/launcher/test_replay_clock.py` (new) — module-structure +
+  surfaces-removed + launcher-uses + TimerLoop-fail-loud +
+  `PraxisInbound(poll_timeout=0.0)` + boundary-value + bookkeeping +
+  behavioural drive_window tests + clean-subprocess import.
+- `tests/launcher/test_clock.py` — drops the two tests that pinned
+  the now-removed monkey-patch (`test_threading_timer_is_permanently_patched`,
+  `test_timer_cancel_stops_wait`).
+
+Closes Vaquum/backtest_simulator#64. RFC: Vaquum/backtest_simulator#65.
+
 # v2.4.0
 
 Sweep performance + dashboard work. End-to-end sweep wall time on

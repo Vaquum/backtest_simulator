@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "backtest_simulator"
-version = "2.4.0"
+version = "2.5.0"
 description = "Honest, gate-enforced backtester for unmodified Nexus strategies against unmodified Praxis."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -202,6 +202,13 @@ max-statements = 50
 # signature (it wraps SimulatedVenueAdapter.submit_order without
 # changing arity).
 "backtest_simulator/launcher/launcher.py" = ["PLR0913"]
+# `ReplayClock.drive_window` is the synchronous-replay seam pinned by
+# slice 0 (#64) at exactly 7 keyword-only params (window_start,
+# window_end, wired_sensors, predict_loop, outcome_loop,
+# drain_pending_submits, freezer). The MVC AST predicate verifies
+# the parameter set; collapsing into a config-bag would diverge from
+# the spec's contract.
+"backtest_simulator/launcher/replay_clock.py" = ["PLR0913"]
 # `_Config.__init__` mirrors `StrategyParamsSpec`'s named fields
 # 1:1 (symbol, capital, kelly_pct, estimated_price, stop_bps,
 # force_flatten_after, maker_preference). The strategy template
