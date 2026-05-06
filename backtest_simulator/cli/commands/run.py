@@ -34,7 +34,11 @@ from backtest_simulator.cli._pipeline import (
     preflight_tunnel,
     train_decoder_by_id_from_csv,
 )
-from backtest_simulator.cli._run_window import run_window_in_subprocess
+# Lazy-imported below in `_run`. Eager import combined with
+# `cli/__init__.py` importing this module on `bts` startup would put
+# `_run_window` in `sys.modules` under its package name, then runpy's
+# `python -m backtest_simulator.cli._run_window` re-execution emits
+# "found in sys.modules … prior to execution".
 from backtest_simulator.cli._verbosity import add_verbosity_arg, configure
 
 
@@ -211,6 +215,7 @@ def _run(args: argparse.Namespace) -> int:
     raw_max_alloc = getattr(args, 'max_allocation_per_trade_pct', None)
     raw_lookback = getattr(args, 'predict_lookback', None)
     from decimal import Decimal as _Decimal
+    from backtest_simulator.cli._run_window import run_window_in_subprocess
     result = run_window_in_subprocess(
         perm_id, kelly, window_start, window_end, exp_dir,
         maker_preference=bool(getattr(args, 'maker', False)),

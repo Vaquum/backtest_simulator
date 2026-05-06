@@ -1,13 +1,10 @@
-"""Local parquet cache for `limen.data.HistoricalData.get_spot_klines`."""
+"""Opt-in parquet cache for `limen.data.HistoricalData.get_spot_klines`."""
 from __future__ import annotations
 
 # Limen has no on-disk cache — every call re-streams BTCUSDT klines from
-# HuggingFace. On a Trainer boot the Sensor reconstruction call pays
-# ~15-20s real wall time to refetch the same data Limen already pulled at
-# experiment-training time. This module installs a monkey-patch at module
-# import: the first call per `kline_size` writes the full frame to
-# `~/.cache/backtest_simulator/limen_klines/btcusdt_{kline_size}.parquet`;
-# every subsequent call in ANY process reads that parquet directly.
+# HuggingFace. This module can install a monkey-patch explicitly, but package
+# import must not do that: `bts sweep` needs Limen's current market-data view,
+# not an implicit local parquet snapshot.
 #
 # Invariants:
 #   - Cache key is `kline_size` only. `n_rows` is sliced client-side so
@@ -70,6 +67,3 @@ def install_cache() -> None:
 
     setattr(HistoricalData, 'get_spot_klines', wrapper)
     setattr(HistoricalData, _INSTALLED_ATTR, True)
-
-
-install_cache()

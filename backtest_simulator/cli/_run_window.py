@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time as _bts_time
 from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
@@ -201,10 +202,16 @@ def capture_runtime_prediction(
         return
     if window_end is not None and ts_obj > window_end:
         return
+    # `_probs` is the raw decoder probability emitted alongside the
+    # binary `_preds` label by the LogReg sensor (see strategy
+    # template's `signal.values.get('_probs')`). Carrying it through
+    # capture so per-window CSV can record the entry-tick prob.
+    prob_val = values.get('_probs')
     sink.append({
         'sensor_id': str(getattr(wired, 'sensor_id', '')),
         'timestamp': ts_obj.isoformat(),
         'pred': pred_val,
+        'prob': float(prob_val) if isinstance(prob_val, (int, float)) else None,
     })
 
 
@@ -225,8 +232,10 @@ def run_window_in_process(
     *,
     maker_preference: bool = False,
     strict_impact: bool = False,
+    trades_parquet_path: str | None = None,
     max_allocation_per_trade_pct: Decimal | None = None,
     predict_lookback: int | None = None,
+    display_id: int | None = None,
 ) -> WindowResult:
     """In-process single-window run — picklable result for cross-process use."""
     if predict_lookback is not None and predict_lookback < 1:
@@ -239,7 +248,12 @@ def run_window_in_process(
     from praxis.launcher import InstanceConfig
     from praxis.trading_config import TradingConfig
 
-    from backtest_simulator.feed.clickhouse import ClickHouseConfig, ClickHouseFeed
+    from backtest_simulator.feed.clickhouse import (
+        ClickHouseConfig,
+        ClickHouseFeed,
+        InMemoryTradesFeed,
+    )
+    import polars as _pl_mod
     from backtest_simulator.launcher import BacktestLauncher
     from backtest_simulator.pipeline.manifest_builder import (
         AccountSpec,
@@ -251,8 +265,26 @@ def run_window_in_process(
     from backtest_simulator.venue.filters import BinanceSpotFilters
     from backtest_simulator.venue.simulated import SimulatedVenueAdapter
 
+    # Subprocess runs silently — parent logs one consolidated
+    # `perm X day Y - done (Ns)` line per window after `.result()`.
+    # Internal sub-phase timing was useful when diagnosing the boot /
+    # advance_clock split; with parallel batches the multiplexed
+    # stderr was unreadable. Removed.
+    _bts_t_start = _bts_time.perf_counter()
+    def _bts_lap(label: str, start: float) -> float:  # no-op kept for shape
+        return _bts_time.perf_counter()
+    _bts_t = _bts_t_start
     seed_price = seed_price_at(window_start)
-    suffix = f'{perm_id}_{window_start.date().isoformat()}'
+    # work_dir uniqueness must follow the human-facing pick identifier,
+    # not the trainer permutation index. In the file-list filter mode
+    # `perm_id` is hardcoded to 0 across every pick because each pick's
+    # sub_dir was trained with `permutation_ids=[0]`; reusing it as the
+    # work_dir suffix collides every pick onto `0_<date>` and the next
+    # pick's `_fresh_work_dir` rmtree's the previous spine. `display_id`
+    # is the unique decoder/file id (== `perm_id` in the experiment-dir
+    # filter mode where they coincide).
+    suffix_id = perm_id if display_id is None else display_id
+    suffix = f'{suffix_id}_{window_start.date().isoformat()}'
     work = _fresh_work_dir(suffix)
     manifest_dir = work / 'manifest'
     state_dir = work / 'state'
@@ -298,7 +330,23 @@ def run_window_in_process(
             maker_preference=maker_preference,
         ),
     )
-    feed = ClickHouseFeed(config=ClickHouseConfig.from_env(), symbol=SYMBOL)
+    _bts_t = _bts_lap('ManifestBuilder.build', _bts_t)
+    # If the parent prefetched the sweep's trade tape, use the parquet
+    # via `InMemoryTradesFeed` — every trade query is now an in-memory
+    # filter, not a ClickHouse round-trip. Falls back to a live
+    # `ClickHouseFeed` only when the parquet wasn't passed (e.g. callers
+    # outside the sweep flow like `bts run`).
+    feed: ClickHouseFeed | InMemoryTradesFeed
+    if trades_parquet_path is not None:
+        feed = InMemoryTradesFeed(
+            _pl_mod.read_parquet(trades_parquet_path),
+            symbol=SYMBOL,
+        )
+    else:
+        feed = ClickHouseFeed(
+            config=ClickHouseConfig.from_env(), symbol=SYMBOL,
+        )
+    _bts_t = _bts_lap('ClickHouseFeed init', _bts_t)
     # Calibrate the slippage model from a pre-window trade slice
     # (strict-causal: end <= window_start, no peek into the run's
     # own fills). 30 minutes is enough density at BTCUSDT scale to
@@ -310,6 +358,7 @@ def run_window_in_process(
     # `slippage_realised_bps` come back null and knows the
     # calibration window needs to widen.
     slippage_model = _calibrate_slippage(feed, window_start)
+    _bts_t = _bts_lap('_calibrate_slippage', _bts_t)
     # MakerFillModel is constructed only when the strategy will
     # use LIMIT orders (`maker_preference=True`). Without LIMIT
     # orders the model would be dead weight. The model's lookback
@@ -336,15 +385,15 @@ def run_window_in_process(
         feed=feed,
         filters=BinanceSpotFilters.binance_spot(SYMBOL),
         fees=FeeSchedule(),
-        # Walk one full kline of trade tape per submit, clamped to
-        # the run window's end. `interval_seconds` is the bundle's
-        # `data_source_config.params['kline_size']` derived above.
-        # `window_end_clamp` prevents a submit near the close of the
-        # run window from peeking at post-window tape — without the
-        # clamp, a SELL submitted at e.g. `window_end - 60s` with a
-        # 4h `trade_window_seconds` would consume ~4h of future
-        # data.
-        trade_window_seconds=interval_seconds,
+        # Per-submit fill walk capped at `min(kline_size, 600s)`. The
+        # original design fetched a full kline of trade tape per submit
+        # (4h on r0014), which over the SSH tunnel cost 3-6s wall and
+        # tripped `drain slow` on every order. Real market orders fill
+        # in the first few trades — 10 minutes is ample tape to walk a
+        # MARKET fill or expire a stuck LIMIT. The kline cap still
+        # applies for sub-10m bundles. `window_end_clamp` continues to
+        # block any peek past the window end.
+        trade_window_seconds=min(interval_seconds, 600),
         window_end_clamp=window_end,
         slippage_model=slippage_model,
         maker_fill_model=maker_fill_model,
@@ -356,6 +405,7 @@ def run_window_in_process(
         epoch_id=1, venue_rest_url='http://sim', venue_ws_url='ws://sim',
         account_credentials={'bts-sweep': ('k', 's')}, shutdown_timeout=5.0,
     )
+    _bts_t = _bts_lap('SimulatedVenueAdapter init', _bts_t)
     launcher = BacktestLauncher(
         trading_config=tc,
         instances=[InstanceConfig(
@@ -367,7 +417,18 @@ def run_window_in_process(
         venue_adapter=adapter,
         db_path=work / 'event_spine.sqlite',
         max_allocation_per_trade_pct=max_allocation_per_trade_pct,
+        # Smart kline-aware clock tick: pass the bundle's kline_size
+        # so `_advance_clock_until` jumps big between boundaries and
+        # crosses each boundary with a 250ms real-time pause. Brings
+        # the per-day idle `time.sleep` budget from ~7s to ~1.5s
+        # while preserving the parity guarantee (each kline boundary
+        # gets a single freezer tick + generous asyncio settle).
+        # Earlier attempt to use `kline_size` as the UNIFORM tick
+        # collapsed Timer fires (1 of 6 captured); the smart path
+        # ticks 1s across the boundary instead of jumping past it.
+        clock_tick_seconds=interval_seconds,
     )
+    _bts_t = _bts_lap('BacktestLauncher init', _bts_t)
     # Auditor (post-v2.0.2) "make it real": capture per-tick runtime
     # predictions so the sweep can assert SignalsTable parity AGAINST
     # the deployed strategy's actual decisions. The hook wraps Nexus's
@@ -404,10 +465,12 @@ def run_window_in_process(
         return signal
 
     setattr(_predict_loop_mod, 'produce_signal', _capturing_produce_signal)
+    _bts_t = _bts_lap('predict-hook install', _bts_t)
     try:
         launcher.run_window(window_start, window_end)
     finally:
         setattr(_predict_loop_mod, 'produce_signal', _real_produce_signal)
+    _bts_t = _bts_lap('launcher.run_window', _bts_t)
     # Slice #17 Task 18: dump the run's EventSpine to JSONL for
     # ledger-parity comparison. Always-dump (codex round 1 #4): the
     # operator gets a comparable artifact regardless of whether
@@ -423,6 +486,7 @@ def run_window_in_process(
         sqlite_path=spine_sqlite,
         jsonl_path=spine_jsonl,
     )
+    _bts_t = _bts_lap('dump_event_spine', _bts_t)
     # Per-window event-type counts feed the operator's five-question
     # scan: did my strategy decide to act (intents)? did the venue
     # accept (submitted)? did money move (fills)? what's still hanging
@@ -679,8 +743,10 @@ def run_window_in_subprocess(
     *,
     maker_preference: bool = False,
     strict_impact: bool = False,
+    trades_parquet_path: str | None = None,
     max_allocation_per_trade_pct: Decimal | None = None,
     predict_lookback: int | None = None,
+    display_id: int | None = None,
 ) -> WindowResult:
     """Run one window in a fresh Python interpreter for state isolation."""
     payload = json.dumps({
@@ -691,6 +757,7 @@ def run_window_in_subprocess(
         'experiment_dir': str(experiment_dir),
         'maker_preference': bool(maker_preference),
         'strict_impact': bool(strict_impact),
+        'trades_parquet_path': trades_parquet_path,
         'max_allocation_per_trade_pct': (
             None if max_allocation_per_trade_pct is None
             else str(max_allocation_per_trade_pct)
@@ -698,6 +765,7 @@ def run_window_in_subprocess(
         'predict_lookback': (
             None if predict_lookback is None else int(predict_lookback)
         ),
+        'display_id': None if display_id is None else int(display_id),
     })
     # Propagate the bts op-sfd cache dir to the child's
     # PYTHONPATH so Limen's `Trainer.train()` (invoked inside
@@ -711,14 +779,25 @@ def run_window_in_subprocess(
     env['PYTHONPATH'] = os.pathsep.join(
         p for p in (op_sfd_pythonpath(), existing) if p
     )
+    # Pin polars to a single Rust thread per subprocess. The Rust
+    # thread pool's GIL acquire on shutdown races against Python
+    # interpreter teardown; with N parallel subprocesses each running
+    # their own polars pool, the panics cascade. One thread → no pool
+    # → no race.
+    env['POLARS_MAX_THREADS'] = '1'
+    # `stderr=None` lets the child's per-phase timing prints reach the
+    # operator's terminal in real time. Without this, `capture_output=True`
+    # buffered stderr and the phase prints only surfaced on failure —
+    # making "stuck for a minute or two" indistinguishable from "crashed".
     proc = subprocess.run(
         [sys.executable, '-m', 'backtest_simulator.cli._run_window'],
         input=payload,
-        capture_output=True, text=True, check=False, timeout=120,
+        stdout=subprocess.PIPE, stderr=None,
+        text=True, check=False, timeout=120,
         env=env,
     )
     if proc.returncode != 0:
-        msg = f'child exit={proc.returncode}; stderr tail: {proc.stderr[-400:]}'
+        msg = f'child exit={proc.returncode}; stdout tail: {proc.stdout[-400:]}'
         raise RuntimeError(msg)
     last: str | None = None
     for line in proc.stdout.splitlines():
@@ -750,6 +829,24 @@ def _child_main() -> int:
     the operator's terminal).
     """
     import logging as _logging
+    # Silence Praxis / Nexus / Limen INFO logs in this subprocess.
+    # They go to stdout via structlog's PrintLogger; stdout is a PIPE
+    # to the parent. Under parallel batches the per-subprocess INFO
+    # spam triggers EPIPE on some writes (parent's reader thread
+    # contention), surfacing as BrokenPipeError in `nexus-bts-sweep`.
+    # Stdlib level (for `_log.info` calls in our own code) and
+    # structlog level (for Praxis / Nexus emitters) both moved to
+    # WARNING. The parent already silences these at sweep start; the
+    # subprocess re-imports fresh, so we re-apply here.
+    for _name in ('limen', 'praxis', 'nexus'):
+        _logging.getLogger(_name).setLevel(_logging.WARNING)
+    try:
+        import structlog as _structlog
+        _structlog.configure(
+            wrapper_class=_structlog.make_filtering_bound_logger(_logging.WARNING),
+        )
+    except ImportError:
+        pass
     _level_name = os.environ.get('BTS_RUN_WINDOW_LOG_LEVEL')
     if _level_name:
         # Copilot caught: `logging.basicConfig(level=...)` is
@@ -772,9 +869,21 @@ def _child_main() -> int:
             format='%(levelname)s %(name)s %(message)s',
             force=True,
         )
+    # Hard rule: one HuggingFace pull per sweep, performed in the parent
+    # before subprocesses spawn. The parent writes the fresh klines to
+    # `~/.cache/backtest_simulator/limen_klines/btcusdt_{kline_size}.parquet`;
+    # `install_cache()` patches `HistoricalData.get_spot_klines` so the
+    # launcher's `BacktestMarketDataPoller.start()` reads that parquet
+    # rather than re-streaming the full dataset from HuggingFace.
+    # Idempotent: the install guard (`HistoricalData._bts_cache_installed`)
+    # short-circuits a second call within the same interpreter.
+    from backtest_simulator._limen_cache import install_cache
+    install_cache()
     payload = json.loads(sys.stdin.read())
     raw_max_alloc = payload.get('max_allocation_per_trade_pct')
     raw_lookback = payload.get('predict_lookback')
+    raw_display_id = payload.get('display_id')
+    raw_trades_parquet = payload.get('trades_parquet_path')
     result = run_window_in_process(
         int(payload['perm_id']),
         Decimal(payload['kelly_pct']),
@@ -783,15 +892,25 @@ def _child_main() -> int:
         Path(payload['experiment_dir']),
         maker_preference=bool(payload.get('maker_preference', False)),
         strict_impact=bool(payload.get('strict_impact', False)),
+        trades_parquet_path=(
+            None if raw_trades_parquet is None else str(raw_trades_parquet)
+        ),
         max_allocation_per_trade_pct=(
             None if raw_max_alloc is None else Decimal(str(raw_max_alloc))
         ),
         predict_lookback=(
             None if raw_lookback is None else int(raw_lookback)
         ),
+        display_id=None if raw_display_id is None else int(raw_display_id),
     )
     print(json.dumps(result), flush=True)
-    return 0
+    # Skip Python interpreter teardown to dodge the polars/pyo3 race
+    # where Rust worker threads call Python APIs after the interpreter
+    # has begun finalising. The result is already serialised to stdout
+    # and read by the parent before the child's exit signal lands.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == '__main__':  # pragma: no cover - subprocess child entry

@@ -5,6 +5,7 @@ import asyncio
 import importlib
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -869,6 +870,7 @@ class BacktestLauncher(Launcher):
         db_path: Path | None = None,
         historical_data: HistoricalData | None = None,
         max_allocation_per_trade_pct: Decimal | None = None,
+        clock_tick_seconds: int | None = None,
     ) -> None:
         # A backtest run is one window, one set of events — not a live
         # service that needs durable state across processes. Starting
@@ -890,6 +892,20 @@ class BacktestLauncher(Launcher):
             healthz_port=None,
         )
         self._historical_data = historical_data or HistoricalData()
+        # `clock_tick_seconds` controls how coarsely the main thread
+        # advances frozen time inside `_advance_clock_until`. The
+        # default of 120s was sized for sub-minute Timer cadences; for
+        # bts sweeps with kline_size >> 120s (e.g. 4h klines) it's
+        # 60-120x finer than necessary — most iterations sleep 10ms +
+        # drain to find no new submits. Pass `kline_size` here and
+        # the loop iterates only once per strategy tick boundary.
+        # `None` keeps the legacy 120s behaviour for callers that
+        # haven't been audited.
+        self._clock_tick_seconds = (
+            timedelta(seconds=clock_tick_seconds)
+            if clock_tick_seconds is not None
+            else _CLOCK_TICK_SECONDS
+        )
         # Synchronous-drain counters. `_submitted_commands` is bumped by
         # the action_submitter's `on_submit` callback after every
         # successful `praxis_outbound.send_command`; the main clock loop
@@ -1616,12 +1632,37 @@ class BacktestLauncher(Launcher):
         # `accelerated_clock` patches `threading.Timer.run` to poll the
         # frozen clock instead, so the timer fires when enough frozen
         # time has elapsed — but that requires someone to actually
-        # advance the frozen clock. Here we do: tick by
-        # `_CLOCK_TICK_SECONDS` each iteration, pause briefly in real
-        # time to let the Timer thread + strategy callbacks + venue
-        # adapter + reconciliation process the tick, drain any pending
-        # submits, repeat until the frozen window end.
+        # advance the frozen clock.
+        #
+        # Two modes:
+        #   - Uniform mode (`_clock_tick_seconds <= 120s`): tick by
+        #     a fixed step (default 120s), pause 10ms, drain. Safe
+        #     for any cadence; default for callers that don't pass
+        #     `clock_tick_seconds`. Cost: 720 iters/day at 120s × 10ms
+        #     ≈ 7s of pure `time.sleep` per day.
+        #   - Smart kline-aware mode (`_clock_tick_seconds > 120s`):
+        #     `_clock_tick_seconds` is interpreted as the bundle's
+        #     `kline_size`. Far from a kline boundary the loop jumps
+        #     big (`margin - 60s`), preserving the 60s buffer; near a
+        #     boundary it crosses with a generous 250ms real-time
+        #     pause so the `produce_signal → on_signal → submit →
+        #     fill` chain has wall-clock time to complete BEFORE the
+        #     next freezer tick. Reduces 720 iters/day to ~20-25 for
+        #     a 4h kline; pause budget around each boundary stays in
+        #     the 250-300ms range that uniform mode delivered via 120
+        #     × 10ms.
         real_start = os.times()[4]
+        kline_size_s = self._clock_tick_seconds.total_seconds()
+        use_smart = kline_size_s > 120.0
+        # Buffer before a boundary where we slow down to single-tick
+        # crossings; >= the largest realistic asyncio-chain latency we
+        # need to absorb (300ms ClickHouse fetch + Praxis pump + drain).
+        _BOUNDARY_BUFFER_S = 60
+        # Real-time pause used when a tick CROSSES a kline boundary —
+        # gives the asyncio event loop, Praxis pump, venue adapter
+        # and `_drain_pending_submits` enough wall-clock to ferry the
+        # produce_signal → fill chain through before we tick again.
+        _BOUNDARY_PAUSE_S = 0.25
         while datetime.now(UTC) < end:
             if os.times()[4] - real_start > _REAL_TIME_CAP_SECONDS:
                 _log.warning(
@@ -1631,8 +1672,33 @@ class BacktestLauncher(Launcher):
                 )
                 return
             tick_fn = getattr(freezer, 'tick')
-            tick_fn(_CLOCK_TICK_SECONDS)
-            time.sleep(_CLOCK_TICK_REAL_PAUSE_SECONDS)
+            if use_smart:
+                frozen_now = datetime.now(UTC)
+                secs = frozen_now.timestamp()
+                # Next kline boundary aligned to UNIX epoch (matches
+                # the cadence the strategy's PredictLoop schedules
+                # against — Timer interval = `kline_size`).
+                next_boundary = (
+                    math.ceil((secs + 1e-6) / kline_size_s) * kline_size_s
+                )
+                margin_s = next_boundary - secs
+                end_dist_s = (end - frozen_now).total_seconds()
+                if margin_s > _BOUNDARY_BUFFER_S * 2:
+                    # Far from boundary — jump big, leave one buffer
+                    # behind so we approach the boundary with margin.
+                    tick_amt = margin_s - _BOUNDARY_BUFFER_S
+                    pause_s = _CLOCK_TICK_REAL_PAUSE_SECONDS
+                else:
+                    # In or near the boundary buffer — cross by 1s
+                    # and grant the asyncio chain a generous pause.
+                    tick_amt = min(margin_s + 1.0, end_dist_s)
+                    pause_s = _BOUNDARY_PAUSE_S
+                tick_amt = min(tick_amt, max(end_dist_s, 1.0))
+                tick_fn(timedelta(seconds=tick_amt))
+                time.sleep(pause_s)
+            else:
+                tick_fn(self._clock_tick_seconds)
+                time.sleep(_CLOCK_TICK_REAL_PAUSE_SECONDS)
             self._drain_pending_submits()
         # Grace drain: frozen time drifts because multiple threads
         # (main + per-Timer conditional-sleep) tick it concurrently, so

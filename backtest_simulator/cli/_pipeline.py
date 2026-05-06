@@ -931,23 +931,25 @@ def pick_decoders(
             flush=True,
         )
     picks: list[tuple[int, Decimal, Path, int]] = []
-    for i in range(take):
-        file_id = int(ranked['id'][i])
-        kelly = Decimal(str(ranked['backtest_mean_kelly_pct'][i]))
-        if input_from_file is not None:
-            # Narrowing: file_path is bound by the input-mode branch
-            # above; pyright doesn't carry the relationship between
-            # `input_from_file is not None` and `file_path is not
-            # None` across blocks, so re-state it here.
-            assert file_path is not None
+    # Mode 2 (input_from_file): each pick triggers `train_single_decoder`,
+    # which runs Limen's pipeline (feature engineering + sklearn fit) for
+    # one permutation. Each call writes to its own content-addressed
+    # `sub_dir` (cache_hash includes params + exp-code SHA), so there's
+    # no shared mutable state across picks. sklearn fit releases the GIL
+    # during numpy ops, so ThreadPool actually parallelises CPU work.
+    # Mode 1 (no `input_from_file`): no per-pick training — just append.
+    if input_from_file is not None:
+        # Narrow file_path for the entire batch; same rationale as the
+        # original sequential loop's per-iteration assertion.
+        assert file_path is not None
+        # Stage 1: pre-compute cache keys + sub_dirs for every pick;
+        # gather the work items the parallel pool will run.
+        work_items: list[tuple[int, Decimal, Path, dict[str, object], Path]] = []
+        for i in range(take):
+            file_id = int(ranked['id'][i])
+            kelly = Decimal(str(ranked['backtest_mean_kelly_pct'][i]))
             row = {k: ranked[k][i] for k in op_param_keys}
             params = row_params(row, op_param_keys)
-            # Cache key includes source filename stem AND a content
-            # hash of (the picked row's params + the operator's
-            # exp-code FILE CONTENT). Codex round-1 P1: hashing
-            # only the path lets in-place edits to `sfd.py` reuse
-            # the stale cached training. Hashing the file content
-            # closes that window — every edit -> new sub_dir.
             exp_code_content_hash = hashlib.sha256(
                 exp_code_path.read_bytes(),
             ).hexdigest()
@@ -964,21 +966,57 @@ def pick_decoders(
                 / f'{file_path.stem}_{exp_code_path.stem}_id_'
                 f'{file_id}_{cache_hash}'
             )
+            work_items.append((file_id, kelly, sub_dir, params, exp_code_path))
+        # Stage 2: sequential training. ThreadPool was tried but Limen's
+        # pipeline calls polars under the hood; polars' Rust thread pool
+        # races against Python interpreter teardown when multiple Python
+        # threads invoke polars concurrently — produces "Python interpreter
+        # is not initialized" panics. With the parent's parquet cache
+        # patch installed (sweep `_run` calls `install_cache()`), each
+        # train_single_decoder skips the ~38s HF fetch and runs in ~1-2s,
+        # so sequential is fast enough. Future: `ProcessPoolExecutor` if
+        # we ever need to parallelise this safely.
+        import time as _time
+        _t_train = _time.perf_counter()
+        n_cache_hits = 0
+        n_trained = 0
+        for item in work_items:
+            _file_id, _kelly, _sub_dir, _params, _exp_code_path = item
+            _t_one = _time.perf_counter()
+            _was_cached = _sub_dir.is_dir() and (_sub_dir / 'results.csv').is_file()
+            train_single_decoder(
+                _sub_dir, _params, _exp_code_path, op_param_keys,
+            )
+            _dt_one = _time.perf_counter() - _t_one
+            if _was_cached and _dt_one < 0.5:
+                n_cache_hits += 1
+                _status = 'cached'
+            else:
+                n_trained += 1
+                _status = 'trained'
             print(
-                f'  training file-id {file_id} from {file_path.name} '
-                f'(exp-code: {exp_code_path.name}, '
-                f'cache_hash={cache_hash[:8]}...)  kelly={kelly}  ...',
+                f'[{_dt_one:7.2f}s] decoder {_file_id:<6} {_status} '
+                f'(kelly={_kelly})',
                 flush=True,
             )
-            train_single_decoder(
-                sub_dir, params, exp_code_path, op_param_keys,
-            )
+        n_workers = 1
+        # Stage 3: assemble picks in the original ranked order. perm_id
+        # is 0 for every Mode-2 pick (each sub_dir was trained with
+        # permutation_ids=[0]); display_id == file_id.
+        for file_id, kelly, sub_dir, _params, _exp_code_path in work_items:
             picks.append((0, kelly, sub_dir, file_id))
-        else:
-            # Mode 1: cache_dir from ensure_trained_from_exp_code
-            # is the experiment_dir for all picks. Resolved above
-            # before the filter machinery runs. Same narrowing
-            # rationale as `assert file_path is not None` above.
+        print(
+            f'[{_time.perf_counter()-_t_train:7.2f}s] '
+            f'filter pool training done '
+            f'({len(work_items)} decoder(s), {n_workers} worker(s))',
+            flush=True,
+        )
+    else:
+        for i in range(take):
+            file_id = int(ranked['id'][i])
+            kelly = Decimal(str(ranked['backtest_mean_kelly_pct'][i]))
+            # Mode 1: cache_dir from ensure_trained_from_exp_code is the
+            # experiment_dir for all picks. Same narrowing rationale.
             assert cache_dir is not None
             picks.append((file_id, kelly, cache_dir, file_id))
     return picks, before
