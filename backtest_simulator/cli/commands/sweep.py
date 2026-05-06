@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from datetime import time as dtime
 from decimal import Decimal
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 # tqdm removed — sweep emits one log line per phase + one per window
 # completion. Progress bars muddied the parallel-batch output.
@@ -315,19 +315,31 @@ def _run(args: argparse.Namespace) -> int:
     session_dir.mkdir(parents=True, exist_ok=True)
     import json as _json2
     _index_path = sessions_root / 'index.json'
+    _existing_sessions: list[dict[str, object]] = []
     if _index_path.is_file():
+        _loaded: object = None
         try:
-            _index_data = _json2.loads(_index_path.read_text(encoding='utf-8'))
+            _loaded = _json2.loads(_index_path.read_text(encoding='utf-8'))
         except _json2.JSONDecodeError:
-            _index_data = {'sessions': []}
-    else:
-        _index_data = {'sessions': []}
+            # Corrupted manifest -> start fresh; the file is operator-
+            # facing only (dashboard manifest), no other downstream
+            # consumer reads it strictly.
+            pass
+        if isinstance(_loaded, dict):
+            _loaded_d = cast('dict[str, object]', _loaded)
+            _raw_sessions = _loaded_d.get('sessions')
+            if isinstance(_raw_sessions, list):
+                _raw_list = cast('list[object]', _raw_sessions)
+                _existing_sessions = [
+                    cast('dict[str, object]', s)
+                    for s in _raw_list if isinstance(s, dict)
+                ]
     _bundle_label = (
         Path(args.bundle).name if getattr(args, 'bundle', None)
         else (Path(args.exp_code).name if getattr(args, 'exp_code', None) else '?')
     )
     _now_iso = datetime.now(UTC).isoformat()
-    _index_data.setdefault('sessions', []).append({
+    _existing_sessions.append({
         'id': args.session_id,
         'started_at': _now_iso,
         'ended_at': None,
@@ -338,6 +350,7 @@ def _run(args: argparse.Namespace) -> int:
             getattr(args, 'replay_period_end', None),
         ],
     })
+    _index_data: dict[str, list[dict[str, object]]] = {'sessions': _existing_sessions}
     _tmp = _index_path.with_suffix(_index_path.suffix + '.tmp')
     _tmp.write_text(_json2.dumps(_index_data, indent=2), encoding='utf-8')
     _tmp.replace(_index_path)
@@ -579,29 +592,45 @@ def _run(args: argparse.Namespace) -> int:
     )
     _raw_max_alloc = getattr(args, 'max_allocation_per_trade_pct', None)
     _raw_lookback = getattr(args, 'predict_lookback', None)
-    _common_kwargs: dict[str, object] = {
-        'maker_preference': bool(getattr(args, 'maker', False)),
-        'strict_impact': bool(getattr(args, 'strict_impact', False)),
-        'trades_parquet_path': str(_trades_parquet),
-        'max_allocation_per_trade_pct': (
-            None if _raw_max_alloc is None else Decimal(str(_raw_max_alloc))
-        ),
-        'predict_lookback': (
-            None if _raw_lookback is None else int(_raw_lookback)
-        ),
-    }
-    window_specs: list[tuple[int, Decimal, Path, int, int, object, datetime, datetime]] = []
+    # Captured by `_run_one_window` below as concrete typed values so
+    # `run_window_in_subprocess` is called with named arguments and
+    # pyright can check each one. Avoids the `dict[str, object]`
+    # unpacking that needed `# type: ignore[arg-type]`.
+    _maker_preference = bool(getattr(args, 'maker', False))
+    _strict_impact = bool(getattr(args, 'strict_impact', False))
+    _trades_parquet_path = str(_trades_parquet)
+    _max_alloc_decimal: Decimal | None = (
+        None if _raw_max_alloc is None else Decimal(str(_raw_max_alloc))
+    )
+    _predict_lookback_int: int | None = (
+        None if _raw_lookback is None else int(_raw_lookback)
+    )
+    # Typed spec for one (perm, day) window. NamedTuple gives every
+    # downstream unpack site full pyright visibility — was previously
+    # `tuple[...]` losing types on `_p, _k, _ed, …` destructuring.
+    from typing import NamedTuple as _NamedTuple
+    class _WindowSpec(_NamedTuple):
+        perm_id: int
+        kelly: Decimal
+        exp_dir: Path
+        display_id: int
+        day_idx: int
+        day: datetime
+        window_start: datetime
+        window_end: datetime
+
+    window_specs: list[_WindowSpec] = []
     for perm_id, kelly, exp_dir, display_id in picks:
         decoder_day_returns[str(display_id)] = {}
         for day_idx, day in enumerate(days):
             window_start = datetime.combine(day.date(), hours_start, tzinfo=UTC)
             window_end = datetime.combine(day.date(), hours_end, tzinfo=UTC)
-            window_specs.append((
+            window_specs.append(_WindowSpec(
                 perm_id, kelly, exp_dir, display_id,
                 day_idx, day, window_start, window_end,
             ))
 
-    def _run_one_window(spec: tuple) -> tuple[object, float]:
+    def _run_one_window(spec: _WindowSpec) -> tuple[object, float]:
         from backtest_simulator.cli._run_window import (
             run_window_in_subprocess,
         )
@@ -616,7 +645,11 @@ def _run(args: argparse.Namespace) -> int:
         _result = run_window_in_subprocess(
             _perm_id, _kelly, _ws, _we, _exp_dir,
             display_id=_display_id,
-            **_common_kwargs,  # type: ignore[arg-type]
+            maker_preference=_maker_preference,
+            strict_impact=_strict_impact,
+            trades_parquet_path=_trades_parquet_path,
+            max_allocation_per_trade_pct=_max_alloc_decimal,
+            predict_lookback=_predict_lookback_int,
         )
         return _result, time.perf_counter() - _t_work_start
 
@@ -679,10 +712,11 @@ def _run(args: argparse.Namespace) -> int:
             if _buy_notional > 0 else Decimal('0')
         )
         _runtime_preds = _r.get('runtime_predictions', [])
-        _all_probs = [
-            float(e['prob']) for e in _runtime_preds
-            if isinstance(e.get('prob'), (int, float))
-        ]
+        _all_probs: list[float] = []
+        for _e in _runtime_preds:
+            _prob = _e.get('prob')
+            if isinstance(_prob, (int, float)):
+                _all_probs.append(float(_prob))
         _pmin = min(_all_probs) if _all_probs else None
         _pmax = max(_all_probs) if _all_probs else None
         csv_writer.writerow([
@@ -729,9 +763,11 @@ def _run(args: argparse.Namespace) -> int:
             parallel_results[(_p, _did, _label)] = _res
             _write_csv_row_now(_did, _label, _res)
             _n_done = len(parallel_results)
-            _n_trades = (
-                len(_res.get('trades', [])) if isinstance(_res, dict) else 0
-            )
+            _n_trades = 0
+            if isinstance(_res, dict):
+                _trades_field = cast('dict[str, object]', _res).get('trades')
+                if isinstance(_trades_field, list):
+                    _n_trades = len(cast('list[object]', _trades_field))
             print(
                 f'[{_t_window:7.2f}s] '
                 f'perm {_did:<6} {_label}  done  '
@@ -1056,17 +1092,27 @@ def _run(args: argparse.Namespace) -> int:
         embargo_seconds=int(args.cpcv_embargo_seconds),
     )
     # Mark the session manifest as finished so the dashboard dropdown
-    # shows ✓ instead of ●. Read-modify-write atomic via tmp+replace.
+    # shows checkmark instead of dot. Read-modify-write atomic via tmp+replace.
+    _loaded_end: object = None
     try:
-        _idx_at_end = _json2.loads(
-            _index_path.read_text(encoding='utf-8'),
-        )
+        _loaded_end = _json2.loads(_index_path.read_text(encoding='utf-8'))
     except (_json2.JSONDecodeError, OSError):
-        _idx_at_end = {'sessions': []}
-    for _entry in _idx_at_end.get('sessions', []):
+        pass
+    _end_sessions: list[dict[str, object]] = []
+    if isinstance(_loaded_end, dict):
+        _end_d = cast('dict[str, object]', _loaded_end)
+        _raw_end = _end_d.get('sessions')
+        if isinstance(_raw_end, list):
+            _raw_end_list = cast('list[object]', _raw_end)
+            _end_sessions = [
+                cast('dict[str, object]', s)
+                for s in _raw_end_list if isinstance(s, dict)
+            ]
+    for _entry in _end_sessions:
         if _entry.get('id') == args.session_id:
             _entry['ended_at'] = datetime.now(UTC).isoformat()
             break
+    _idx_at_end: dict[str, list[dict[str, object]]] = {'sessions': _end_sessions}
     _tmp_end = _index_path.with_suffix(_index_path.suffix + '.tmp')
     _tmp_end.write_text(_json2.dumps(_idx_at_end, indent=2), encoding='utf-8')
     _tmp_end.replace(_index_path)
@@ -1181,15 +1227,17 @@ def _build_and_save_signals_tables(
     _t_klines = time.perf_counter()
     if _cp.is_file():
         cached = _pl.read_parquet(_cp)
-        cached_max = cached['datetime'].max()
-        # `datetime` column from limen is tz-naive UTC; compare against
-        # naive `_now_utc` to avoid tz-mixing TypeError.
-        if cached_max is not None:
-            cached_max_aware = (
-                cached_max if cached_max.tzinfo is not None
-                else cached_max.replace(tzinfo=UTC)
+        # `polars.Series.max()` is typed as `PythonLiteral | None`;
+        # at runtime on a `Datetime[us, UTC]` column it's a `datetime`
+        # (or `None` when empty). Narrow explicitly so the tz-aware
+        # comparison below is type-safe.
+        _cached_max_obj: object = cached['datetime'].max()
+        if isinstance(_cached_max_obj, datetime):
+            _cached_max_aware = (
+                _cached_max_obj if _cached_max_obj.tzinfo is not None
+                else _cached_max_obj.replace(tzinfo=UTC)
             )
-            age_h = (_now_utc - cached_max_aware).total_seconds() / 3600.0
+            age_h = (_now_utc - _cached_max_aware).total_seconds() / 3600.0
             if age_h < _STALE_THRESHOLD_HOURS:
                 klines_shared = cached
                 _use_cache = True
@@ -1213,14 +1261,22 @@ def _build_and_save_signals_tables(
             f'klines refetched from HuggingFace ({klines_shared.height} rows)',
             flush=True,
         )
-    klines_max_dt = klines_shared['datetime'].max()
-    if klines_max_dt is None or klines_max_dt < replay_end:
+    if klines_shared is None:
+        # Defensive narrow — the cache hit and refetch branches above
+        # both assign `klines_shared`, so this is unreachable in
+        # practice. Pyright needs the explicit `is None` check to
+        # drop the `DataFrame | None` annotation that lingers after
+        # the `_use_cache` branching.
+        msg = 'sweep signals: klines_shared not populated'
+        raise RuntimeError(msg)
+    _klines_max_dt_obj: object = klines_shared['datetime'].max()
+    if not isinstance(_klines_max_dt_obj, datetime) or _klines_max_dt_obj < replay_end:
         msg = (
-            f'sweep signals: klines end at {klines_max_dt}, '
+            f'sweep signals: klines end at {_klines_max_dt_obj}, '
             f'which is before replay_end '
             f'{replay_end.isoformat()}. The SignalsTable '
             f'would silently produce constant predictions '
-            f'for every tick past {klines_max_dt}. Either '
+            f'for every tick past {_klines_max_dt_obj}. Either '
             f'shorten --replay-period-end or wait for the '
             f'upstream klines dataset to publish through '
             f'the requested window.'
@@ -1283,57 +1339,6 @@ def _build_and_save_signals_tables(
         flush=True,
     )
     return tables
-
-
-def _print_sweep_signals_summary(
-    tables: dict[str, SignalsTable],
-    *, tick_timestamps: list[datetime],
-) -> None:
-    """One-line confirmation that SignalsTables built + saved + gated.
-
-    Auditor: SignalsTable build can honestly skip ticks when the
-    causal window is empty or feature warmup hasn't filled.
-    Reporting bar counts alone is reassuring but not diagnostic
-    — two decoders with the same bar count but different
-    warmup windows would print identically. Surface the
-    expected-vs-realized rows AND a coverage percentage so the
-    operator sees how much of the planned replay actually
-    produced predictions.
-
-    `expected = len(tick_timestamps)` is known up front (the
-    PredictLoop fires at every interval boundary); `actual` is
-    `t._frame.height`. Coverage < 100% means warmup or causal-
-    gap skips are eating bars; 100% means every tick produced a
-    prediction.
-    """
-    if not tables:
-        print('sweep signals    skipped: no SignalsTables built')
-        return
-    bar_counts = [t.n_bars for t in tables.values()]
-    expected = len(tick_timestamps)
-    avg_bars = sum(bar_counts) // max(1, len(bar_counts))
-    if expected > 0:
-        # Coverage = realized / expected, rendered per-decoder
-        # min/max so the operator sees if any single decoder
-        # under-built. Average is included for a quick pulse.
-        coverages = [c / expected for c in bar_counts]
-        cov_min = min(coverages)
-        cov_max = max(coverages)
-        cov_avg = sum(coverages) / len(coverages)
-        cov_str = (
-            f'  coverage={cov_avg * 100:.1f}% '
-            f'(min={cov_min * 100:.1f}% max={cov_max * 100:.1f}%)'
-        )
-    else:
-        cov_str = '  coverage=n/a (zero ticks scheduled)'
-    print(
-        f'sweep signals    n_decoders={len(tables)}  '
-        f'expected_bars={expected}  '
-        f'avg_bars_per_decoder={avg_bars}  '
-        f'min_bars={min(bar_counts)}  '
-        f'max_bars={max(bar_counts)}'
-        f'{cov_str}',
-    )
 
 
 def _print_cpcv_pbo_summary(
