@@ -41,8 +41,17 @@ if TYPE_CHECKING:
     # freezegun's `FrozenDateTimeFactory.move_to(target_datetime)`
     # signatures byte-for-byte; renaming the parameter on either side
     # would break Protocol contravariance at the launcher's call site.
-    from freezegun.api import FrozenDateTimeFactory
+    # `_FreezerFactory` is the same union `clock.py:_FreezerFactory`
+    # carries — the three concrete classes `freeze_time()` may return
+    # depending on `tick` / `auto_tick_seconds` kwargs.
+    from freezegun.api import (
+        FrozenDateTimeFactory,
+        StepTickTimeFactory,
+        TickingDateTimeFactory,
+    )
     from nexus.startup.sequencer import WiredSensor
+
+    _FreezerFactory = FrozenDateTimeFactory | StepTickTimeFactory | TickingDateTimeFactory
 
 _log = logging.getLogger(__name__)
 
@@ -224,7 +233,7 @@ class ReplayClock:
         predict_loop: _PredictLoop,
         outcome_loop: _OutcomeLoop,
         drain_pending_submits: Callable[[], None],
-        freezer: FrozenDateTimeFactory,
+        freezer: _FreezerFactory,
     ) -> None:
         """Drive one backtest window synchronously to completion.
 
