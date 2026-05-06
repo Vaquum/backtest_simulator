@@ -903,30 +903,22 @@ class BacktestLauncher(Launcher):
             healthz_port=None,
         )
         self._historical_data = historical_data or HistoricalData()
-        # `clock_tick_seconds` controls how coarsely the main thread
-        # advances frozen time inside `_advance_clock_until`. The
-        # default of 120s was sized for sub-minute Timer cadences; for
-        # bts sweeps with kline_size >> 120s (e.g. 4h klines) it's
-        # 60-120x finer than necessary — most iterations sleep 10ms +
-        # drain to find no new submits. Pass `kline_size` here and
-        # the loop iterates only once per strategy tick boundary.
-        # `None` keeps the legacy 120s behaviour for callers that
-        # haven't been audited.
+        # `clock_tick_seconds`: accepted for backward compatibility with
+        # `cli/_run_window.py` (out of scope for slice 0; see #64). The
+        # synchronous replay path introduced by `ReplayClock.drive_window`
+        # reads cadence from `wired_sensor.interval_seconds`, NOT from
+        # this stored value, so the parameter is now a silent no-op.
+        # The validate-and-store pattern stays so existing callers don't
+        # break; the field is retired in a follow-up slice that touches
+        # `cli/_run_window.py`. Sub-zero values are still rejected so a
+        # caller that hands in a bogus value sees the failure at
+        # construction time rather than via a downstream NoneType crash
+        # if the field is ever re-read.
         if clock_tick_seconds is not None and clock_tick_seconds <= 0:
-            # `_advance_clock_until` derives boundary buffers and
-            # tick amounts from `_clock_tick_seconds.total_seconds()`;
-            # zero or negative would produce zero / negative
-            # timedeltas and either spin or freeze (Copilot P1).
-            msg = (
-                f'clock_tick_seconds must be > 0 when provided, '
-                f'got {clock_tick_seconds!r}.'
-            )
-            raise ValueError(msg)
-        self._clock_tick_seconds = (
-            timedelta(seconds=clock_tick_seconds)
-            if clock_tick_seconds is not None
-            else _CLOCK_TICK_SECONDS
-        )
+            raise ValueError(f'clock_tick_seconds must be > 0 when provided, got {clock_tick_seconds!r}.')
+        if clock_tick_seconds is not None:
+            _log.info('clock_tick_seconds=%s ignored — ReplayClock reads cadence from wired_sensor.interval_seconds (slice 0; #64)', clock_tick_seconds)
+        self._clock_tick_seconds = timedelta(seconds=clock_tick_seconds) if clock_tick_seconds is not None else _CLOCK_TICK_SECONDS
         # Synchronous-drain counters. `_submitted_commands` is bumped by
         # the action_submitter's `on_submit` callback after every
         # successful `praxis_outbound.send_command`; the main clock loop
@@ -1429,35 +1421,39 @@ class BacktestLauncher(Launcher):
         return NexusInstanceConfig(account_id=inst.account_id, venue='binance_spot_simulated')
 
     def run_window(self, start: datetime, end: datetime) -> None:
-        """Run the backtest from `start` to `end`; boot then accelerate.
+        """Run the backtest from `start` to `end`; boot then synchronously replay.
 
         Boot (Trading + Nexus StartupSequencer + Trainer + strategy
         on_startup) runs under REAL wall time. Nexus's Trainer re-streams
         the full BTCUSDT-klines dataset from HuggingFace on every boot
         (Limen has no on-disk cache) and that fetch takes ~20 real
         seconds plus sklearn refit. Running that under `accelerated_clock`
-        lets concurrent asyncio.sleep sites tick the frozen clock
-        forward during the real-time HTTPS wait and burn through the
-        backtest window before PredictLoop ticks at all.
+        lets concurrent asyncio.sleep sites burn through the backtest
+        window before any predict tick fires.
 
-        The flow instead:
+        The flow:
           1. Launch thread starts under real time — Trainer fetches at
              full speed, SSL validates against a 2026 real clock, and
-             every Nexus instance logs 'nexus instance running' when its
-             StartupSequencer completes and PredictLoop.start() has
-             been called.
-          2. A log handler keyed on that message releases a barrier
-             once all instances are up.
+             every Nexus instance signals `_nexus_running` once its
+             StartupSequencer completes and the per-instance
+             `PredictLoop` / `OutcomeLoop` are constructed (NOT
+             started — see `_run_my_nexus_instance`).
+          2. A direct `threading.Event` releases a barrier once all
+             instances are up.
           3. We enter `accelerated_clock(start)` at that point. The
-             main thread is now the sole driver of frozen time:
-             `_advance_clock_until` ticks the freezer by
-             `_CLOCK_TICK_SECONDS` per iteration while asyncio sleeps
-             and `threading.Timer.run` wait (via the frozen-aware
-             patch in `clock.py`) for the frozen clock to reach their
-             targets.
-          4. Main thread blocks until `datetime.now(UTC) >= end`, then
-             calls `request_stop()`. A real-wall-clock cap protects
-             against runs that never produce a sleep.
+             main thread is the sole driver of frozen time:
+             `ReplayClock.drive_window` jumps the freezer to each
+             pre-computed kline boundary in `(start, end]`, calls
+             `predict_loop.tick_once(wired)` per sensor synchronously
+             (Nexus's public single-shot entry, vaquum-nexus >=
+             0.41.0), then drains pending submits + routed outcomes
+             to quiescence (repeat-until-fixed-point) before
+             advancing.
+          4. After `drive_window` returns, `request_stop()` releases
+             the launch thread. There is no `_advance_clock_until`,
+             no `threading.Timer.run` monkey-patch, no real-time
+             pause budget per boundary; the synchronous replay path
+             is deterministic by construction (slice 0, RFC-2001).
         """
         if end <= start:
             msg = f'run_window: end {end} must be after start {start}'

@@ -1,28 +1,25 @@
-"""Schedule-driven replay clock for `backtest_simulator`.
-
-Replaces the racy `threading.Timer` + `freezer.tick(...)` collision in
-the legacy `_advance_clock_until` path with a single-thread driver:
-
-  - boundaries are pre-computed from `(window_start, window_end]`
-  - frozen time jumps directly to each boundary (`freezer.move_to`),
-    no polling, no real-time sleep
-  - per-sensor predict cadence is invoked synchronously via Nexus's
-    public `PredictLoop.tick_once(wired)` (vaquum-nexus >= 0.41.0)
-  - submits and outcomes drain to quiescence between boundaries; the
-    drain loop repeats until both queues are empty in the same pass,
-    so an `on_outcome` that emits new actions cannot leave residue.
-
-The Timer-driven `PredictLoop` and worker-thread `OutcomeLoop` are
-not started in the synchronous replay path; `drive_window` fails loud
-on entry if either is running, and on heterogeneous-cadence wired
-sensors. Strategy-authored timers (`TimerLoop`) are not supported in
-this path; the launcher fails loud upstream when the sequencer
-declares `timer_specs`.
-
-Production Praxis is unchanged. The simulator stops faking real-time
-scheduling; everything else (strategy logic, venue adapter, account
-loop, fill chain) is the same code Praxis runs.
-"""
+"""Schedule-driven replay clock — single-thread driver for backtest replay."""
+# Replaces the racy `threading.Timer` + `freezer.tick(...)` collision in
+# the legacy `_advance_clock_until` path with a single-thread driver:
+#   - boundaries are pre-computed from `(window_start, window_end]`
+#   - frozen time jumps directly to each boundary (`freezer.move_to`),
+#     no polling, no real-time sleep
+#   - per-sensor predict cadence is invoked synchronously via Nexus's
+#     public `PredictLoop.tick_once(wired)` (vaquum-nexus >= 0.41.0)
+#   - submits and outcomes drain to quiescence between boundaries; the
+#     drain loop repeats until both queues are empty in the same pass,
+#     so an `on_outcome` that emits new actions cannot leave residue.
+#
+# The Timer-driven `PredictLoop` and worker-thread `OutcomeLoop` are
+# not started in the synchronous replay path; `drive_window` fails loud
+# on entry if either is running, and on heterogeneous-cadence wired
+# sensors. Strategy-authored timers (`TimerLoop`) are not supported in
+# this path; the launcher fails loud upstream when the sequencer
+# declares `timer_specs`.
+#
+# Production Praxis is unchanged. The simulator stops faking real-time
+# scheduling; everything else (strategy logic, venue adapter, account
+# loop, fill chain) is the same code Praxis runs.
 
 from __future__ import annotations
 
@@ -30,7 +27,16 @@ import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    # `WiredSensor` is imported under TYPE_CHECKING so the Protocol's
+    # `tick_once(wired: WiredSensor)` matches Nexus's actual
+    # `PredictLoop.tick_once` signature without a runtime import (the
+    # Nexus circular import — `nexus.startup.shutdown_sequencer` <->
+    # `nexus.strategy.predict_loop` — would otherwise propagate to any
+    # caller that imports `replay_clock` from a clean interpreter).
+    from nexus.startup.sequencer import WiredSensor
 
 _log = logging.getLogger(__name__)
 
@@ -54,7 +60,7 @@ class _PredictLoop(Protocol):
     @property
     def running(self) -> bool: ...
 
-    def tick_once(self, wired: object) -> None: ...
+    def tick_once(self, wired: WiredSensor) -> None: ...
 
 
 class _OutcomeLoop(Protocol):
@@ -108,6 +114,19 @@ def compute_kline_boundaries(
     if window_start.tzinfo is None:
         msg = (
             'compute_kline_boundaries: window_start must be timezone-aware'
+        )
+        raise ValueError(msg)
+    if window_end.tzinfo is None:
+        msg = (
+            'compute_kline_boundaries: window_end must be timezone-aware'
+        )
+        raise ValueError(msg)
+    if window_start.tzinfo != window_end.tzinfo:
+        msg = (
+            f'compute_kline_boundaries: window_start.tzinfo ({window_start.tzinfo}) '
+            f'and window_end.tzinfo ({window_end.tzinfo}) must match. The '
+            f'epoch alignment is anchored to window_start.tzinfo; mismatched '
+            f'tzinfo would produce off-by-N-hour boundaries.'
         )
         raise ValueError(msg)
     if window_end < window_start:
@@ -180,7 +199,7 @@ class ReplayClock:
     increments a "drained" counter so the loop can be observed.
     """
 
-    def drive_window(  # noqa: PLR0913 — slice 0 spec pins these 7 keyword-only params
+    def drive_window(
         self,
         *,
         window_start: datetime,

@@ -25,7 +25,7 @@ import sys
 import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -307,10 +307,27 @@ class TestComputeKlineBoundaries:
             )
 
     def test_naive_window_start_raises(self) -> None:
-        with pytest.raises(ValueError, match='timezone-aware'):
+        with pytest.raises(ValueError, match='window_start must be timezone-aware'):
             compute_kline_boundaries(
                 window_start=datetime(2026, 4, 4, 0, 0),
                 window_end=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+                interval_seconds=14400,
+            )
+
+    def test_naive_window_end_raises(self) -> None:
+        with pytest.raises(ValueError, match='window_end must be timezone-aware'):
+            compute_kline_boundaries(
+                window_start=datetime(2026, 4, 4, 0, 0, tzinfo=UTC),
+                window_end=datetime(2026, 4, 4, 8, 0),
+                interval_seconds=14400,
+            )
+
+    def test_mismatched_tzinfo_raises(self) -> None:
+        plus_one = timezone(timedelta(hours=1))
+        with pytest.raises(ValueError, match='must match'):
+            compute_kline_boundaries(
+                window_start=datetime(2026, 4, 4, 0, 0, tzinfo=UTC),
+                window_end=datetime(2026, 4, 4, 8, 0, tzinfo=plus_one),
                 interval_seconds=14400,
             )
 

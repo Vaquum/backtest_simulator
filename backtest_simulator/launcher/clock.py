@@ -1,17 +1,15 @@
-"""accelerated_clock: freezegun wrapper for backtest replay.
-
-Frozen time is owned by `backtest_simulator.launcher.replay_clock.ReplayClock`,
-which calls `freezer.move_to(boundary)` synchronously from a single thread
-at every pre-computed kline boundary. No `threading.Timer` polling, no
-`asyncio.sleep` patch — strategy `produce_signal` calls fire when (and
-only when) `ReplayClock` invokes `PredictLoop.tick_once(wired)` (the
-public single-shot entry exposed by vaquum-nexus >= 0.41.0).
-
-The legacy `_frozen_aware_timer_run` monkey-patch on `threading.Timer.run`
-is gone. The race it tried to absorb (multiple threads writing the
-shared frozen clock) is gone with it: only `ReplayClock`'s thread ever
-moves frozen time forward.
-"""
+"""accelerated_clock: freezegun wrapper for backtest replay."""
+# Frozen time is owned by `backtest_simulator.launcher.replay_clock.ReplayClock`,
+# which calls `freezer.move_to(boundary)` synchronously from a single thread
+# at every pre-computed kline boundary. No `threading.Timer` polling, no
+# `asyncio.sleep` patch — strategy `produce_signal` calls fire when (and
+# only when) `ReplayClock` invokes `PredictLoop.tick_once(wired)` (the
+# public single-shot entry exposed by vaquum-nexus >= 0.41.0).
+#
+# The legacy `_frozen_aware_timer_run` monkey-patch on `threading.Timer.run`
+# is gone. The race it tried to absorb (multiple threads writing the
+# shared frozen clock) is gone with it: only `ReplayClock`'s thread ever
+# moves frozen time forward.
 from __future__ import annotations
 
 import logging
