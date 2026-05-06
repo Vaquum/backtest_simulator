@@ -48,8 +48,6 @@ def atomic_index_update(
         for diagnostics but `index_path` is never overwritten.
     """
     index_path.parent.mkdir(parents=True, exist_ok=True)
-    if not index_path.is_file():
-        index_path.write_text('{"sessions": []}', encoding='utf-8')
     lock_path = index_path.with_suffix(index_path.suffix + '.lock')
     try:
         lock_fp = lock_path.open('w', encoding='utf-8')
@@ -61,8 +59,16 @@ def atomic_index_update(
         return
     try:
         fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        # Seed inside the flock so two concurrent sweeps starting on
+        # a fresh machine (no `index.json` yet) cannot race the
+        # initial write — Copilot P1. Without the lock, both
+        # processes saw `not is_file()` and both raced to write the
+        # seed; if both writes interleaved the file could end up
+        # partial / empty before either took the flock.
         try:
             raw = index_path.read_text(encoding='utf-8')
+        except FileNotFoundError:
+            raw = ''
         except OSError as exc:
             sys.stderr.write(
                 f'bts sweep: cannot read sessions index at '

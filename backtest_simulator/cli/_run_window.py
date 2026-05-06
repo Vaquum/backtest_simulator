@@ -335,8 +335,15 @@ def run_window_in_process(
     # outside the sweep flow like `bts run`).
     feed: ClickHouseFeed | InMemoryTradesFeed
     if trades_parquet_path is not None:
+        # `prefetch_sweep_trades` writes a parquet that is already
+        # `sort(['time','trade_id'])`-ordered + `set_sorted('time')`,
+        # but polars sorted-flags are lazy (not persisted in parquet
+        # metadata), so the re-loaded frame in the subprocess is
+        # UNMARKED. Re-mark `time` sorted so `InMemoryTradesFeed._slice`'s
+        # `(time >= start) & (time <= end)` filter takes the
+        # binary-search fast path instead of a full scan (Copilot P1).
         feed = InMemoryTradesFeed(
-            _pl_mod.read_parquet(trades_parquet_path),
+            _pl_mod.read_parquet(trades_parquet_path).set_sorted('time'),
             symbol=SYMBOL,
         )
     else:
