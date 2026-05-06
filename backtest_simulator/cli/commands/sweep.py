@@ -645,16 +645,29 @@ def _run(args: argparse.Namespace) -> int:
     _trade_fetch_end = replay_end + timedelta(seconds=600)
     # ClickHouse env may be missing in CI / unit-test contexts that
     # mock `run_window_in_subprocess` and never actually read the
-    # parquet. `_ChCfg.from_env()` raises `RuntimeError` on missing
-    # env vars in that case; we surface the reason to stderr and
-    # pass `trades_parquet_path=None` so the (mocked) subprocess
-    # path skips it. Real CLI usage always has the env set so this
-    # branch never fires in production sweeps.
-    import os as _envcheck
-    _ch_env_ok = bool(_envcheck.environ.get('CLICKHOUSE_PASSWORD'))
-    if _ch_env_ok:
+    # parquet. `_ChCfg.from_env()` raises `RuntimeError` on ANY
+    # missing required var (HOST/PORT/USER/PASSWORD), so we catch
+    # the RuntimeError directly rather than spot-checking one
+    # variable. The catch is narrow (RuntimeError, with the same
+    # message shape the env validator already produces) and the
+    # handler surfaces the reason to stderr before falling back to
+    # `trades_parquet_path=None`. Real CLI usage always has the env
+    # set so the except branch never fires in production sweeps;
+    # the (mocked) subprocess path in unit tests reaches the
+    # parity-check assertions instead of crashing on env init.
+    try:
+        _ch_config = _ChCfg.from_env()
+    except RuntimeError as _ch_exc:
+        sys.stderr.write(
+            f'bts sweep: ClickHouse env not configured ({_ch_exc}); '
+            f'skipping trades prefetch (subprocesses will fetch '
+            f'per-window or fail loudly if real ClickHouse access '
+            f'is needed).\n',
+        )
+        _trades_parquet_path: str | None = None
+    else:
         _trades_parquet = _prefetch_trades(
-            config=_ChCfg.from_env(),
+            config=_ch_config,
             symbol='BTCUSDT',
             start=_trade_fetch_start,
             end=_trade_fetch_end,
@@ -665,14 +678,7 @@ def _run(args: argparse.Namespace) -> int:
             f'trades tape ready: {_trades_parquet.name}',
             flush=True,
         )
-        _trades_parquet_path: str | None = str(_trades_parquet)
-    else:
-        sys.stderr.write(
-            'bts sweep: CLICKHOUSE_PASSWORD not set; skipping trades '
-            'prefetch (subprocesses will fetch per-window or fail '
-            'loudly if real ClickHouse access is needed).\n',
-        )
-        _trades_parquet_path = None
+        _trades_parquet_path = str(_trades_parquet)
     _raw_max_alloc = getattr(args, 'max_allocation_per_trade_pct', None)
     _raw_lookback = getattr(args, 'predict_lookback', None)
     # Captured by `_run_one_window` below as concrete typed values so
