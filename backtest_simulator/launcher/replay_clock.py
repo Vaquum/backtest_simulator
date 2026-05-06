@@ -31,12 +31,17 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    # `WiredSensor` is imported under TYPE_CHECKING so the Protocol's
-    # `tick_once(wired: WiredSensor)` matches Nexus's actual
-    # `PredictLoop.tick_once` signature without a runtime import (the
-    # Nexus circular import — `nexus.startup.shutdown_sequencer` <->
-    # `nexus.strategy.predict_loop` — would otherwise propagate to any
-    # caller that imports `replay_clock` from a clean interpreter).
+    # Imported under TYPE_CHECKING so neither runtime import propagates
+    # to clean-interpreter callers of `replay_clock` (the Nexus
+    # circular import — `nexus.startup.shutdown_sequencer` <->
+    # `nexus.strategy.predict_loop` — would otherwise fire on cold
+    # import; `freezegun.api` adds no runtime cost but stays
+    # consistent here). The Protocols below use these types to match
+    # Nexus's actual `PredictLoop.tick_once(wired: WiredSensor)` and
+    # freezegun's `FrozenDateTimeFactory.move_to(target_datetime)`
+    # signatures byte-for-byte; renaming the parameter on either side
+    # would break Protocol contravariance at the launcher's call site.
+    from freezegun.api import FrozenDateTimeFactory
     from nexus.startup.sequencer import WiredSensor
 
 _log = logging.getLogger(__name__)
@@ -48,19 +53,6 @@ _log = logging.getLogger(__name__)
 # legacy `_advance_clock_until` enforced; constructor-injectable so
 # tests can use a tiny cap without wall-clock waiting.
 _REAL_TIME_CAP_SECONDS_DEFAULT = 600.0
-
-
-class _Freezer(Protocol):
-    """Minimal protocol for the freezegun factory `drive_window` uses.
-
-    `freezegun.FrozenDateTimeFactory.move_to(target)` jumps the frozen
-    clock to `target`. We only need that one method, so the parameter
-    is typed via this Protocol rather than the union of three concrete
-    freezegun classes (which complicates type narrowing without buying
-    anything for callers).
-    """
-
-    def move_to(self, target: datetime) -> None: ...
 
 
 class _PredictLoop(Protocol):
@@ -232,7 +224,7 @@ class ReplayClock:
         predict_loop: _PredictLoop,
         outcome_loop: _OutcomeLoop,
         drain_pending_submits: Callable[[], None],
-        freezer: _Freezer,
+        freezer: FrozenDateTimeFactory,
     ) -> None:
         """Drive one backtest window synchronously to completion.
 
