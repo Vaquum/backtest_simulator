@@ -840,13 +840,15 @@ def _child_main() -> int:
     # subprocess re-imports fresh, so we re-apply here.
     for _name in ('limen', 'praxis', 'nexus'):
         _logging.getLogger(_name).setLevel(_logging.WARNING)
-    try:
-        import structlog as _structlog
-        _structlog.configure(
-            wrapper_class=_structlog.make_filtering_bound_logger(_logging.WARNING),
-        )
-    except ImportError:
-        pass
+    # `structlog` is a dependency of Praxis (transitive of bts via
+    # `vaquum-praxis`); it's always importable in this subprocess.
+    # No try/except needed — we want a hard failure if the
+    # environment is broken rather than a silent skip of the
+    # WARNING-level filter.
+    import structlog as _structlog
+    _structlog.configure(
+        wrapper_class=_structlog.make_filtering_bound_logger(_logging.WARNING),
+    )
     _level_name = os.environ.get('BTS_RUN_WINDOW_LOG_LEVEL')
     if _level_name:
         # Copilot caught: `logging.basicConfig(level=...)` is
