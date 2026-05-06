@@ -29,6 +29,7 @@ from typing import Protocol
 import numpy as np
 import polars as pl
 
+# tqdm removed — sweep emits one log line per phase, no progress bars.
 from backtest_simulator.launcher.poller import (
     DEFAULT_N_ROWS as POLLER_N_ROWS,
 )
@@ -196,29 +197,25 @@ def build_signals_table_for_decoder(
     timestamps: list[datetime] = []
     preds_list: list[int] = []
     probs_list: list[float] = []
+    # Per-tick `prepare_data` — Nexus's runtime recipe byte-for-byte.
+    # An earlier optimisation called `prepare_data` ONCE per decoder
+    # over the full window and sliced per tick; that was faster but
+    # fit Limen's scaler on a single window instead of the per-tick
+    # `tail(n_rows)` window the runtime uses. At decision boundaries
+    # the float scaler delta flipped int `pred`, raising
+    # `ParityViolation`. Strict mandate (strategy tested = strategy
+    # deployed) means we mirror runtime exactly here.
     for raw_tick in tick_timestamps:
         tick = _as_utc_datetime(raw_tick)
         causal = klines.filter(pl.col('datetime') <= tick).tail(effective_n_rows)
         if causal.is_empty():
-            # No klines yet at this tick — runtime poller would
-            # return an empty frame and `produce_signal` would emit
-            # an empty `signal.values`. Skip honestly.
             continue
         data_dict = manifest_full.prepare_data(causal, round_params)
         x_train_obj = data_dict.get('x_train')
-        # Limen's prep returns x_train as a polars DataFrame — narrow
-        # explicitly so the .is_empty() / .tail() / .to_numpy() chain
-        # is type-safe even though the dict is dict[str, object].
         if not isinstance(x_train_obj, pl.DataFrame) or x_train_obj.is_empty():
-            # Feature warmup hasn't filled — Nexus's runtime would
-            # also emit no Signal here. Skip honestly.
             continue
         last_x = x_train_obj.tail(effective_lookback).to_numpy()
         result = sensor.predict({'x_test': last_x})
-        # Mirror Nexus's `_extract_values`: take the last element of
-        # the predict output array, which corresponds to the current
-        # tick. With effective_lookback==1 this reduces to the legacy
-        # single-row behaviour.
         preds_list.append(int(result['_preds'][-1]))
         probs_list.append(float(result['_probs'][-1]))
         timestamps.append(tick)

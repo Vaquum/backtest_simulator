@@ -1065,19 +1065,26 @@ class SimulatedVenueAdapter:
         )
 
     async def query_order_book(self, symbol: str, *, limit: int = 20) -> OrderBookSnapshot:
-        # One-level book sourced from most recent trade. Real depth-20 needs a
-        # live book; this passes the Protocol so no hot-path consumer of the
-        # book exists in the backtest. HonestyStatus flags as ESTIMATED.
+        # One-level synthetic book at last-trade price; level `qty` is the
+        # SUM of trade quantities in the past 60s (a proxy for top-of-book
+        # liquidity). The previous shape used `last_trade.qty` alone, so
+        # Praxis's `estimate_slippage` saw a fake top-of-book of 0.0001 BTC
+        # and warned `book depth insufficient` on every order, even though
+        # 60s of BTCUSDT tape carries tens of BTC of volume. Aggregating
+        # makes the depth proxy honest at sweep scale; HonestyStatus still
+        # flags as ESTIMATED because it's a single synthetic level rather
+        # than a real depth-20 book.
         del limit
         now = self._now()
         trades = self._feed.get_trades(symbol, now - _I.window_seconds(60), now)
         if trades.is_empty():
             return OrderBookSnapshot(bids=(), asks=(), last_update_id=0)
         last = trades.tail(1).row(0, named=True)
-        px, qty = Decimal(str(last['price'])), Decimal(str(last['qty']))
+        px = Decimal(str(last['price']))
+        depth_qty = Decimal(str(trades['qty'].sum()))
         return OrderBookSnapshot(
-            bids=(OrderBookLevel(price=px, qty=qty),),
-            asks=(OrderBookLevel(price=px, qty=qty),),
+            bids=(OrderBookLevel(price=px, qty=depth_qty),),
+            asks=(OrderBookLevel(price=px, qty=depth_qty),),
             last_update_id=int(last.get('trade_id', 0)),
         )
 

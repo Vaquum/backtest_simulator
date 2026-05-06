@@ -1,3 +1,54 @@
+# v2.4.0
+
+Sweep performance + dashboard work. End-to-end sweep wall time on
+a 10×14 r0014 run drops from 60+ minutes (sequential subprocess per
+window, per-submit ClickHouse fetches, 4-hour fill walks) to ~2-3
+minutes. SignalsTable parity guarantee preserved throughout.
+
+Surfaces:
+- `backtest_simulator/cli/commands/sweep.py` — `--session-id`
+  required, session-scoped output dir under `~/sweep/sessions/<id>/`
+  with `index.json` manifest the dashboard polls; live per-window
+  CSV write inside `as_completed`; ThreadPoolExecutor parallel
+  per-window subprocess batch (capped at min(cpu/2, len, 8)); parent
+  install_cache for filter-pool training; one-fetch sweep-trades
+  prefetch via `prefetch_sweep_trades`; one-fetch klines with 48-h
+  freshness check; tqdm + per-decoder noise stripped; clean
+  `[X.XXs] message` log lines; `--max-allocation-per-trade-pct`
+  default 0.4 (matches r0014's kelly~0.18); ended_at update on exit.
+- `backtest_simulator/cli/_pipeline.py` — `pick_decoders` filter-pool
+  training emits `[X.XXs] decoder N cached/trained` per pick.
+- `backtest_simulator/cli/_run_window.py` — `trades_parquet_path`
+  param plumbed through `run_window_in_subprocess` payload;
+  `InMemoryTradesFeed` used in subprocess instead of ClickHouseFeed;
+  `trade_window_seconds=min(kline_size, 600)` caps fill-walk; smart
+  kline-aware `clock_tick_seconds` passed; `os._exit(0)` after JSON
+  result to dodge polars/pyo3 teardown race; structlog WARNING in
+  child to silence Praxis/Nexus pipe spam; `POLARS_MAX_THREADS=1`.
+- `backtest_simulator/cli/_signals_builder.py` — tqdm removed;
+  per-tick `prepare_data` retained (mandate-faithful — earlier
+  one-shot variant flipped int `pred` at decision boundaries).
+- `backtest_simulator/feed/clickhouse.py` — `InMemoryTradesFeed`
+  duck-typed for `VenueFeed` Protocol; `prefetch_sweep_trades`
+  cache-aware fetch keyed on `(symbol, start, end)`; LZ4 compression
+  on `clickhouse_connect.get_client`.
+- `backtest_simulator/launcher/launcher.py` — `clock_tick_seconds`
+  constructor param; smart-tick advance loop (big jump → 1 s
+  cross + 250 ms pause around boundaries) cuts the day-replay
+  `time.sleep` budget from ~7 s to ~1.5 s without breaking
+  Timer-fire parity.
+- `backtest_simulator/venue/simulated.py` — `query_order_book`
+  level qty = sum of last-60 s trade volume (was last-trade qty
+  alone, which falsely tripped `book depth insufficient` on
+  every kelly-sized order).
+- `backtest_simulator/_limen_cache.py` — install signature
+  preserved; auto-install removed earlier remains removed (sweep
+  invokes `install_cache()` explicitly so a stale parquet never
+  gates filter-pool training).
+- `~/sweep/index.html` (operator-side, served by `python -m
+  http.server` from `~/sweep/`) — Results / Log tabs + session
+  dropdown polling `~/sweep/sessions/index.json`.
+
 # v2.3.5
 
 Drop the two bts-side INTAKE pre-hooks (`_check_declared_stop`,

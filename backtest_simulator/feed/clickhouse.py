@@ -5,6 +5,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 import polars as pl
 import pyarrow as pa
@@ -227,7 +228,126 @@ def _make_client(
     return _ch_get_client(
         host=host, port=port, username=username,
         password=password, database=database,
+        compress='lz4',
     )
+
+
+class InMemoryTradesFeed:
+    """Trades feed backed by a pre-loaded polars frame.
+
+    Drop-in replacement for `ClickHouseFeed` once a sweep has fetched the
+    full replay-window trade tape ONCE in the parent. Subprocess fill-walks
+    and slippage-calibrations slice the in-memory frame instead of issuing
+    per-submit network round-trips, which over an SSH tunnel were costing
+    3-6s per order and tripping `drain slow`.
+
+    The frame is expected to be in the same shape `ClickHouseFeed` returns:
+    columns `time` (Datetime[us, UTC]), `price` (Float64), `qty` (Float64),
+    `is_buyer_maker` (Boolean), `trade_id` (UInt64), already sorted by
+    `(time, trade_id)`.
+    """
+
+    def __init__(self, frame: pl.DataFrame, symbol: str = 'BTCUSDT') -> None:
+        self._frame = frame
+        self._symbol = symbol
+
+    def get_window(self, symbol: str, kline_size: int, n_rows: int) -> pl.DataFrame:
+        # Same contract as `ClickHouseFeed.get_window`: klines belong to
+        # `limen.HistoricalData().get_spot_klines()`, not the trades feed.
+        del kline_size, n_rows, symbol
+        msg = (
+            'InMemoryTradesFeed.get_window: klines are served by '
+            'limen.HistoricalData().get_spot_klines(); this feed only '
+            'provides trades via get_trades().'
+        )
+        raise NotImplementedError(msg)
+
+    def get_trades(self, symbol: str, start: datetime, end: datetime) -> pl.DataFrame:
+        return self._slice(symbol, start, end, venue_lookahead_seconds=0)
+
+    def get_trades_for_venue(
+        self, symbol: str, start: datetime, end: datetime,
+        *, venue_lookahead_seconds: int,
+    ) -> pl.DataFrame:
+        return self._slice(
+            symbol, start, end,
+            venue_lookahead_seconds=venue_lookahead_seconds,
+        )
+
+    def _slice(
+        self, symbol: str, start: datetime, end: datetime,
+        *, venue_lookahead_seconds: int,
+    ) -> pl.DataFrame:
+        assert_trades_causal(
+            end, symbol=symbol,
+            venue_lookahead_seconds=venue_lookahead_seconds,
+        )
+        if symbol != self._symbol:
+            msg = f'InMemoryTradesFeed configured for {self._symbol}; received {symbol}'
+            raise ValueError(msg)
+        # Polars filter on a `Datetime[us, UTC]` column with sorted order is
+        # O(log N) under the hood when the frame is marked sorted; the
+        # prefetch writer marks `time` sorted via `set_sorted` before
+        # returning. Inclusive `[start, end]` matches the
+        # `HistoricalFeed.get_trades` / `VenueFeed.get_trades_for_venue`
+        # Protocol contracts (`feed/protocol.py`) and `ParquetFixtureFeed`'s
+        # implementation; the prior `< end` would silently drop a trade
+        # at exactly `walk_end` and shift the simulated fill outcome
+        # (Copilot P1).
+        sliced = self._frame.filter(
+            (pl.col('time') >= start) & (pl.col('time') <= end),
+        )
+        assert_window_causal(
+            sliced, symbol=symbol, column='time',
+            venue_lookahead_seconds=venue_lookahead_seconds,
+        )
+        return sliced
+
+
+def prefetch_sweep_trades(
+    *,
+    config: ClickHouseConfig,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    cache_dir: Path,
+) -> Path:
+    """Fetch full trade tape for the sweep window once; cache as parquet.
+
+    Returns the cache path. On cache hit (file covers `[start, end]`),
+    skips the ClickHouse query entirely. The caller hands the parquet
+    path through to every subprocess; each subprocess wraps the frame in
+    `InMemoryTradesFeed` so the sweep makes exactly ONE ClickHouse call
+    for the whole run.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Cache key: symbol + [start, end] stamps. Tightly bound — different
+    # replay windows get their own files; reruns of the same window
+    # hit cache.
+    fname = (
+        f'{symbol.lower()}_'
+        f'{start.strftime("%Y%m%dT%H%M%S")}_'
+        f'{end.strftime("%Y%m%dT%H%M%S")}.parquet'
+    )
+    path = cache_dir / fname
+    if path.is_file():
+        return path
+    # Cache miss — fetch the whole window in one query.
+    feed = ClickHouseFeed(config=config, symbol=symbol)
+    frame = feed.get_trades_for_venue(
+        symbol, start, end,
+        # The fetch runs in the sweep parent (no frozen clock); end is in
+        # the historical past relative to real `datetime.now(UTC)`, so the
+        # causality assertion passes regardless of `venue_lookahead_seconds`.
+        # Pass a large value to be unambiguous.
+        venue_lookahead_seconds=int((end - start).total_seconds()) + 86400,
+    )
+    # Marked sorted gives the InMemoryTradesFeed a fast filter path.
+    frame = frame.sort(['time', 'trade_id']).set_sorted('time')
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    frame.write_parquet(tmp)
+    tmp.replace(path)
+    return path
 
 
 def _query_arrow(

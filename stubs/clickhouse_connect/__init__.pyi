@@ -16,4 +16,5 @@ def get_client(
     username: str | None = ...,
     password: str = ...,
     database: str = ...,
+    compress: str | bool = ...,
 ) -> Client: ...

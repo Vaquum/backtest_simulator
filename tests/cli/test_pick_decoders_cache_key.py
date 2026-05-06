@@ -41,7 +41,15 @@ def _write_csv(path: Path, *, q_value: float = 0.41) -> None:
         'backtest_mean_kelly_pct': [11.434],
         'backtest_total_return_net_pct': [81.5],
         'backtest_trades_count': [488],
-        # _PARAM_COLS:
+        # _PARAM_COLS — every key in the operator's exp-code params()
+        # must appear here. The pre-PR-#61 fixture omitted six keys
+        # (cal_method / threshold_min / threshold_max / threshold_step
+        # / use_calibration / use_threshold) that limen.logreg_binary
+        # added in a sibling round; sweep's strict CSV validator
+        # (`_pipeline.py: --input-from-file ... is missing columns`)
+        # rejected the fixture before the cache-key assertions could
+        # run. Adding the columns here pins the fixture to the
+        # current logreg_binary surface.
         'frac_diff_d': [0.0],
         'shift': [-1],
         'q': [q_value],
@@ -54,6 +62,12 @@ def _write_csv(path: Path, *, q_value: float = 0.41) -> None:
         'max_iter': [60],
         'solver': ['lbfgs'],
         'tol': [0.01],
+        'cal_method': ['isotonic'],
+        'threshold_min': [0.2],
+        'threshold_max': [0.6],
+        'threshold_step': [0.05],
+        'use_calibration': [True],
+        'use_threshold': [True],
     })
     df.write_csv(path)
 
@@ -210,6 +224,15 @@ def test_pick_decoders_strips_whitespace_in_numeric_columns(
         'max_iter': [60, 60, 60],
         'solver': ['lbfgs', 'lbfgs', 'lbfgs'],
         'tol': [0.01, 0.01, 0.01],
+        # logreg_binary calibration/threshold params (added in a
+        # sibling round; sweep's strict CSV validator requires every
+        # key from the operator's params() to appear as a column).
+        'cal_method': ['isotonic', 'isotonic', 'isotonic'],
+        'threshold_min': [0.2, 0.2, 0.2],
+        'threshold_max': [0.6, 0.6, 0.6],
+        'threshold_step': [0.05, 0.05, 0.05],
+        'use_calibration': [True, True, True],
+        'use_threshold': [True, True, True],
     })
     df.write_csv(csv)
     sub_dirs = _capture_sub_dirs(monkeypatch, csv)
@@ -257,6 +280,12 @@ def test_pick_decoders_fails_loudly_on_zero_usable_rows(
         'max_iter': [60, 60, 60],
         'solver': ['lbfgs', 'lbfgs', 'lbfgs'],
         'tol': [0.01, 0.01, 0.01],
+        'cal_method': ['isotonic', 'isotonic', 'isotonic'],
+        'threshold_min': [0.2, 0.2, 0.2],
+        'threshold_max': [0.6, 0.6, 0.6],
+        'threshold_step': [0.05, 0.05, 0.05],
+        'use_calibration': [True, True, True],
+        'use_threshold': [True, True, True],
     })
     df.write_csv(csv)
     exp_code = csv.parent / 'exp.py'

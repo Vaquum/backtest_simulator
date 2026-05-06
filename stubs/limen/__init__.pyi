@@ -12,7 +12,6 @@ from typing import Any
 
 from polars import DataFrame as _DataFrame
 
-
 class HistoricalData:
     data: _DataFrame
     data_columns: list[str]
@@ -38,8 +37,8 @@ class Trainer:
     # the manifest config + per-permutation params without
     # reaching past Limen's underscore at the call site (which
     # pyright would flag as `reportPrivateUsage`).
-    _manifest: Any  # noqa: ANN401 - Limen's Manifest; consumed via .data_source_config / .split_config
-    _round_data: dict[int, dict[str, Any]]  # noqa: ANN401 - per-pid run params dict
+    _manifest: Any
+    _round_data: dict[int, dict[str, Any]]
 
     def __init__(
         self,

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-
 def kurtosis(
     a: Sequence[float],
     axis: int = 0,

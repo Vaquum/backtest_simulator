@@ -17,11 +17,10 @@ from backtest_simulator.venue.filters import BinanceSpotFilters
 from backtest_simulator.venue.types import FillModelConfig
 
 # Integration re-exports require the `[integration]` extra (Praxis +
-# Nexus + Limen). Try eager so `_limen_cache`'s side-effect (installing
-# the Limen klines patch) fires on package import. On a slim install
-# the imports fail and accessing one of the integration names raises
-# `ImportError` with install guidance via `__getattr__` below — the
-# pure-Python surface above stays available either way.
+# Nexus + Limen). On a slim install the imports fail and accessing one
+# of the integration names raises `ImportError` with install guidance via
+# `__getattr__` below — the pure-Python surface above stays available
+# either way.
 _LAZY_NAMES = (
     'install_cache', 'BacktestLauncher',
     'BacktestMarketDataPoller', 'SimulatedVenueAdapter',
