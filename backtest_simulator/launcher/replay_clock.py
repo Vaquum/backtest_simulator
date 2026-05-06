@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -39,6 +40,14 @@ if TYPE_CHECKING:
     from nexus.startup.sequencer import WiredSensor
 
 _log = logging.getLogger(__name__)
+
+# Default wall-clock cap on a single `drive_window` call. Aborts loud
+# rather than letting a cyclic `on_outcome` chain (action emits new
+# action whose fill emits another action ...) spin the
+# repeat-until-fixed-point drain forever. 600s is the same budget the
+# legacy `_advance_clock_until` enforced; constructor-injectable so
+# tests can use a tiny cap without wall-clock waiting.
+_REAL_TIME_CAP_SECONDS_DEFAULT = 600.0
 
 
 class _Freezer(Protocol):
@@ -147,6 +156,16 @@ def compute_kline_boundaries(
     return boundaries
 
 
+class ReplayDeadlineExceededError(RuntimeError):
+    """Raised when `ReplayClock.drive_window` exceeds its wall-clock cap.
+
+    The most likely causes are a cyclic `on_outcome` chain (action
+    emits new action whose fill emits another action) or a strategy
+    that never quiesces. The replay path aborts loudly rather than
+    silently spinning so an operator (or CI) sees the failure.
+    """
+
+
 @dataclass(frozen=True)
 class ReplayClock:
     """Single-thread schedule-driven replay clock for one backtest window.
@@ -184,9 +203,12 @@ class ReplayClock:
       - `outcome_loop.running` is False on entry (else `RuntimeError`).
         Symmetric guard for the outcome worker.
 
-    The class carries no state. It exists as a class (rather than a
-    free function) to keep the call site explicit at the launcher and
-    to give the drain helper a natural method home.
+    The class carries one field: `real_time_cap_seconds`, the
+    wall-clock budget enforced by every drain pass and every boundary
+    crossing. Defaults to 600s (matches the legacy
+    `_advance_clock_until` cap); tests pass a tiny value to exercise
+    the deadline path without wall-clock waiting. Exceeding the cap
+    raises `ReplayDeadlineExceededError`.
 
     Drain contract for `drain_pending_submits`: the caller-provided
     callable MUST yield to the running asyncio loop until every
@@ -198,6 +220,8 @@ class ReplayClock:
     bound method satisfies that contract; tests pass a mock that
     increments a "drained" counter so the loop can be observed.
     """
+
+    real_time_cap_seconds: float = _REAL_TIME_CAP_SECONDS_DEFAULT
 
     def drive_window(
         self,
@@ -281,32 +305,38 @@ class ReplayClock:
         )
         _log.info(
             'replay_clock: %d boundaries scheduled '
-            '(window=[%s, %s], interval=%ds, sensors=%d)',
+            '(window=[%s, %s], interval=%ds, sensors=%d, cap=%.1fs)',
             len(boundaries), window_start, window_end,
-            interval_seconds, len(wired_sensors),
+            interval_seconds, len(wired_sensors), self.real_time_cap_seconds,
         )
 
+        deadline = os.times()[4] + self.real_time_cap_seconds
         for boundary in boundaries:
             freezer.move_to(boundary)
             for wired in wired_sensors:
                 predict_loop.tick_once(wired)
-            self._drain_to_quiescence(outcome_loop, drain_pending_submits)
+            self._drain_to_quiescence(outcome_loop, drain_pending_submits, deadline)
 
         freezer.move_to(window_end)
-        self._drain_to_quiescence(outcome_loop, drain_pending_submits)
+        self._drain_to_quiescence(outcome_loop, drain_pending_submits, deadline)
 
     @staticmethod
     def _drain_to_quiescence(
         outcome_loop: _OutcomeLoop,
         drain_pending_submits: Callable[[], None],
+        deadline: float,
     ) -> None:
-        """Repeat-until-fixed-point drain.
+        """Repeat-until-fixed-point drain, bounded by `deadline`.
 
         Each pass: settle pending submits, then consume every
         currently-routed outcome. If consuming an outcome triggered
         `on_outcome` to emit new actions, those produce new submits
         in the next pass; the loop only exits when both queues are
         empty in the same pass.
+
+        `deadline` is a `os.times()[4]` wall-time budget; if a pass
+        finishes after the deadline the loop raises
+        `ReplayDeadlineExceededError` rather than spinning further.
         """
 
         while True:
@@ -316,3 +346,5 @@ class ReplayClock:
                 consumed = True
             if not consumed:
                 break
+            if os.times()[4] > deadline:
+                raise ReplayDeadlineExceededError('ReplayClock: drain-to-quiescence exceeded real-time cap. Likely cyclic on_outcome chain (action emits new action whose fill emits another). Tighten the strategy or raise real_time_cap_seconds.')

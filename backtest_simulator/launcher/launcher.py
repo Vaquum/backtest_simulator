@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from types import FrameType
@@ -88,20 +88,13 @@ _SHUTDOWN_TIMEOUT_SECONDS = 30
 # to this captured real clock keeps the asyncio scheduler on real
 # wall time, regardless of what freezegun has patched globally.
 _REAL_MONOTONIC = time.monotonic
-# Main clock tick: 120 frozen seconds per iteration with a real-time
-# yield so the asyncio account_loop + Timer threads get CPU between
-# ticks. Strategy sklearn inference (~50ms real) keeps main ticking
-# during that window; the tinier the pause, the bigger the frozen-time
-# drift per strategy tick (drift ~= sklearn_time x tick_seconds / pause).
-# With 120s ticks at 0.01s pause, drift is ~600s = 10 min per tick —
-# small enough that PredictLoop Timer firings still land at the intended
-# frozen schedule, and the decoder's proven `preds 0→1→0→1` transition
-# cluster on the 14:00-04:00 window fires cleanly. 120s also halves the
-# main iteration count vs 60s ticks, cutting clock-advance real time
-# from ~8.4s to ~4.2s on a 14h window — the biggest single lever to
-# keep the e2e profile inside the 10s budget.
-_CLOCK_TICK_SECONDS = timedelta(seconds=120)
-_CLOCK_TICK_REAL_PAUSE_SECONDS = 0.01
+# `_REAL_TIME_CAP_SECONDS` (above) caps the synchronous replay's total
+# wall-clock budget; passed into `ReplayClock.drive_window` so the
+# drain-to-quiescence loop aborts loudly on cyclic on_outcome chains
+# rather than spinning forever. Pre-slice-0 tick-and-sleep constants
+# (`_CLOCK_TICK_SECONDS`, `_CLOCK_TICK_REAL_PAUSE_SECONDS`) are gone:
+# `ReplayClock` jumps frozen time directly to each kline boundary and
+# never sleeps.
 # Drain settings: Praxis's account_loop polls its queue every 0.1s. The
 # drain wakes up at 0.02s granularity to catch fresh dispatches with
 # minimal delay after they complete; it bounds total drain real time so
@@ -918,7 +911,6 @@ class BacktestLauncher(Launcher):
             raise ValueError(f'clock_tick_seconds must be > 0 when provided, got {clock_tick_seconds!r}.')
         if clock_tick_seconds is not None:
             _log.info('clock_tick_seconds=%s ignored — ReplayClock reads cadence from wired_sensor.interval_seconds (slice 0; #64)', clock_tick_seconds)
-        self._clock_tick_seconds = timedelta(seconds=clock_tick_seconds) if clock_tick_seconds is not None else _CLOCK_TICK_SECONDS
         # Synchronous-drain counters. `_submitted_commands` is bumped by
         # the action_submitter's `on_submit` callback after every
         # successful `praxis_outbound.send_command`; the main clock loop
@@ -1555,8 +1547,9 @@ class BacktestLauncher(Launcher):
     def _record_submitted_command(self, command_id: str) -> None:
         # Called by action_submitter's `on_submit` hook. The lock guards
         # the counter only — actual drain coordination happens on the
-        # main clock thread in `_advance_clock_until`, which reads the
-        # counter and compares it to the adapter's delivered-order count.
+        # main clock thread in `_drain_pending_submits`, which reads the
+        # counter and compares it to the adapter's delivered-order count
+        # and the routed-outcomes counter.
         del command_id
         with self._submit_lock:
             self._submitted_commands += 1

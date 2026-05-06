@@ -32,6 +32,7 @@ import pytest
 
 from backtest_simulator.launcher.replay_clock import (
     ReplayClock,
+    ReplayDeadlineExceededError,
     compute_kline_boundaries,
 )
 
@@ -555,6 +556,29 @@ class TestDriveWindow:
         args = self._build_args(wired_sensors=[])
         with pytest.raises(ValueError, match='non-empty sequence'):
             ReplayClock().drive_window(**args)
+
+    def test_drain_aborts_loud_on_cyclic_on_outcome_chain(self) -> None:
+        # Simulate a cyclic on_outcome chain: every drain pass consumes
+        # one outcome AND enqueues a new one, so the
+        # repeat-until-fixed-point loop never naturally exits. With
+        # real_time_cap_seconds=0.5, drive_window must raise
+        # ReplayDeadlineExceededError rather than spinning forever.
+        outcome_loop = _MockOutcomeLoop(outcomes=['o0'])
+
+        def cyclic_drain() -> None:
+            outcome_loop.queue(f'o{len(outcome_loop.consumed)+1}')
+
+        args = {
+            'window_start': datetime(2026, 4, 4, 0, 0, tzinfo=UTC),
+            'window_end': datetime(2026, 4, 4, 4, 0, tzinfo=UTC),
+            'wired_sensors': [_MockWired(sensor_id='s1', interval_seconds=14400)],
+            'predict_loop': _MockPredictLoop(),
+            'outcome_loop': outcome_loop,
+            'drain_pending_submits': cyclic_drain,
+            'freezer': _MockFreezer(),
+        }
+        with pytest.raises(ReplayDeadlineExceededError, match='cyclic on_outcome'):
+            ReplayClock(real_time_cap_seconds=0.5).drive_window(**args)
 
     def test_is_deterministic_across_runs(self) -> None:
         # Two independent calls with identical inputs produce identical
