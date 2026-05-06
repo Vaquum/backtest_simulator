@@ -424,8 +424,8 @@ class _MockFreezer:
     def __init__(self) -> None:
         self.moves: list[datetime] = []
 
-    def move_to(self, target_datetime: datetime) -> None:
-        self.moves.append(target_datetime)
+    def move_to(self, target: datetime) -> None:
+        self.moves.append(target)
 
 
 def _drain() -> Callable[[], None]:

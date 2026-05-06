@@ -60,7 +60,7 @@ class _Freezer(Protocol):
     anything for callers).
     """
 
-    def move_to(self, target_datetime: datetime) -> None: ...
+    def move_to(self, target: datetime) -> None: ...
 
 
 class _PredictLoop(Protocol):
