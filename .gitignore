@@ -35,4 +35,7 @@ e2e.csv
 min.csv
 tiny.csv
 *.csv
+# Slice 1 (#?): canonical golden-test fixtures must ship in-repo.
+!tests/fixtures/canonical/expected/sweep_per_window.csv
+!tests/fixtures/canonical/expected/sweep_per_tick.csv
 Untitled.ipynb

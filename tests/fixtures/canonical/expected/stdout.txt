@@ -1,0 +1,45 @@
+
+     04:00 → 08:00   BUY   66576.25 → SELL   66930.79   +0.33%   R +0.18
+     04:00 → 08:00   BUY   66576.25 → SELL   66930.79   +0.33%   R +0.18
+     12:00 → 16:00   BUY   66220.28 → SELL   66852.91   +0.75%   R +0.32
+     12:00 → 16:00   BUY   66220.28 → SELL   66852.91   +0.75%   R +0.32
+   perm 107   2026-04-01  trades 0  PF —       R̄ —        DD 0.00%  total 0.00%  slip 0.00bp n=0/excl=0
+   perm 107   2026-04-02  trades 2 (intents 4, fills 4)  PF inf     R̄ +0.25    DD 0.00%  total +1.09%  slip -0.98bp n=4/excl=0 gap -1.56bp (n_predict=4)  imp +0.08bp n=4/flagged=0
+   perm 107   2026-04-03  trades 0  PF —       R̄ —        DD 0.00%  total 0.00%  slip 0.00bp n=0/excl=0
+   perm 17    2026-04-01  trades 0  PF —       R̄ —        DD 0.00%  total 0.00%  slip 0.00bp n=0/excl=0
+   perm 17    2026-04-02  trades 2 (intents 4, fills 4)  PF inf     R̄ +0.25    DD 0.00%  total +1.09%  slip -0.98bp n=4/excl=0 gap -1.56bp (n_predict=4)  imp +0.08bp n=4/flagged=0
+   perm 17    2026-04-03  trades 0  PF —       R̄ —        DD 0.00%  total 0.00%  slip 0.00bp n=0/excl=0
+  loaded filter pool from BtcLogRegEVSFD__r0014.csv: 112 rows  (exp-code: BtcLogRegEVSFD__r0014__bts_shim.py)
+  no filters given — ranking all 112 decoders as-is
+[<dur>] SignalsTable build done (2 decoder(s))
+[<dur>] SignalsTable built decoder 107    (15 ticks)
+[<dur>] SignalsTable built decoder 17     (15 ticks)
+[<dur>] decoder 107    <trained-or-cached> (kelly=17.955)
+[<dur>] decoder 17     <trained-or-cached> (kelly=17.955)
+[<dur>] filter pool training done (2 decoder(s), 1 worker(s))
+[<dur>] klines cache HIT (age=<age>, 5136 rows)
+[<dur>] manifest loaded (kline_size=14400)
+[<dur>] perm 107    2026-04-01  done  (<i>/6, trades=0)
+[<dur>] perm 107    2026-04-02  done  (<i>/6, trades=4)
+[<dur>] perm 107    2026-04-03  done  (<i>/6, trades=0)
+[<dur>] perm 17     2026-04-01  done  (<i>/6, trades=0)
+[<dur>] perm 17     2026-04-02  done  (<i>/6, trades=4)
+[<dur>] perm 17     2026-04-03  done  (<i>/6, trades=0)
+[<dur>] replay batch done (6 window(s))
+[<dur>] replay launching 6 window(s) on 5 worker(s)
+[<dur>] sensors trained (1 decoder(s))
+[<dur>] sensors trained (1 decoder(s))
+[<dur>] session <session-id> → <session-path>
+[<dur>] trades tape ready: btcusdt_20260331T233000_20260404T000900.parquet
+done   6 run(s) in <wall>s
+sweep book_gap   skipped: no STOP/TP trigger fills observed (default long_on_signal template uses MARKET orders; this metric activates when strategies emit STOP/TP orders)
+sweep calibration  predict-vs-realised gap -1.56bp across 8 predicted fills  uncalibrated_predict=0  WARN: gap >1bp — calibration window or qty buckets do not match this run; recalibrate
+sweep cpcv_pbo   skipped: every path lost its IS or OOS pool to purge/embargo or predictions are degenerate (n_groups=4 test_groups=2 purge_s=0 embargo_s=0)
+sweep csv        <session-path>
+sweep dsr        sharpe_best=0.577  decoder=17  n_trials=5000  deflated=-6.059  p_value=0.000
+sweep impact     mean=+0.08bp  n=8 flagged=0  rejected=0  uncalibrated=0
+sweep signals parity  OK n_compared=30 (runtime Sensor.predict matches SignalsTable per-tick)
+sweep slippage  cost -0.98bp  n=8 fills across 6 run(s)  excluded=0 (0.0% coverage gap)
+sweep spa        statistic=1.152  p_value=0.067  n_candidates=2
+sweep stats      n_runs_excluded_open_position=0  clean_days=3
+sweep tick csv   <session-path>
