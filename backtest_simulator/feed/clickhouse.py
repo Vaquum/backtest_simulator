@@ -288,10 +288,14 @@ class InMemoryTradesFeed:
         # Polars filter on a `Datetime[us, UTC]` column with sorted order is
         # O(log N) under the hood when the frame is marked sorted; the
         # prefetch writer marks `time` sorted via `set_sorted` before
-        # returning. Half-open `[start, end)` matches `get_trades_for_venue`'s
-        # `walk_end` exclusivity.
+        # returning. Inclusive `[start, end]` matches the
+        # `HistoricalFeed.get_trades` / `VenueFeed.get_trades_for_venue`
+        # Protocol contracts (`feed/protocol.py`) and `ParquetFixtureFeed`'s
+        # implementation; the prior `< end` would silently drop a trade
+        # at exactly `walk_end` and shift the simulated fill outcome
+        # (Copilot P1).
         sliced = self._frame.filter(
-            (pl.col('time') >= start) & (pl.col('time') < end),
+            (pl.col('time') >= start) & (pl.col('time') <= end),
         )
         assert_window_causal(
             sliced, symbol=symbol, column='time',

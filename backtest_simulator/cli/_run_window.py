@@ -18,7 +18,6 @@ import os
 import shutil
 import subprocess
 import sys
-import time as _bts_time
 from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
@@ -202,16 +201,17 @@ def capture_runtime_prediction(
         return
     if window_end is not None and ts_obj > window_end:
         return
-    # `_probs` is the raw decoder probability emitted alongside the
-    # binary `_preds` label by the LogReg sensor (see strategy
-    # template's `signal.values.get('_probs')`). Carrying it through
-    # capture so per-window CSV can record the entry-tick prob.
-    prob_val = values.get('_probs')
+    # The captured-entry contract is fixed at three keys: sensor_id /
+    # timestamp / pred. `_probs` extraction lives at the call site
+    # (`_capturing_produce_signal` adds `prob` AFTER this returns);
+    # the per-tick / prob_min / prob_max dashboard fields read from
+    # there. Pinning the helper's output shape lets the contract test
+    # in `tests/cli/test_runtime_prediction_capture.py` (out of scope
+    # for this PR) keep its exact-equality assertion.
     sink.append({
         'sensor_id': str(getattr(wired, 'sensor_id', '')),
         'timestamp': ts_obj.isoformat(),
         'pred': pred_val,
-        'prob': float(prob_val) if isinstance(prob_val, (int, float)) else None,
     })
 
 
@@ -269,11 +269,9 @@ def run_window_in_process(
     # `perm X day Y - done (Ns)` line per window after `.result()`.
     # Internal sub-phase timing was useful when diagnosing the boot /
     # advance_clock split; with parallel batches the multiplexed
-    # stderr was unreadable. Removed.
-    _bts_t_start = _bts_time.perf_counter()
-    def _bts_lap(label: str, start: float) -> float:  # no-op kept for shape
-        return _bts_time.perf_counter()
-    _bts_t = _bts_t_start
+    # stderr was unreadable. The whole `_bts_lap` scaffolding was
+    # removed; if per-phase timing is needed again, attach a real
+    # logger here rather than a no-op closure.
     seed_price = seed_price_at(window_start)
     # work_dir uniqueness must follow the human-facing pick identifier,
     # not the trainer permutation index. In the file-list filter mode
@@ -330,7 +328,6 @@ def run_window_in_process(
             maker_preference=maker_preference,
         ),
     )
-    _bts_t = _bts_lap('ManifestBuilder.build', _bts_t)
     # If the parent prefetched the sweep's trade tape, use the parquet
     # via `InMemoryTradesFeed` — every trade query is now an in-memory
     # filter, not a ClickHouse round-trip. Falls back to a live
@@ -346,7 +343,6 @@ def run_window_in_process(
         feed = ClickHouseFeed(
             config=ClickHouseConfig.from_env(), symbol=SYMBOL,
         )
-    _bts_t = _bts_lap('ClickHouseFeed init', _bts_t)
     # Calibrate the slippage model from a pre-window trade slice
     # (strict-causal: end <= window_start, no peek into the run's
     # own fills). 30 minutes is enough density at BTCUSDT scale to
@@ -358,7 +354,6 @@ def run_window_in_process(
     # `slippage_realised_bps` come back null and knows the
     # calibration window needs to widen.
     slippage_model = _calibrate_slippage(feed, window_start)
-    _bts_t = _bts_lap('_calibrate_slippage', _bts_t)
     # MakerFillModel is constructed only when the strategy will
     # use LIMIT orders (`maker_preference=True`). Without LIMIT
     # orders the model would be dead weight. The model's lookback
@@ -405,7 +400,6 @@ def run_window_in_process(
         epoch_id=1, venue_rest_url='http://sim', venue_ws_url='ws://sim',
         account_credentials={'bts-sweep': ('k', 's')}, shutdown_timeout=5.0,
     )
-    _bts_t = _bts_lap('SimulatedVenueAdapter init', _bts_t)
     launcher = BacktestLauncher(
         trading_config=tc,
         instances=[InstanceConfig(
@@ -428,7 +422,6 @@ def run_window_in_process(
         # ticks 1s across the boundary instead of jumping past it.
         clock_tick_seconds=interval_seconds,
     )
-    _bts_t = _bts_lap('BacktestLauncher init', _bts_t)
     # Auditor (post-v2.0.2) "make it real": capture per-tick runtime
     # predictions so the sweep can assert SignalsTable parity AGAINST
     # the deployed strategy's actual decisions. The hook wraps Nexus's
@@ -458,19 +451,37 @@ def run_window_in_process(
             signal = _real_produce_signal(
                 wired, market_data, lookback=_lookback,
             )
+        _len_before = len(runtime_predictions)
         capture_runtime_prediction(
             wired=wired, signal=signal, sink=runtime_predictions,
             window_start=window_start, window_end=window_end,
         )
+        # `_probs` is the raw decoder probability emitted alongside
+        # the binary `_preds` label by the LogReg sensor (see
+        # strategy template's `signal.values.get('_probs')`).
+        # `capture_runtime_prediction` keeps a fixed three-key shape;
+        # we fold `prob` in here so the per-tick CSV / prob_min /
+        # prob_max sweep dashboard fields have a value when the
+        # signal carries one. Skipped if the helper rejected the
+        # signal (no new entry) or if `_probs` is missing/non-numeric.
+        if len(runtime_predictions) > _len_before:
+            from collections.abc import Mapping
+            from typing import cast as _cast_local
+            _values_obj = getattr(signal, 'values', None)
+            if isinstance(_values_obj, Mapping):
+                _values_typed = _cast_local(
+                    'Mapping[str, object]', _values_obj,
+                )
+                _prob: object = _values_typed.get('_probs')
+                if isinstance(_prob, (int, float)):
+                    runtime_predictions[-1]['prob'] = float(_prob)
         return signal
 
     setattr(_predict_loop_mod, 'produce_signal', _capturing_produce_signal)
-    _bts_t = _bts_lap('predict-hook install', _bts_t)
     try:
         launcher.run_window(window_start, window_end)
     finally:
         setattr(_predict_loop_mod, 'produce_signal', _real_produce_signal)
-    _bts_t = _bts_lap('launcher.run_window', _bts_t)
     # Slice #17 Task 18: dump the run's EventSpine to JSONL for
     # ledger-parity comparison. Always-dump (codex round 1 #4): the
     # operator gets a comparable artifact regardless of whether
@@ -486,7 +497,6 @@ def run_window_in_process(
         sqlite_path=spine_sqlite,
         jsonl_path=spine_jsonl,
     )
-    _bts_t = _bts_lap('dump_event_spine', _bts_t)
     # Per-window event-type counts feed the operator's five-question
     # scan: did my strategy decide to act (intents)? did the venue
     # accept (submitted)? did money move (fills)? what's still hanging
@@ -785,19 +795,30 @@ def run_window_in_subprocess(
     # their own polars pool, the panics cascade. One thread → no pool
     # → no race.
     env['POLARS_MAX_THREADS'] = '1'
-    # `stderr=None` lets the child's per-phase timing prints reach the
-    # operator's terminal in real time. Without this, `capture_output=True`
-    # buffered stderr and the phase prints only surfaced on failure —
-    # making "stuck for a minute or two" indistinguishable from "crashed".
+    # `stderr=PIPE` so the actual Python traceback on a child crash
+    # reaches the parent's exception message (bit-mis P1). Per-phase
+    # timing prints were removed (the prior comment justified
+    # `stderr=None` by them — that rationale is gone). Tracebacks
+    # write to stderr and would otherwise interleave across up to 8
+    # concurrent worker subprocesses on the parent's inherited
+    # terminal — unreadable. With the pipe, the parent attaches the
+    # tail to the RuntimeError below so the operator sees the real
+    # cause without scrolling stderr.
     proc = subprocess.run(
         [sys.executable, '-m', 'backtest_simulator.cli._run_window'],
         input=payload,
-        stdout=subprocess.PIPE, stderr=None,
+        capture_output=True,
         text=True, check=False, timeout=120,
         env=env,
     )
     if proc.returncode != 0:
-        msg = f'child exit={proc.returncode}; stdout tail: {proc.stdout[-400:]}'
+        _stderr_tail = (proc.stderr or '')[-800:]
+        _stdout_tail = (proc.stdout or '')[-400:]
+        msg = (
+            f'child exit={proc.returncode}; '
+            f'stderr tail: {_stderr_tail}; '
+            f'stdout tail: {_stdout_tail}'
+        )
         raise RuntimeError(msg)
     last: str | None = None
     for line in proc.stdout.splitlines():
@@ -805,7 +826,13 @@ def run_window_in_subprocess(
         if s.startswith('{') and s.endswith('}'):
             last = s
     if last is None:
-        msg = f'child produced no JSON result; stdout tail: {proc.stdout[-400:]}'
+        _stderr_tail = (proc.stderr or '')[-800:]
+        _stdout_tail = proc.stdout[-400:]
+        msg = (
+            f'child produced no JSON result; '
+            f'stderr tail: {_stderr_tail}; '
+            f'stdout tail: {_stdout_tail}'
+        )
         raise RuntimeError(msg)
     # The child writes a `WindowResult`-shaped dict via `json.dumps`;
     # `json.loads` returns `Any`, so a typed cast at this boundary
@@ -822,11 +849,11 @@ def _child_main() -> int:
     `INFO`, `DEBUG`). The default leaves logging unconfigured so
     `_log.info(...)` calls in the strategy / launcher / Praxis /
     Nexus chain are silently dropped — that's the production sweep
-    path where stderr is captured and only surfaced on failure.
-    Set the env var when diagnosing per-window behaviour so the
-    on_signal / on_outcome / FORCE FLATTEN log lines reach
-    `subprocess.run`'s captured stderr (or, with stderr inherited,
-    the operator's terminal).
+    path where the parent pipes stderr into the RuntimeError tail
+    on failure. Set the env var when diagnosing per-window behaviour
+    so the on_signal / on_outcome / FORCE FLATTEN log lines flow
+    into the captured stderr buffer the parent attaches to the
+    failure message.
     """
     import logging as _logging
     # Silence Praxis / Nexus / Limen INFO logs in this subprocess.

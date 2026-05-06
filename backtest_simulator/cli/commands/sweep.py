@@ -8,6 +8,10 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import fcntl
+import json as _index_json
+import re
 import sys
 import time
 from collections.abc import Callable
@@ -33,14 +37,20 @@ from backtest_simulator.cli._pipeline import (
     seed_price_at,
 )
 
-# Lazy-imported below: `from backtest_simulator.cli._run_window import …`
-# is moved INSIDE the functions that need it. Eager import at module
-# scope here, combined with `cli/__init__.py` importing this module on
-# `bts` startup, would put `_run_window` into `sys.modules` under its
-# package name; the subprocess later runs `python -m
-# backtest_simulator.cli._run_window`, and runpy emits
-# "found in sys.modules … prior to execution" because the package
-# import already loaded the module.
+# Re-exported at module scope so test fixtures can `monkeypatch.setattr(
+# sweep, 'read_kline_size_from_experiment_dir', …)` and
+# `monkeypatch.setattr(sweep, 'run_window_in_subprocess', …)`. The
+# Python runtime emits a runpy `RuntimeWarning` because `cli/__init__.py`
+# loads sweep.py (which in turn loads `_run_window`) before the
+# subprocess does `python -m backtest_simulator.cli._run_window` — the
+# warning is cosmetic, not a behavioural issue, and shadowing it would
+# break public API contracts for monkey-patching tests.
+from backtest_simulator.cli._run_window import (
+    read_kline_size_from_experiment_dir as read_kline_size_from_experiment_dir,
+)
+from backtest_simulator.cli._run_window import (
+    run_window_in_subprocess as run_window_in_subprocess,
+)
 from backtest_simulator.cli._signals_builder import (
     assert_signals_parity,
     build_signals_table_for_decoder,
@@ -63,6 +73,106 @@ _SECOND_WEEK_APRIL_START: Final = datetime(2026, 4, 6, tzinfo=UTC).date()
 _SECOND_WEEK_APRIL_END: Final = datetime(2026, 4, 12, tzinfo=UTC).date()
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _re_session_id_pattern() -> re.Pattern[str]:
+    """ASCII alnum + `-_.`, no leading dot. Path-traversal-safe."""
+    return re.compile(r'[A-Za-z0-9_\-][A-Za-z0-9_\-.]*')
+
+
+def _atomic_index_update(
+    index_path: Path,
+    mutate: Callable[[list[dict[str, object]]], None],
+) -> None:
+    """Read-modify-write `index.json` under a `flock(LOCK_EX)`.
+
+    Concurrency: serialises start-of-sweep `append` and end-of-sweep
+    `ended_at` updates from concurrent `bts sweep` processes against a
+    shared `~/sweep/sessions/index.json`. Without the lock the two
+    processes' read-modify-write windows can overlap and the loser's
+    update is silently lost (bit-mis P1).
+
+    Failure modes are explicit:
+      - missing file → seed with `{"sessions": []}` and proceed.
+      - malformed JSON or unreadable file → write to stderr and BAIL
+        without rewriting (do NOT clobber other operators' sessions
+        with `{"sessions": []}`; bit-mis P1 silent-data-loss).
+      - mutate raises → propagate (caller decides; we still drop the
+        lock via the context manager exit).
+    """
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    if not index_path.is_file():
+        index_path.write_text('{"sessions": []}', encoding='utf-8')
+    try:
+        fp = index_path.open('r+', encoding='utf-8')
+    except OSError as exc:
+        sys.stderr.write(
+            f'bts sweep: cannot open sessions index at {index_path} '
+            f'({exc}); leaving manifest unchanged.\n',
+        )
+        return
+    try:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
+        raw = fp.read()
+        if not raw.strip():
+            data: dict[str, object] = {'sessions': []}
+        else:
+            try:
+                loaded: object = _index_json.loads(raw)
+            except _index_json.JSONDecodeError as exc:
+                sys.stderr.write(
+                    f'bts sweep: sessions index at {index_path} is '
+                    f'malformed ({exc}); leaving manifest unchanged.\n',
+                )
+                return
+            if not isinstance(loaded, dict):
+                sys.stderr.write(
+                    f'bts sweep: sessions index at {index_path} is not '
+                    f'an object; leaving manifest unchanged.\n',
+                )
+                return
+            data = cast('dict[str, object]', loaded)
+        raw_sessions = data.get('sessions')
+        sessions_list: list[dict[str, object]] = []
+        if isinstance(raw_sessions, list):
+            sessions_list = [
+                cast('dict[str, object]', s)
+                for s in cast('list[object]', raw_sessions)
+                if isinstance(s, dict)
+            ]
+        mutate(sessions_list)
+        data['sessions'] = sessions_list
+        fp.seek(0)
+        fp.truncate()
+        fp.write(_index_json.dumps(data, indent=2))
+        fp.flush()
+    finally:
+        fp.close()
+
+
+def _finalize_session(index_path: Path, session_id: str) -> None:
+    """Stamp `ended_at` for `session_id` in `index.json`.
+
+    Registered via `atexit` immediately after the session is appended at
+    sweep start, so the dashboard's `live` indicator clears whether the
+    sweep returned cleanly, raised `ParityViolation`,
+    `RuntimeError("sweep aborted")`, or was interrupted (Ctrl-C lets
+    `atexit` run; `os._exit` does not — that's only used post-success in
+    subprocess children, not the parent).
+
+    Idempotent: only stamps when `ended_at is None`. atexit handlers are
+    not re-entered automatically, but the guard makes a manual second
+    call harmless too.
+    """
+    def _stamp(sessions: list[dict[str, object]]) -> None:
+        now_iso = datetime.now(UTC).isoformat()
+        for entry in sessions:
+            if entry.get('id') != session_id:
+                continue
+            if entry.get('ended_at') is None:
+                entry['ended_at'] = now_iso
+            return
+    _atomic_index_update(index_path, _stamp)
 
 
 def assert_sweep_signals_parity_ran(
@@ -113,9 +223,6 @@ def _resolve_grid_interval(
     means picks were assembled from heterogeneous training pools and
     the shared parity grid is not well-defined.
     """
-    from backtest_simulator.cli._run_window import (
-        read_kline_size_from_experiment_dir,
-    )
     seen: dict[int, Path] = {}
     for _, _, exp_dir, _ in picks:
         ks = read_kline_size_from_experiment_dir(exp_dir)
@@ -301,67 +408,87 @@ def _run(args: argparse.Namespace) -> int:
     #   ~/sweep/sessions/<id>/sweep_per_window.csv (live per-window)
     #   ~/sweep/sessions/<id>/sweep_per_tick.csv   (live per-tick preds)
     #   ~/sweep/sessions/index.json                (dashboard manifest)
-    sessions_root = Path.home() / 'sweep' / 'sessions'
-    sessions_root.mkdir(parents=True, exist_ok=True)
-    session_dir = sessions_root / args.session_id
-    _existing_csv = session_dir / 'sweep_per_window.csv'
-    if _existing_csv.is_file():
-        sys.stderr.write(
-            f'bts sweep: --session-id {args.session_id!r} already has '
-            f'sweep_per_window.csv at {_existing_csv}. Pick a unique id '
-            f'or remove the directory to retry.\n',
-        )
-        return 2
-    session_dir.mkdir(parents=True, exist_ok=True)
-    import json as _json2
-    _index_path = sessions_root / 'index.json'
-    _existing_sessions: list[dict[str, object]] = []
-    if _index_path.is_file():
-        _loaded: object = None
-        try:
-            _loaded = _json2.loads(_index_path.read_text(encoding='utf-8'))
-        except _json2.JSONDecodeError as _exc_idx:
-            # Corrupted manifest -> warn the operator and start fresh.
-            # The file is operator-facing only (dashboard manifest); no
-            # other downstream consumer reads it strictly. The new
-            # session will rewrite it cleanly.
+    # `--session-id` is registered as `required=True` via argparse, so a
+    # real CLI invocation always carries it. Unit tests in `tests/cli/`
+    # construct `argparse.Namespace` directly (bypassing argparse) and
+    # may omit it; we tolerate that by routing those callers to a
+    # tempdir and skipping the manifest. Operator-facing CLI behaviour
+    # is unchanged.
+    _session_id = getattr(args, 'session_id', None)
+    if _session_id is None:
+        import tempfile as _tmp
+        session_dir = Path(_tmp.mkdtemp(prefix='_bts_test_sweep_'))
+        _index_path: Path | None = None
+    else:
+        sessions_root = Path.home() / 'sweep' / 'sessions'
+        sessions_root.mkdir(parents=True, exist_ok=True)
+        # Path-traversal guard: session-id must be a single safe segment
+        # so `sessions_root / session_id` cannot escape
+        # `~/sweep/sessions/`. `..`, absolute paths, embedded slashes,
+        # NUL bytes and shell metacharacters all rejected. Allowed:
+        # ASCII letters, digits, dash, underscore, dot (no leading dot,
+        # no `..`).
+        _SESSION_ID_RE = _re_session_id_pattern()
+        if not _SESSION_ID_RE.fullmatch(_session_id) or _session_id == '..':
             sys.stderr.write(
-                f'bts sweep: ignoring malformed sessions index at '
-                f'{_index_path} ({_exc_idx}); starting fresh.\n',
+                f'bts sweep: --session-id {_session_id!r} is not a '
+                f'safe filesystem segment. Use letters / digits / dash / '
+                f'underscore / dot (no leading dot, no slashes, no `..`).\n',
             )
-        if isinstance(_loaded, dict):
-            _loaded_d = cast('dict[str, object]', _loaded)
-            _raw_sessions = _loaded_d.get('sessions')
-            if isinstance(_raw_sessions, list):
-                _raw_list = cast('list[object]', _raw_sessions)
-                _existing_sessions = [
-                    cast('dict[str, object]', s)
-                    for s in _raw_list if isinstance(s, dict)
-                ]
-    _bundle_label = (
-        Path(args.bundle).name if getattr(args, 'bundle', None)
-        else (Path(args.exp_code).name if getattr(args, 'exp_code', None) else '?')
-    )
-    _now_iso = datetime.now(UTC).isoformat()
-    _existing_sessions.append({
-        'id': args.session_id,
-        'started_at': _now_iso,
-        'ended_at': None,
-        'bundle': _bundle_label,
-        'n_decoders': int(getattr(args, 'n_decoders', 0) or 0),
-        'replay_period': [
-            getattr(args, 'replay_period_start', None),
-            getattr(args, 'replay_period_end', None),
-        ],
-    })
-    _index_data: dict[str, list[dict[str, object]]] = {'sessions': _existing_sessions}
-    _tmp = _index_path.with_suffix(_index_path.suffix + '.tmp')
-    _tmp.write_text(_json2.dumps(_index_data, indent=2), encoding='utf-8')
-    _tmp.replace(_index_path)
-    print(
-        f'[{0.0:7.2f}s] session {args.session_id} → {session_dir}',
-        flush=True,
-    )
+            return 2
+        session_dir = sessions_root / _session_id
+        # Reject any pre-existing session_dir, even if
+        # `sweep_per_window.csv` is missing (Copilot P1: prior guard
+        # let `~/sweep/sessions/<id>/` with leftover artefacts
+        # overwrite a partially-cleaned run).
+        if session_dir.exists():
+            sys.stderr.write(
+                f'bts sweep: --session-id {_session_id!r} already has '
+                f'directory at {session_dir}. Pick a unique id or '
+                f'remove the directory to retry.\n',
+            )
+            return 2
+        session_dir.mkdir(parents=True, exist_ok=False)
+        _index_path = sessions_root / 'index.json'
+        _bundle_label = (
+            Path(args.bundle).name if getattr(args, 'bundle', None)
+            else (Path(args.exp_code).name if getattr(args, 'exp_code', None) else '?')
+        )
+        _now_iso = datetime.now(UTC).isoformat()
+        _new_entry: dict[str, object] = {
+            'id': _session_id,
+            'started_at': _now_iso,
+            'ended_at': None,
+            'bundle': _bundle_label,
+            'n_decoders': int(getattr(args, 'n_decoders', 0) or 0),
+            'replay_period': [
+                getattr(args, 'replay_period_start', None),
+                getattr(args, 'replay_period_end', None),
+            ],
+        }
+        _sid_for_closure = _session_id
+
+        def _append_session(sessions: list[dict[str, object]]) -> None:
+            # De-duplicate by `id` — if a prior partial run left a
+            # stale entry for this session-id (the directory guard
+            # above is belt-and-braces; operators occasionally rm -rf
+            # the dir but leave the manifest entry), replace in place.
+            sessions[:] = [
+                s for s in sessions if s.get('id') != _sid_for_closure
+            ]
+            sessions.append(_new_entry)
+        _atomic_index_update(_index_path, _append_session)
+        # Stamp `ended_at` on EVERY exit path — clean return,
+        # ParityViolation, RuntimeError("sweep aborted: …"), sys.exit,
+        # Ctrl-C — so the dashboard never shows a session stuck
+        # `live` after the process is gone. atexit fires even on
+        # raised exceptions; only `os._exit` would bypass it (we use
+        # that in subprocess children, never the parent).
+        atexit.register(_finalize_session, _index_path, _session_id)
+        print(
+            f'[{0.0:7.2f}s] session {_session_id} → {session_dir}',
+            flush=True,
+        )
     # Silence noisy third-party INFO logs so the sweep log stays uniform
     # `[X.XXs] message` lines. `limen.experiment.trainer.trainer` emits
     # `INFO ... Trained sensor for permutation 0` per training call —
@@ -432,6 +559,24 @@ def _run(args: argparse.Namespace) -> int:
         net_return_min_q=args.net_return_min_q,
         input_from_file=args.input_from_file,
     )
+    if not picks:
+        # `pick_decoders` returned 0 — every candidate failed the
+        # `--*-min-q` / `--trades-q-range` filters, or `--n-decoders`
+        # is 0, or `--input-from-file` had no usable rows. Without
+        # picks the parallel batch's `n_workers = min(0, …, 8) == 0`
+        # would crash `ThreadPoolExecutor` with `max_workers must be
+        # greater than 0` straight out of stdlib (bit-mis P1). Fail
+        # loudly instead with the cause named.
+        sys.stderr.write(
+            f'bts sweep: pick_decoders returned 0 picks from a '
+            f'candidate pool of {candidate_pool_size}. Either relax '
+            f'the filter quantiles (--tp-min-q / --fpr-max-q / '
+            f'--kelly-min-q / --trade-count-min-q / --net-return-min-q '
+            f'/ --trades-q-range), supply more candidates via '
+            f'--n-permutations or --input-from-file, or raise '
+            f'--n-decoders. There is no work to dispatch.\n',
+        )
+        return 2
     # Header line removed — the same numbers (decoders x days = runs) are
     # already implicit in the per-window log lines and the `replay
     # launching … window(s) on … worker(s)` line right before the batch.
@@ -538,6 +683,15 @@ def _run(args: argparse.Namespace) -> int:
     csv_dir = session_dir
     csv_path = csv_dir / 'sweep_per_window.csv'
     csv_fp = csv_path.open('w', newline='', encoding='utf-8')
+    # atexit close so an exception inside the parallel batch / post-
+    # processing never leaves the CSV file handle dangling (Copilot
+    # P1). The success path also closes explicitly (~line 1120) so
+    # the operator's `tail` of the file isn't blocked on process
+    # teardown; the atexit close becomes a no-op on the second
+    # invocation. Per-row `csv_fp.flush()` calls keep buffers on
+    # disk, so even a hard-kill leaves the rows that were written
+    # at the point of failure.
+    atexit.register(csv_fp.close)
     csv_writer = _csv.writer(csv_fp)
     csv_writer.writerow([
         'display_id', 'date', 'capital_alloc_pct', 'profit_pct',
@@ -550,6 +704,7 @@ def _run(args: argparse.Namespace) -> int:
     # whether `_probs` actually varies tick-to-tick within a window.
     tick_csv_path = csv_dir / 'sweep_per_tick.csv'
     tick_csv_fp = tick_csv_path.open('w', newline='', encoding='utf-8')
+    atexit.register(tick_csv_fp.close)
     tick_csv_writer = _csv.writer(tick_csv_fp)
     tick_csv_writer.writerow([
         'display_id', 'date', 'timestamp', 'pred', 'prob',
@@ -635,9 +790,6 @@ def _run(args: argparse.Namespace) -> int:
             ))
 
     def _run_one_window(spec: _WindowSpec) -> tuple[object, float]:
-        from backtest_simulator.cli._run_window import (
-            run_window_in_subprocess,
-        )
         (_perm_id, _kelly, _exp_dir, _display_id,
          _day_idx, _day, _ws, _we) = spec
         # Measure WORK time only — the wall-clock from when this thread
@@ -1099,38 +1251,10 @@ def _run(args: argparse.Namespace) -> int:
         purge_seconds=int(args.cpcv_purge_seconds),
         embargo_seconds=int(args.cpcv_embargo_seconds),
     )
-    # Mark the session manifest as finished so the dashboard dropdown
-    # shows checkmark instead of dot. Read-modify-write atomic via tmp+replace.
-    _loaded_end: object = None
-    try:
-        _loaded_end = _json2.loads(_index_path.read_text(encoding='utf-8'))
-    except (_json2.JSONDecodeError, OSError) as _exc_end:
-        # Manifest disappeared or got corrupted between session start
-        # and finish. Warn loudly and rewrite — the operator's
-        # dashboard would otherwise show this session stuck `live`
-        # forever even though it finished.
-        sys.stderr.write(
-            f'bts sweep: cannot read sessions index for ended_at '
-            f'update at {_index_path} ({_exc_end}); rewriting.\n',
-        )
-    _end_sessions: list[dict[str, object]] = []
-    if isinstance(_loaded_end, dict):
-        _end_d = cast('dict[str, object]', _loaded_end)
-        _raw_end = _end_d.get('sessions')
-        if isinstance(_raw_end, list):
-            _raw_end_list = cast('list[object]', _raw_end)
-            _end_sessions = [
-                cast('dict[str, object]', s)
-                for s in _raw_end_list if isinstance(s, dict)
-            ]
-    for _entry in _end_sessions:
-        if _entry.get('id') == args.session_id:
-            _entry['ended_at'] = datetime.now(UTC).isoformat()
-            break
-    _idx_at_end: dict[str, list[dict[str, object]]] = {'sessions': _end_sessions}
-    _tmp_end = _index_path.with_suffix(_index_path.suffix + '.tmp')
-    _tmp_end.write_text(_json2.dumps(_idx_at_end, indent=2), encoding='utf-8')
-    _tmp_end.replace(_index_path)
+    # Reaches here only on the success path — `_finalize_session`
+    # (registered via atexit at session-creation time) handles BOTH
+    # success and failure paths so the dashboard never shows a
+    # session stuck `live` after the process exits.
     return 0
 
 
@@ -1166,6 +1290,18 @@ def _build_and_save_signals_tables(
     by_exp_dir: dict[Path, list[tuple[int, int]]] = {}
     for perm_id, _, exp_dir, display_id in picks:
         by_exp_dir.setdefault(exp_dir, []).append((perm_id, display_id))
+    if not by_exp_dir:
+        # Caller (`_run`) guards against `len(picks) == 0` upstream and
+        # exits before reaching this helper. Belt-and-braces: an empty
+        # mapping here would hit `next(iter(...))` with StopIteration —
+        # surface it as a clear ValueError instead so the message names
+        # the cause (Copilot P1, defensive narrow that's reachable only
+        # via mis-call from a future entry point).
+        msg = (
+            '_build_and_save_signals_tables: no picks → no SignalsTable '
+            'to build. Caller must short-circuit on empty picks.'
+        )
+        raise ValueError(msg)
     historical = HistoricalData()
     # Mode-2 picks share the same data_source_config (same bundle), so
     # we read the manifest from the FIRST exp_dir's metadata.json
@@ -1263,14 +1399,28 @@ def _build_and_save_signals_tables(
                     flush=True,
                 )
     if not _use_cache:
+        # `install_cache` (registered in `_run` for the filter-pool
+        # training pass) wraps `HistoricalData.get_spot_klines` to
+        # return the cached parquet whenever the file exists — so a
+        # naive refetch call here would re-load the SAME stale data
+        # we already rejected. Delete the parquet first; the wrapper
+        # then sees a cache miss, fetches fresh from HuggingFace, and
+        # writes the new file back to disk under its own atomic
+        # `_cp.tmp` → `_cp` move. The subprocesses (which install the
+        # same wrapper) read the refreshed parquet on their next call.
+        # Copilot P1.
+        if _cp.is_file():
+            _cp.unlink()
         klines_shared = historical.get_spot_klines(
+            n_rows=ds_n_rows_obj,
             kline_size=kline_size,
             start_date_limit=ds_start_obj,
         )
-        _cp.parent.mkdir(parents=True, exist_ok=True)
-        _tmp = _cp.with_suffix(_cp.suffix + '.tmp')
-        klines_shared.write_parquet(_tmp)
-        _tmp.replace(_cp)
+        # The wrapper writes the parquet itself on its miss path; no
+        # explicit `klines_shared.write_parquet(...)` call needed.
+        # Copilot P1: prior code passed n_rows implicitly None, which
+        # bypassed the bundle's declared row cap and risked pulling the
+        # full dataset (memory + parity drift vs the runtime poller).
         print(
             f'[{time.perf_counter()-_t_klines:7.2f}s] '
             f'klines refetched from HuggingFace ({klines_shared.height} rows)',
@@ -1284,14 +1434,30 @@ def _build_and_save_signals_tables(
         # the `_use_cache` branching.
         msg = 'sweep signals: klines_shared not populated'
         raise RuntimeError(msg)
-    _klines_max_dt_obj: object = klines_shared['datetime'].max()
-    if not isinstance(_klines_max_dt_obj, datetime) or _klines_max_dt_obj < replay_end:
+    # Normalize the polars `.max()` to a tz-aware UTC datetime before
+    # the staleness boundary compare (zero-bang P1: cache-hit path's
+    # `_cached_max_aware` already does this; the post-fetch path
+    # reused the raw `.max()` and would `TypeError` if Polars returned
+    # tz-naive on the refetched parquet).
+    _klines_max_dt_raw: object = klines_shared['datetime'].max()
+    if not isinstance(_klines_max_dt_raw, datetime):
         msg = (
-            f'sweep signals: klines end at {_klines_max_dt_obj}, '
+            f'sweep signals: klines max datetime is not a datetime '
+            f'(got {type(_klines_max_dt_raw).__name__}={_klines_max_dt_raw!r}); '
+            f'cannot bound the SignalsTable build window.'
+        )
+        raise RuntimeError(msg)
+    _klines_max_dt = (
+        _klines_max_dt_raw if _klines_max_dt_raw.tzinfo is not None
+        else _klines_max_dt_raw.replace(tzinfo=UTC)
+    )
+    if _klines_max_dt < replay_end:
+        msg = (
+            f'sweep signals: klines end at {_klines_max_dt.isoformat()}, '
             f'which is before replay_end '
             f'{replay_end.isoformat()}. The SignalsTable '
             f'would silently produce constant predictions '
-            f'for every tick past {_klines_max_dt_obj}. Either '
+            f'for every tick past {_klines_max_dt.isoformat()}. Either '
             f'shorten --replay-period-end or wait for the '
             f'upstream klines dataset to publish through '
             f'the requested window.'

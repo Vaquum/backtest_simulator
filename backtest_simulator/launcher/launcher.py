@@ -901,6 +901,16 @@ class BacktestLauncher(Launcher):
         # the loop iterates only once per strategy tick boundary.
         # `None` keeps the legacy 120s behaviour for callers that
         # haven't been audited.
+        if clock_tick_seconds is not None and clock_tick_seconds <= 0:
+            # `_advance_clock_until` derives boundary buffers and
+            # tick amounts from `_clock_tick_seconds.total_seconds()`;
+            # zero or negative would produce zero / negative
+            # timedeltas and either spin or freeze (Copilot P1).
+            msg = (
+                f'clock_tick_seconds must be > 0 when provided, '
+                f'got {clock_tick_seconds!r}.'
+            )
+            raise ValueError(msg)
         self._clock_tick_seconds = (
             timedelta(seconds=clock_tick_seconds)
             if clock_tick_seconds is not None
@@ -1683,6 +1693,13 @@ class BacktestLauncher(Launcher):
                 )
                 margin_s = next_boundary - secs
                 end_dist_s = (end - frozen_now).total_seconds()
+                if end_dist_s <= 0:
+                    # `while datetime.now(UTC) < end` already gates
+                    # the loop, but the freezer's microsecond resolution
+                    # means the next iteration can race past `end` by
+                    # micros — defensive break so we never tick past
+                    # the requested window edge (Copilot P1).
+                    break
                 if margin_s > _BOUNDARY_BUFFER_S * 2:
                     # Far from boundary — jump big, leave one buffer
                     # behind so we approach the boundary with margin.
@@ -1691,9 +1708,14 @@ class BacktestLauncher(Launcher):
                 else:
                     # In or near the boundary buffer — cross by 1s
                     # and grant the asyncio chain a generous pause.
-                    tick_amt = min(margin_s + 1.0, end_dist_s)
+                    tick_amt = margin_s + 1.0
                     pause_s = _BOUNDARY_PAUSE_S
-                tick_amt = min(tick_amt, max(end_dist_s, 1.0))
+                # Strict clamp to remaining distance — the prior
+                # `max(end_dist_s, 1.0)` lower bound let `tick_amt`
+                # advance past `end` when `end_dist_s < 1.0`,
+                # surfacing extra Timer fires in the post-window
+                # processing (Copilot P1).
+                tick_amt = min(tick_amt, end_dist_s)
                 tick_fn(timedelta(seconds=tick_amt))
                 time.sleep(pause_s)
             else:
