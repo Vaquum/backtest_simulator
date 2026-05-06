@@ -1,26 +1,4 @@
-"""`~/sweep/sessions/index.json` read-modify-write helpers.
-
-Extracted from `cli/commands/sweep.py` so the orchestrator stays
-within the file-size balance ratio. The two helpers exposed here
-are called from `_run`:
-
-  * `atomic_index_update(path, mutate)`: serialises start-of-sweep
-    `append` and end-of-sweep `ended_at` updates from concurrent
-    `bts sweep` processes against a shared `index.json`. Uses a
-    SEPARATE `.lock` file (so the lock survives the rename-into-
-    place that the writer performs) + atomic `tmp.replace(path)`
-    so readers (the dashboard, anyone polling the manifest) see
-    only the OLD or NEW complete file.
-
-  * `finalize_session(path, session_id)`: stamps `ended_at` for
-    `session_id`. Registered via `atexit` immediately after the
-    session is appended at sweep start so every exit path (clean
-    return, `ParityViolation`, `RuntimeError("sweep aborted")`,
-    `sys.exit`, `Ctrl-C`) clears the dashboard's `live` indicator.
-
-Re-`re_session_id_pattern()` is also re-exported so the path-
-traversal regex stays adjacent to the manifest writer.
-"""
+"""`~/sweep/sessions/index.json` read-modify-write helpers (flock + atomic temp+replace)."""
 from __future__ import annotations
 
 import fcntl
