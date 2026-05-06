@@ -9,9 +9,6 @@ from __future__ import annotations
 
 import argparse
 import atexit
-import fcntl
-import json as _index_json
-import re
 import sys
 import time
 from collections.abc import Callable
@@ -51,6 +48,15 @@ from backtest_simulator.cli._run_window import (
 from backtest_simulator.cli._run_window import (
     run_window_in_subprocess as run_window_in_subprocess,
 )
+from backtest_simulator.cli._session_manifest import (
+    atomic_index_update as _atomic_index_update,
+)
+from backtest_simulator.cli._session_manifest import (
+    finalize_session as _finalize_session,
+)
+from backtest_simulator.cli._session_manifest import (
+    re_session_id_pattern as _re_session_id_pattern,
+)
 from backtest_simulator.cli._signals_builder import (
     assert_signals_parity,
     build_signals_table_for_decoder,
@@ -73,124 +79,6 @@ _SECOND_WEEK_APRIL_START: Final = datetime(2026, 4, 6, tzinfo=UTC).date()
 _SECOND_WEEK_APRIL_END: Final = datetime(2026, 4, 12, tzinfo=UTC).date()
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
-
-
-def _re_session_id_pattern() -> re.Pattern[str]:
-    """ASCII alnum + `-_.`, no leading dot. Path-traversal-safe."""
-    return re.compile(r'[A-Za-z0-9_\-][A-Za-z0-9_\-.]*')
-
-
-def _atomic_index_update(
-    index_path: Path,
-    mutate: Callable[[list[dict[str, object]]], None],
-) -> None:
-    """Read-modify-write `index.json` under a flock + atomic temp+replace.
-
-    Concurrency:
-      - flock is taken on a SEPARATE `index.json.lock` file (not on
-        the data file itself), so the lock survives the
-        rename-into-place that the writer performs.
-      - The new JSON is written to `<path>.tmp` first, then
-        `Path.replace`d into place. Readers (the dashboard, anyone
-        else that opens `index.json` without holding the lock) see
-        either the OLD complete file or the NEW complete file —
-        never the partial in-place truncate-then-write window of a
-        single open file (Copilot P1).
-
-    Serialises start-of-sweep `append` and end-of-sweep `ended_at`
-    updates from concurrent `bts sweep` processes against a shared
-    `~/sweep/sessions/index.json`. Without the lock the two
-    processes' read-modify-write windows can overlap and the
-    loser's update is silently lost (bit-mis P1).
-
-    Failure modes are explicit:
-      - missing file → seed with `{"sessions": []}` and proceed.
-      - malformed JSON or unreadable file → write to stderr and BAIL
-        without rewriting (do NOT clobber other operators' sessions
-        with `{"sessions": []}`; bit-mis P1 silent-data-loss).
-      - mutate raises → propagate; the temp file is left on disk
-        for diagnostics but `index_path` is never overwritten.
-    """
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    if not index_path.is_file():
-        index_path.write_text('{"sessions": []}', encoding='utf-8')
-    lock_path = index_path.with_suffix(index_path.suffix + '.lock')
-    try:
-        lock_fp = lock_path.open('w', encoding='utf-8')
-    except OSError as exc:
-        sys.stderr.write(
-            f'bts sweep: cannot open sessions index lock at '
-            f'{lock_path} ({exc}); leaving manifest unchanged.\n',
-        )
-        return
-    try:
-        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
-        try:
-            raw = index_path.read_text(encoding='utf-8')
-        except OSError as exc:
-            sys.stderr.write(
-                f'bts sweep: cannot read sessions index at '
-                f'{index_path} ({exc}); leaving manifest unchanged.\n',
-            )
-            return
-        if not raw.strip():
-            data: dict[str, object] = {'sessions': []}
-        else:
-            try:
-                loaded: object = _index_json.loads(raw)
-            except _index_json.JSONDecodeError as exc:
-                sys.stderr.write(
-                    f'bts sweep: sessions index at {index_path} is '
-                    f'malformed ({exc}); leaving manifest unchanged.\n',
-                )
-                return
-            if not isinstance(loaded, dict):
-                sys.stderr.write(
-                    f'bts sweep: sessions index at {index_path} is not '
-                    f'an object; leaving manifest unchanged.\n',
-                )
-                return
-            data = cast('dict[str, object]', loaded)
-        raw_sessions = data.get('sessions')
-        sessions_list: list[dict[str, object]] = []
-        if isinstance(raw_sessions, list):
-            sessions_list = [
-                cast('dict[str, object]', s)
-                for s in cast('list[object]', raw_sessions)
-                if isinstance(s, dict)
-            ]
-        mutate(sessions_list)
-        data['sessions'] = sessions_list
-        tmp_path = index_path.with_suffix(index_path.suffix + '.tmp')
-        tmp_path.write_text(_index_json.dumps(data, indent=2), encoding='utf-8')
-        tmp_path.replace(index_path)
-    finally:
-        lock_fp.close()
-
-
-def _finalize_session(index_path: Path, session_id: str) -> None:
-    """Stamp `ended_at` for `session_id` in `index.json`.
-
-    Registered via `atexit` immediately after the session is appended at
-    sweep start, so the dashboard's `live` indicator clears whether the
-    sweep returned cleanly, raised `ParityViolation`,
-    `RuntimeError("sweep aborted")`, or was interrupted (Ctrl-C lets
-    `atexit` run; `os._exit` does not — that's only used post-success in
-    subprocess children, not the parent).
-
-    Idempotent: only stamps when `ended_at is None`. atexit handlers are
-    not re-entered automatically, but the guard makes a manual second
-    call harmless too.
-    """
-    def _stamp(sessions: list[dict[str, object]]) -> None:
-        now_iso = datetime.now(UTC).isoformat()
-        for entry in sessions:
-            if entry.get('id') != session_id:
-                continue
-            if entry.get('ended_at') is None:
-                entry['ended_at'] = now_iso
-            return
-    _atomic_index_update(index_path, _stamp)
 
 
 def assert_sweep_signals_parity_ran(
@@ -755,18 +643,36 @@ def _run(args: argparse.Namespace) -> int:
     _t_trades = time.perf_counter()
     _trade_fetch_start = replay_start - timedelta(minutes=30)
     _trade_fetch_end = replay_end + timedelta(seconds=600)
-    _trades_parquet = _prefetch_trades(
-        config=_ChCfg.from_env(),
-        symbol='BTCUSDT',
-        start=_trade_fetch_start,
-        end=_trade_fetch_end,
-        cache_dir=Path.home() / '.cache' / 'backtest_simulator' / 'trades',
-    )
-    print(
-        f'[{time.perf_counter()-_t_trades:7.2f}s] '
-        f'trades tape ready: {_trades_parquet.name}',
-        flush=True,
-    )
+    # ClickHouse env may be missing in CI / unit-test contexts that
+    # mock `run_window_in_subprocess` and never actually read the
+    # parquet. `_ChCfg.from_env()` raises `RuntimeError` on missing
+    # env vars in that case; we surface the reason to stderr and
+    # pass `trades_parquet_path=None` so the (mocked) subprocess
+    # path skips it. Real CLI usage always has the env set so this
+    # branch never fires in production sweeps.
+    import os as _envcheck
+    _ch_env_ok = bool(_envcheck.environ.get('CLICKHOUSE_PASSWORD'))
+    if _ch_env_ok:
+        _trades_parquet = _prefetch_trades(
+            config=_ChCfg.from_env(),
+            symbol='BTCUSDT',
+            start=_trade_fetch_start,
+            end=_trade_fetch_end,
+            cache_dir=Path.home() / '.cache' / 'backtest_simulator' / 'trades',
+        )
+        print(
+            f'[{time.perf_counter()-_t_trades:7.2f}s] '
+            f'trades tape ready: {_trades_parquet.name}',
+            flush=True,
+        )
+        _trades_parquet_path: str | None = str(_trades_parquet)
+    else:
+        sys.stderr.write(
+            'bts sweep: CLICKHOUSE_PASSWORD not set; skipping trades '
+            'prefetch (subprocesses will fetch per-window or fail '
+            'loudly if real ClickHouse access is needed).\n',
+        )
+        _trades_parquet_path = None
     _raw_max_alloc = getattr(args, 'max_allocation_per_trade_pct', None)
     _raw_lookback = getattr(args, 'predict_lookback', None)
     # Captured by `_run_one_window` below as concrete typed values so
@@ -775,7 +681,6 @@ def _run(args: argparse.Namespace) -> int:
     # unpacking that the typing-budget ratchet rejected.
     _maker_preference = bool(getattr(args, 'maker', False))
     _strict_impact = bool(getattr(args, 'strict_impact', False))
-    _trades_parquet_path = str(_trades_parquet)
     _max_alloc_decimal: Decimal | None = (
         None if _raw_max_alloc is None else Decimal(str(_raw_max_alloc))
     )

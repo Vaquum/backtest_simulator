@@ -10,7 +10,7 @@ from typing import Final
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIR = REPO_ROOT / 'backtest_simulator'
 
-# 20.00 accommodates:
+# 18.00 accommodates:
 #   (a) Protocol-conformance files (SimulatedVenueAdapter implements the
 #       15-method praxis.infrastructure.venue_adapter.VenueAdapter Protocol;
 #       runtime_checkable isinstance() requires those methods to live on
@@ -25,20 +25,14 @@ SOURCE_DIR = REPO_ROOT / 'backtest_simulator'
 #       type-narrow the conversion on each branch.
 #   (d) sweep.py: end-to-end sweep orchestration (filter-pool training
 #       + SignalsTable build + parallel-batch + per-window post-
-#       processing + statistics summaries + session manifest IO +
-#       cross-process flock-protected manifest read-modify-write +
-#       atexit finalizer + dead-on-exception CSV close registration).
-#       Splitting it would require threading every module-local helper
-#       through a shared state dict, which is the kind of plumbing the
-#       balance gate is meant to discourage; the ratio bumps from 16
-#       to 18 to 20 each correspond to one named, scope-bounded review
-#       round (zero-bang + bit-mis + Copilot P1s) on this single
-#       orchestrator module.
+#       processing + statistics summaries). Per-process manifest
+#       helpers live in `cli/_session_manifest.py`, the natural
+#       sibling boundary the gate encourages.
 # Private helpers do live in sibling `_*` modules where the class/file
 # boundary is natural (e.g. `venue/_adapter_internals.py`,
 # `honesty/capital.py`'s `_PendingLifecycle`); the ratio cap is set
 # against the residual Protocol-sized modules.
-MAX_RATIO: Final[float] = 20.00
+MAX_RATIO: Final[float] = 18.00
 MIN_FILES_FOR_GATE: Final[int] = 3
 
 
