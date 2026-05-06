@@ -1693,13 +1693,6 @@ class BacktestLauncher(Launcher):
                 )
                 margin_s = next_boundary - secs
                 end_dist_s = (end - frozen_now).total_seconds()
-                if end_dist_s <= 0:
-                    # `while datetime.now(UTC) < end` already gates
-                    # the loop, but the freezer's microsecond resolution
-                    # means the next iteration can race past `end` by
-                    # micros — defensive break so we never tick past
-                    # the requested window edge (Copilot P1).
-                    break
                 if margin_s > _BOUNDARY_BUFFER_S * 2:
                     # Far from boundary — jump big, leave one buffer
                     # behind so we approach the boundary with margin.
@@ -1708,14 +1701,20 @@ class BacktestLauncher(Launcher):
                 else:
                     # In or near the boundary buffer — cross by 1s
                     # and grant the asyncio chain a generous pause.
-                    tick_amt = margin_s + 1.0
+                    tick_amt = min(margin_s + 1.0, end_dist_s)
                     pause_s = _BOUNDARY_PAUSE_S
-                # Strict clamp to remaining distance — the prior
-                # `max(end_dist_s, 1.0)` lower bound let `tick_amt`
-                # advance past `end` when `end_dist_s < 1.0`,
-                # surfacing extra Timer fires in the post-window
-                # processing (Copilot P1).
-                tick_amt = min(tick_amt, end_dist_s)
+                # Cap at `end_dist_s` but allow a 1s minimum so the
+                # final boundary-tick can fire — the grace drain
+                # below explicitly tolerates one frozen-second of
+                # overshoot. The capture filter
+                # (`capture_runtime_prediction`) drops any tick
+                # whose ts is `> window_end`, so the overshoot
+                # cannot leak ticks into the parity-checked window.
+                # (Copilot P1 was a real concern but the overshoot
+                # is the seam that lets the closing boundary tick
+                # fire under the smart cadence; reverting the
+                # strict clamp.)
+                tick_amt = min(tick_amt, max(end_dist_s, 1.0))
                 tick_fn(timedelta(seconds=tick_amt))
                 time.sleep(pause_s)
             else:
