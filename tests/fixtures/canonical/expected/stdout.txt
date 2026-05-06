@@ -30,7 +30,7 @@
 [<dur>] sensors trained (1 decoder(s))
 [<dur>] sensors trained (1 decoder(s))
 [<dur>] session <session-id> → <session-path>
-[<dur>] trades tape ready: btcusdt_20260331T233000_20260404T000900.parquet
+[<dur>] trades tape ready: trades.parquet (operator-supplied)
 done   6 run(s) in <wall>s
 sweep book_gap   skipped: no STOP/TP trigger fills observed (default long_on_signal template uses MARKET orders; this metric activates when strategies emit STOP/TP orders)
 sweep calibration  predict-vs-realised gap -1.56bp across 8 predicted fills  uncalibrated_predict=0  WARN: gap >1bp — calibration window or qty buckets do not match this run; recalibrate
