@@ -5,7 +5,6 @@ from collections.abc import Mapping, Sequence
 
 import pyarrow as pa
 
-
 class QueryResult:
     result_rows: Sequence[Sequence[object]]
 

@@ -245,6 +245,7 @@ def run_window_in_process(
             f'lookback < 1 yields an empty x_test and IndexError downstream.'
         )
         raise ValueError(msg)
+    import polars as _pl_mod
     from praxis.launcher import InstanceConfig
     from praxis.trading_config import TradingConfig
 
@@ -253,7 +254,6 @@ def run_window_in_process(
         ClickHouseFeed,
         InMemoryTradesFeed,
     )
-    import polars as _pl_mod
     from backtest_simulator.launcher import BacktestLauncher
     from backtest_simulator.pipeline.manifest_builder import (
         AccountSpec,

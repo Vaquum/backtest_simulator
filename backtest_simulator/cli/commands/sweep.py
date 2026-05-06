@@ -19,7 +19,6 @@ from typing import Final
 
 # tqdm removed — sweep emits one log line per phase + one per window
 # completion. Progress bars muddied the parallel-batch output.
-
 from backtest_simulator.cli._metrics import (
     STARTING_CAPITAL,
     Trade,
@@ -33,6 +32,7 @@ from backtest_simulator.cli._pipeline import (
     preflight_tunnel,
     seed_price_at,
 )
+
 # Lazy-imported below: `from backtest_simulator.cli._run_window import …`
 # is moved INSIDE the functions that need it. Eager import at module
 # scope here, combined with `cli/__init__.py` importing this module on
@@ -363,7 +363,7 @@ def _run(args: argparse.Namespace) -> int:
     # Without this, every `train_single_decoder(...)` invocation calls
     # Limen's pipeline → `manifest.fetch_data()` → `get_spot_klines` →
     # full HuggingFace stream (~40 s each). With N decoders that's
-    # N × ~40 s of pure HF refetching just for the filter pool. The
+    # N x ~40 s of pure HF refetching just for the filter pool. The
     # patch is idempotent (guarded by `HistoricalData._bts_cache_installed`)
     # so it composes with the same install in the per-window
     # subprocesses (`_run_window._child_main`). The 48h freshness check
@@ -415,7 +415,7 @@ def _run(args: argparse.Namespace) -> int:
         net_return_min_q=args.net_return_min_q,
         input_from_file=args.input_from_file,
     )
-    # Header line removed — the same numbers (decoders × days = runs) are
+    # Header line removed — the same numbers (decoders x days = runs) are
     # already implicit in the per-window log lines and the `replay
     # launching … window(s) on … worker(s)` line right before the batch.
     total_runs = len(picks) * len(days)
@@ -549,6 +549,7 @@ def _run(args: argparse.Namespace) -> int:
     # 30-min trade slice queries during slippage calibration.
     import concurrent.futures as _cf
     import os as _os
+
     # ONE ClickHouse fetch for the whole sweep — covers slippage
     # calibration (30-min pre-window slice), per-submit market-impact
     # bucket fetches (1-min pre-submit slice), and the per-submit fill
@@ -557,6 +558,8 @@ def _run(args: argparse.Namespace) -> int:
     # round-trips that were costing 3-6s each over the SSH tunnel.
     from backtest_simulator.feed.clickhouse import (
         ClickHouseConfig as _ChCfg,
+    )
+    from backtest_simulator.feed.clickhouse import (
         prefetch_sweep_trades as _prefetch_trades,
     )
     _t_trades = time.perf_counter()
@@ -640,6 +643,7 @@ def _run(args: argparse.Namespace) -> int:
         if not isinstance(_res, dict):
             return
         from typing import cast as _cast2
+
         from backtest_simulator.cli._run_window import (
             WindowResult as _WR2,
         )
@@ -748,9 +752,9 @@ def _run(args: argparse.Namespace) -> int:
             window_start = datetime.combine(day.date(), hours_start, tzinfo=UTC)
             window_end = datetime.combine(day.date(), hours_end, tzinfo=UTC)
             day_label = day.date().isoformat()
-            t0 = time.perf_counter()
             result_obj = parallel_results[(perm_id, display_id, day_label)]
             from typing import cast as _cast
+
             from backtest_simulator.cli._run_window import (
                 WindowResult as _WR,
             )
@@ -893,59 +897,14 @@ def _run(args: argparse.Namespace) -> int:
                 n_runs_with_trailing_inventory += 1
             else:
                 decoder_day_returns[str(display_id)][day_idx] = day_return
-            # Per-window CSV row. All values are recomputed locally
-            # from the same primitives `print_run` uses so the CSV
-            # matches the per-line print exactly.
-            pairs_csv, _trailing_csv = pair_trades(trades)
-            net_pnls_csv: list[Decimal] = []
-            r_mults_csv: list[Decimal] = []
-            ret_pcts_csv: list[Decimal] = []
-            for buy_csv, sell_csv in pairs_csv:
-                declared_csv = declared_stops.get(buy_csv.client_order_id)
-                net_csv, ret_csv, r_csv = pair_metrics(
-                    (buy_csv, sell_csv), declared_csv,
-                )
-                net_pnls_csv.append(net_csv)
-                ret_pcts_csv.append(ret_csv)
-                if r_csv is not None:
-                    r_mults_csv.append(r_csv)
-            n_trades_csv = len(pairs_csv)
-            # Position-relative trade-pair return sum (percent
-            # points) — matches the per-window log line's
-            # `total +X.XX%`. Distinct from `day_return`
-            # (capital-relative fraction) which is a different metric
-            # used for DSR/PBO/SPA stats.
-            total_pct_csv = (
-                sum(ret_pcts_csv, Decimal('0')) if ret_pcts_csv else None
-            )
-            r_mean_csv = (
-                sum(r_mults_csv, Decimal('0')) / len(r_mults_csv)
-                if r_mults_csv else None
-            )
-            max_dd_csv = max_drawdown_pct(net_pnls_csv, STARTING_CAPITAL)
-            # Effective allocation that ACTUALLY got deployed this
-            # day. Computed from the actual BUY trades' notional, not
-            # from the configured Kelly cap — operator-honest. Sums
-            # all BUY notionals on multi-trade days; 0 on flat days.
-            buy_notional_csv = sum(
-                (buy_csv.qty * buy_csv.price for buy_csv, _ in pairs_csv),
-                Decimal('0'),
-            )
-            cap_alloc_csv = (
-                buy_notional_csv / STARTING_CAPITAL * Decimal('100')
-                if buy_notional_csv > 0 else Decimal('0')
-            )
-            # Min/max of model `_probs` across EVERY captured kline
-            # tick in the window — not just BUY-entry ticks. This
-            # surfaces whether the model output varies through the
-            # day, independent of when the strategy chose to act.
-            # When the model is stuck at a constant, min == max and
-            # that's visible.
-            # Per-window + per-tick CSV writes are done LIVE inside the
-            # parallel-batch `as_completed` loop above (`_write_csv_row_now`)
-            # so the dashboard streams rows as windows finish, instead of
-            # waiting for the whole batch. Removed from this ordered
-            # post-processing block to avoid duplicate rows.
+            # Per-window + per-tick CSV writes happen live inside the
+            # parallel-batch `as_completed` loop above
+            # (`_write_csv_row_now`) so the dashboard streams rows as
+            # windows finish, instead of waiting for the whole batch.
+            # The duplicated `pair_trades` / `pair_metrics` /
+            # `max_drawdown_pct` computations that used to live here
+            # were dead — the live writer is the single source of
+            # truth for sweep CSV output.
             sweep_n_limit_total += n_limit
             sweep_n_limit_full += n_limit_full
             sweep_n_limit_partial += n_limit_partial
@@ -1141,6 +1100,7 @@ def _build_and_save_signals_tables(
     """
     import importlib
     import json as _json
+
     from limen import HistoricalData, Trainer
     by_exp_dir: dict[Path, list[tuple[int, int]]] = {}
     for perm_id, _, exp_dir, display_id in picks:
@@ -1275,7 +1235,7 @@ def _build_and_save_signals_tables(
         # constructs the manifest + scaler factory; `trainer.train([…])`
         # fits N sklearn classifiers in one pass. Their wall time was
         # previously hidden — the per-decoder line started AFTER this
-        # block, so 10 × 0.12s did not equal the outer summary's seconds.
+        # block, so 10 x 0.12s did not equal the outer summary's seconds.
         # Logging it here makes the math add up.
         _t_trainer = time.perf_counter()
         trainer = Trainer(exp_dir, data=klines_shared)

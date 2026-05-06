@@ -1638,7 +1638,7 @@ class BacktestLauncher(Launcher):
         #   - Uniform mode (`_clock_tick_seconds <= 120s`): tick by
         #     a fixed step (default 120s), pause 10ms, drain. Safe
         #     for any cadence; default for callers that don't pass
-        #     `clock_tick_seconds`. Cost: 720 iters/day at 120s × 10ms
+        #     `clock_tick_seconds`. Cost: 720 iters/day at 120s x 10ms
         #     ≈ 7s of pure `time.sleep` per day.
         #   - Smart kline-aware mode (`_clock_tick_seconds > 120s`):
         #     `_clock_tick_seconds` is interpreted as the bundle's
@@ -1650,7 +1650,7 @@ class BacktestLauncher(Launcher):
         #     next freezer tick. Reduces 720 iters/day to ~20-25 for
         #     a 4h kline; pause budget around each boundary stays in
         #     the 250-300ms range that uniform mode delivered via 120
-        #     × 10ms.
+        #     x 10ms.
         real_start = os.times()[4]
         kline_size_s = self._clock_tick_seconds.total_seconds()
         use_smart = kline_size_s > 120.0

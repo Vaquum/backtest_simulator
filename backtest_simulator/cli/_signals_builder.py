@@ -28,8 +28,8 @@ from typing import Protocol
 
 import numpy as np
 import polars as pl
-# tqdm removed — sweep emits one log line per phase, no progress bars.
 
+# tqdm removed — sweep emits one log line per phase, no progress bars.
 from backtest_simulator.launcher.poller import (
     DEFAULT_N_ROWS as POLLER_N_ROWS,
 )
