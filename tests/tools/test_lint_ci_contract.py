@@ -72,6 +72,13 @@ EXPECTED_RUFF_POLICY: Final[dict[str, object]] = {
         # signature exactly so it can replace the adapter's method
         # via setattr without breaking the Protocol.
         'backtest_simulator/launcher/launcher.py': ['PLR0913'],
+        # Slice 0 (#64): `ReplayClock.drive_window` is the synchronous
+        # replay seam; the slice MVC AST predicate pins exactly 7
+        # keyword-only params (window_start, window_end,
+        # wired_sensors, predict_loop, outcome_loop,
+        # drain_pending_submits, freezer). Collapsing into a config-
+        # bag would diverge from the spec contract.
+        'backtest_simulator/launcher/replay_clock.py': ['PLR0913'],
         # Slice #28: build_validation_pipeline mirrors Praxis's
         # _build_validation_pipeline parameter shape. The 9 kwargs are
         # the parity surface; collapsing them would diverge from

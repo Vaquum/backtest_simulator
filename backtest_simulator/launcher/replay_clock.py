@@ -228,7 +228,7 @@ class ReplayClock:
         *,
         window_start: datetime,
         window_end: datetime,
-        wired_sensors: Sequence[object],
+        wired_sensors: Sequence[WiredSensor],
         predict_loop: _PredictLoop,
         outcome_loop: _OutcomeLoop,
         drain_pending_submits: Callable[[], None],

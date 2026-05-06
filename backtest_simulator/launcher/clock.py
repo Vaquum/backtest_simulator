@@ -27,11 +27,23 @@ from freezegun.api import (
 
 _log = logging.getLogger(__name__)
 
+# Why this module is small: `accelerated_clock` is the entire public
+# surface kept for backtest replay. It is the freezegun re-entry guard
+# plus a `freeze_time(start, real_asyncio=True)` invocation; everything
+# else (the schedule of when frozen time advances, when ticks fire, when
+# outcomes drain) lives in `replay_clock.py`. Splitting these two
+# modules keeps the freezegun policy seam in one file and the synchronous
+# replay driver in another, so a future PR can replace either half
+# without touching the other.
+#
 # `freeze_time()` yields a Union of three factory classes depending on
 # tick / auto_tick_seconds. We construct it with defaults (tick=False,
 # auto_tick_seconds=0) so the runtime value is always
 # FrozenDateTimeFactory — but pyright reads the declared Union from the
-# library signature, so the variable type must accept all three.
+# library signature, so the variable type must accept all three. The
+# stubs in `stubs/freezegun.pyi` only narrow the public symbols; the
+# `freeze_time()` return type is opaque, so the `_FreezerFactory` alias
+# below carries the union forward to every call site.
 _FreezerFactory = FrozenDateTimeFactory | StepTickTimeFactory | TickingDateTimeFactory
 
 _active_freezer: _FreezerFactory | None = None
