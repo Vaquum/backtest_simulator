@@ -684,7 +684,9 @@ def _run(args: argparse.Namespace) -> int:
         from backtest_simulator.cli._run_window import (
             WindowResult as _WR2,
         )
-        _r = _cast2('_WR2', _res)
+        # Use the symbol (not the string form) so vulture sees the
+        # import as live; pyright + cast both accept the bare class.
+        _r = _cast2(_WR2, _res)
         _trades_raw = _r.get('trades', [])
         _stops_raw = _r.get('declared_stops', {})
         _trades_local = [Trade(*row) for row in _trades_raw]
@@ -798,7 +800,9 @@ def _run(args: argparse.Namespace) -> int:
             from backtest_simulator.cli._run_window import (
                 WindowResult as _WR,
             )
-            result = _cast('_WR', result_obj)
+            # Use the symbol (not the string form) so vulture sees the
+            # import as live; pyright + cast both accept the bare class.
+            result = _cast(_WR, result_obj)
             trades_raw = result['trades']
             stops_raw = result['declared_stops']
             trades = [Trade(*row) for row in trades_raw]
