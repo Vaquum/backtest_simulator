@@ -166,6 +166,11 @@ def main() -> int:
                     print(f'    files no longer live: {sorted(missing)}', file=sys.stderr)
                 if extra:
                     print(f'    files newly live:     {sorted(extra)}', file=sys.stderr)
+                for path in sorted(set(exp) & set(got)):
+                    if exp[path] != got[path]:
+                        print(f'    {path}:', file=sys.stderr)
+                        print(f'      expected: {exp[path]}', file=sys.stderr)
+                        print(f'      got:      {got[path]}', file=sys.stderr)
             elif isinstance(exp, list) and isinstance(got, list):
                 exp_keys = {e if isinstance(e, str) else e['path'] for e in exp}
                 got_keys = {g if isinstance(g, str) else g['path'] for g in got}

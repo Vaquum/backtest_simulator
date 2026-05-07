@@ -39,6 +39,10 @@ _TRAINED_OR_CACHED_RE = re.compile(r'(decoder \d+\s+)(trained|cached)\b')
 _COMPLETION_INDEX_RE = re.compile(r'done\s+\(\d+/(\d+),')
 # Final summary `done   N run(s) in X.Xs` carries total wall time.
 _TOTAL_WALL_TIME_RE = re.compile(r'(done\s+\d+ run\(s\) in )\d+\.\d+s')
+# `replay launching N window(s) on M worker(s)` — M depends on host
+# cpu_count() so it varies between CI VMs and dev macs. N is a
+# function of the canonical args and stays.
+_WORKER_COUNT_RE = re.compile(r'(replay launching \d+ window\(s\) on )\d+( worker\(s\))')
 
 
 def normalize_stdout(text: str) -> str:
@@ -52,6 +56,7 @@ def normalize_stdout(text: str) -> str:
     scrubbed = _TRAINED_OR_CACHED_RE.sub(r'\1<trained-or-cached>', scrubbed)
     scrubbed = _COMPLETION_INDEX_RE.sub(r'done  (<i>/\1,', scrubbed)
     scrubbed = _TOTAL_WALL_TIME_RE.sub(r'\1<wall>s', scrubbed)
+    scrubbed = _WORKER_COUNT_RE.sub(r'\1<n>\2', scrubbed)
     # The per-window `done` lines are emitted in parallel-completion
     # order. Sort the whole stdout line-wise so two runs with the same
     # underlying content (different completion order) compare byte-equal.
@@ -73,11 +78,32 @@ def normalize_stderr(text: str) -> str:
 
 def normalize_csv(text: str) -> str:
     """Sort CSV rows (preserving the header) so parallel completion
-    order does not drive byte-equality."""
+    order does not drive byte-equality. Also round any column whose
+    values look like floats with >6 fractional digits to 6 places, so
+    BLAS reduction-order drift across CI runners (which produces
+    sub-ULP precision noise in the trailing digits) does not break
+    byte-equal comparison."""
     lines = text.splitlines()
     if not lines:
         return ''
-    header, rows = lines[0], sorted(lines[1:])
+    header = lines[0]
+    rows = lines[1:]
+    rounded: list[str] = []
+    for row in rows:
+        cols = row.split(',')
+        new_cols: list[str] = []
+        for c in cols:
+            try:
+                f = float(c)
+            except ValueError:
+                new_cols.append(c)
+                continue
+            if '.' in c and len(c.split('.')[1]) > 6:
+                new_cols.append(f'{f:.6f}')
+            else:
+                new_cols.append(c)
+        rounded.append(','.join(new_cols))
+    rows = sorted(rounded)
     return header + '\n' + '\n'.join(rows) + '\n'
 
 

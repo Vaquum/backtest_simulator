@@ -26,7 +26,7 @@
 [<dur>] perm 17     2026-04-02  done  (<i>/6, trades=4)
 [<dur>] perm 17     2026-04-03  done  (<i>/6, trades=0)
 [<dur>] replay batch done (6 window(s))
-[<dur>] replay launching 6 window(s) on 2 worker(s)
+[<dur>] replay launching 6 window(s) on <n> worker(s)
 [<dur>] sensors trained (1 decoder(s))
 [<dur>] sensors trained (1 decoder(s))
 [<dur>] session <session-id> → <session-path>
