@@ -1,3 +1,74 @@
+# v2.7.0
+
+Slice 1 follow-up cleanup + Plan §CI Gates items 3-5 (the canonical
+contract is now machine-enforced end-to-end).
+
+Package surface (cleanup):
+
+- `bts` CLI surface reduced to one subcommand: `bts sweep`. The
+  `run / enrich / test / lint / typecheck / gate / notebook /
+  version` subcommands and their backing modules are deleted.
+- Package test suite removed; the canonical golden sweep
+  (`tests/golden/test_bts_sweep_canonical.py`) is the contract.
+  CI guardrails in `tests/tools/` stay.
+- `pr_checks_honesty.yml` removed (its sole target,
+  `tests/honesty/`, no longer exists).
+- 16 dead files deleted from `backtest_simulator/`, identified by
+  one canonical sweep run under coverage and cross-referenced
+  against `git ls-files`. Strategy-template `long_on_signal.py`
+  stays despite zero source coverage — file-level dep
+  (`manifest_builder.py:166` reads it as text and writes the copy
+  for Nexus to load).
+- Every `backtest_simulator/**/*.py` file stripped of comments and
+  function/class docstrings; module-level one-line docstrings
+  retained (gate-required). Sole-docstring class bodies got
+  `pass` inserted to stay parseable.
+- 46 dead functions deleted at function-level (105 candidates from
+  `sweep_function_coverage.json`, 59 retained because of static
+  references / Protocol conformance / file-level deps).
+- Dead-branch surgery within live functions: 30 files / -635 raw
+  lines via `else:` and `if`-body deletion, golden-test-guarded
+  per-file. Iter 2 added marginal -7 lines before hitting
+  diminishing returns.
+
+Total package module-budget shrunk 10,500 -> 4,690 over the
+course of the cleanup. File-size-balance ratio 17.96 -> 11.43.
+
+CI gate scaffolding (Plan items 3-5):
+
+- `pr_checks_canonical_bundle.yml` + `tools/check_canonical_bundle
+  .py` — verify SHA256 of every fixture in `tests/fixtures/
+  canonical/checksums.sha256`. Hard fixture-byte lock.
+- `pr_checks_sweep_reference.yml` + `tools/check_sweep_reference
+  .py` — re-run canonical `bts sweep` under coverage, regenerate
+  the live/empty/no-executed-lines classification, compare
+  against the committed `sweep_reference.json`. Drift fails.
+- `pr_checks_package_coverage.yml` + `tools/check_package_coverage
+  .py` — Package Coverage Law: every line + branch in every live
+  file (per `sweep_reference.json`) is hit by the canonical sweep.
+  Currently surfaces ~330 dead lines + ~150 dead branches across
+  declared-live files; turns green incrementally as the line-
+  level cleanup continues. (Operator-accepted to fail temporarily
+  alongside `tools/check_test_code_ratio.py` and
+  `tools/check_coverage_floor.py`.)
+- `.github/rulesets/main.json` + 4 ruleset-gate fixtures — the
+  three new gates are now required-status checks.
+
+Subprocess coverage wiring stays in place
+(`pyproject.toml [tool.coverage.run]` parallel + concurrency, the
+`_run_window.py` save-before-`os._exit` flush). The `.pth` file
+that auto-inits `coverage.process_startup()` lives in the venv
+and is installed during workflow setup.
+
+Snapshots:
+
+- `tests/fixtures/canonical/sweep_reference.json` — file-level
+  classification (50 tracked, 43 live, 5 empty_init, 2
+  no-executed-lines).
+- `tests/fixtures/canonical/sweep_function_coverage.json` —
+  function-level classification (378 functions, 238 live, 4
+  empty, 105 dead candidates pre-filter).
+
 # v2.6.0
 
 Slice 1 (The-Plan.md) — canonical golden sweep gate. The deterministic

@@ -19,98 +19,98 @@
     "replay_window_count": 6
   },
   "overall": {
-    "tracked_files": 66,
-    "live_files": 44,
-    "empty_init_files": 6,
-    "dead_files": 16,
-    "covered_lines": 3260,
-    "num_statements": 5482,
-    "percent_covered": 54.888188073394495
+    "tracked_files": 50,
+    "live_files": 43,
+    "empty_init_files": 5,
+    "dead_files": 2,
+    "covered_lines": 3004,
+    "num_statements": 3871,
+    "percent_covered": 73.66139171905485
   },
   "live": {
     "backtest_simulator/__init__.py": {
-      "num_statements": 22,
-      "covered_lines": 14,
-      "num_branches": 4,
+      "num_statements": 17,
+      "covered_lines": 13,
+      "num_branches": 2,
       "covered_branches": 0
     },
     "backtest_simulator/_limen_cache.py": {
-      "num_statements": 39,
-      "covered_lines": 27,
-      "num_branches": 4,
-      "covered_branches": 2
-    },
-    "backtest_simulator/cli/__init__.py": {
-      "num_statements": 19,
-      "covered_lines": 18,
+      "num_statements": 37,
+      "covered_lines": 26,
       "num_branches": 2,
       "covered_branches": 1
     },
+    "backtest_simulator/cli/__init__.py": {
+      "num_statements": 16,
+      "covered_lines": 16,
+      "num_branches": 0,
+      "covered_branches": 0
+    },
     "backtest_simulator/cli/_metrics.py": {
-      "num_statements": 127,
-      "covered_lines": 113,
-      "num_branches": 50,
-      "covered_branches": 35
-    },
-    "backtest_simulator/cli/_pipeline.py": {
-      "num_statements": 366,
-      "covered_lines": 192,
-      "num_branches": 116,
-      "covered_branches": 47
-    },
-    "backtest_simulator/cli/_run_window.py": {
-      "num_statements": 238,
-      "covered_lines": 199,
-      "num_branches": 54,
+      "num_statements": 111,
+      "covered_lines": 106,
+      "num_branches": 34,
       "covered_branches": 28
     },
+    "backtest_simulator/cli/_pipeline.py": {
+      "num_statements": 248,
+      "covered_lines": 164,
+      "num_branches": 40,
+      "covered_branches": 23
+    },
+    "backtest_simulator/cli/_run_window.py": {
+      "num_statements": 195,
+      "covered_lines": 188,
+      "num_branches": 26,
+      "covered_branches": 17
+    },
     "backtest_simulator/cli/_session_manifest.py": {
-      "num_statements": 59,
+      "num_statements": 52,
       "covered_lines": 35,
-      "num_branches": 12,
+      "num_branches": 6,
       "covered_branches": 2
     },
     "backtest_simulator/cli/_signals_builder.py": {
-      "num_statements": 134,
-      "covered_lines": 84,
-      "num_branches": 46,
-      "covered_branches": 25
-    },
-    "backtest_simulator/cli/_stats.py": {
-      "num_statements": 176,
-      "covered_lines": 60,
-      "num_branches": 58,
+      "num_statements": 70,
+      "covered_lines": 63,
+      "num_branches": 6,
       "covered_branches": 5
     },
+    "backtest_simulator/cli/_stats.py": {
+      "num_statements": 45,
+      "covered_lines": 45,
+      "num_branches": 2,
+      "covered_branches": 2
+    },
     "backtest_simulator/cli/_verbosity.py": {
-      "num_statements": 39,
-      "covered_lines": 33,
+      "num_statements": 27,
+      "covered_lines": 27,
       "num_branches": 6,
       "covered_branches": 4
     },
     "backtest_simulator/cli/commands/sweep.py": {
-      "num_statements": 512,
-      "covered_lines": 437,
-      "num_branches": 122,
-      "covered_branches": 80
+      "num_statements": 420,
+      "covered_lines": 406,
+      "num_branches": 66,
+      "covered_branches": 53
     },
     "backtest_simulator/exceptions.py": {
-      "num_statements": 9,
-      "covered_lines": 9,
+      "num_statements": 17,
+      "covered_lines": 17,
       "num_branches": 0,
       "covered_branches": 0
     },
     "backtest_simulator/feed/clickhouse.py": {
-      "num_statements": 124,
-      "covered_lines": 48,
-      "num_branches": 26,
-      "covered_branches": 1
+      "num_statements": 79,
+      "covered_lines": 44,
+      "num_branches": 0,
+      "covered_branches": 0
     },
     "backtest_simulator/feed/lookahead.py": {
-      "num_statements": 29,
-      "covered_lines": 23,
-      "num_branches": 10,
-      "covered_branches": 5
+      "num_statements": 20,
+      "covered_lines": 18,
+      "num_branches": 2,
+      "covered_branches": 1
     },
     "backtest_simulator/feed/protocol.py": {
       "num_statements": 15,
@@ -125,69 +125,63 @@
       "covered_branches": 0
     },
     "backtest_simulator/honesty/book_gap.py": {
-      "num_statements": 24,
+      "num_statements": 21,
       "covered_lines": 15,
-      "num_branches": 4,
+      "num_branches": 2,
       "covered_branches": 1
     },
     "backtest_simulator/honesty/capital.py": {
-      "num_statements": 191,
-      "covered_lines": 144,
-      "num_branches": 48,
-      "covered_branches": 20
-    },
-    "backtest_simulator/honesty/conservation.py": {
-      "num_statements": 64,
-      "covered_lines": 53,
-      "num_branches": 14,
+      "num_statements": 146,
+      "covered_lines": 133,
+      "num_branches": 18,
       "covered_branches": 9
     },
-    "backtest_simulator/honesty/cpcv.py": {
-      "num_statements": 37,
-      "covered_lines": 19,
-      "num_branches": 8,
-      "covered_branches": 0
+    "backtest_simulator/honesty/conservation.py": {
+      "num_statements": 48,
+      "covered_lines": 46,
+      "num_branches": 4,
+      "covered_branches": 4
     },
     "backtest_simulator/honesty/deflated_sharpe.py": {
-      "num_statements": 32,
+      "num_statements": 22,
       "covered_lines": 11,
-      "num_branches": 8,
+      "num_branches": 0,
       "covered_branches": 0
     },
     "backtest_simulator/honesty/ledger_parity.py": {
-      "num_statements": 112,
-      "covered_lines": 68,
-      "num_branches": 48,
-      "covered_branches": 20
+      "num_statements": 57,
+      "covered_lines": 51,
+      "num_branches": 14,
+      "covered_branches": 12
     },
     "backtest_simulator/honesty/maker_fill.py": {
-      "num_statements": 87,
+      "num_statements": 56,
       "covered_lines": 26,
-      "num_branches": 32,
+      "num_branches": 8,
       "covered_branches": 0
     },
     "backtest_simulator/honesty/market_impact.py": {
-      "num_statements": 83,
-      "covered_lines": 42,
+      "num_statements": 74,
+      "covered_lines": 36,
       "num_branches": 24,
       "covered_branches": 2
     },
     "backtest_simulator/honesty/risk.py": {
-      "num_statements": 19,
-      "covered_lines": 13,
-      "num_branches": 4,
+      "num_statements": 12,
+      "covered_lines": 11,
+      "num_branches": 0,
       "covered_branches": 0
     },
     "backtest_simulator/honesty/slippage.py": {
-      "num_statements": 65,
-      "covered_lines": 56,
-      "num_branches": 18,
-      "covered_branches": 12
+      "num_statements": 54,
+      "covered_lines": 52,
+      "num_branches": 12,
+      "covered_branches": 9
     },
     "backtest_simulator/honesty/spa.py": {
-      "num_statements": 57,
+      "num_statements": 43,
       "covered_lines": 14,
-      "num_branches": 16,
+      "num_branches": 6,
       "covered_branches": 0
     },
     "backtest_simulator/launcher/__init__.py": {
@@ -197,34 +191,34 @@
       "covered_branches": 0
     },
     "backtest_simulator/launcher/action_submitter.py": {
-      "num_statements": 204,
-      "covered_lines": 159,
-      "num_branches": 64,
-      "covered_branches": 30
+      "num_statements": 160,
+      "covered_lines": 149,
+      "num_branches": 24,
+      "covered_branches": 20
     },
     "backtest_simulator/launcher/clock.py": {
-      "num_statements": 27,
-      "covered_lines": 23,
-      "num_branches": 2,
-      "covered_branches": 1
+      "num_statements": 24,
+      "covered_lines": 22,
+      "num_branches": 0,
+      "covered_branches": 0
     },
     "backtest_simulator/launcher/launcher.py": {
-      "num_statements": 499,
-      "covered_lines": 401,
+      "num_statements": 498,
+      "covered_lines": 402,
       "num_branches": 150,
       "covered_branches": 84
     },
     "backtest_simulator/launcher/poller.py": {
-      "num_statements": 71,
-      "covered_lines": 52,
-      "num_branches": 16,
-      "covered_branches": 8
+      "num_statements": 45,
+      "covered_lines": 44,
+      "num_branches": 2,
+      "covered_branches": 2
     },
     "backtest_simulator/launcher/replay_clock.py": {
-      "num_statements": 82,
-      "covered_lines": 61,
-      "num_branches": 34,
-      "covered_branches": 23
+      "num_statements": 51,
+      "covered_lines": 51,
+      "num_branches": 12,
+      "covered_branches": 12
     },
     "backtest_simulator/pipeline/__init__.py": {
       "num_statements": 4,
@@ -233,56 +227,56 @@
       "covered_branches": 0
     },
     "backtest_simulator/pipeline/bundle.py": {
-      "num_statements": 201,
-      "covered_lines": 126,
-      "num_branches": 66,
+      "num_statements": 146,
+      "covered_lines": 117,
+      "num_branches": 50,
       "covered_branches": 28
     },
     "backtest_simulator/pipeline/experiment.py": {
-      "num_statements": 129,
-      "covered_lines": 61,
-      "num_branches": 36,
-      "covered_branches": 8
+      "num_statements": 80,
+      "covered_lines": 50,
+      "num_branches": 8,
+      "covered_branches": 2
     },
     "backtest_simulator/pipeline/manifest_builder.py": {
-      "num_statements": 72,
-      "covered_lines": 66,
-      "num_branches": 6,
-      "covered_branches": 3
+      "num_statements": 63,
+      "covered_lines": 63,
+      "num_branches": 0,
+      "covered_branches": 0
     },
     "backtest_simulator/sensors/precompute.py": {
-      "num_statements": 148,
-      "covered_lines": 85,
+      "num_statements": 145,
+      "covered_lines": 83,
       "num_branches": 46,
       "covered_branches": 15
     },
     "backtest_simulator/venue/_adapter_internals.py": {
-      "num_statements": 69,
-      "covered_lines": 50,
-      "num_branches": 24,
-      "covered_branches": 7
+      "num_statements": 46,
+      "covered_lines": 45,
+      "num_branches": 4,
+      "covered_branches": 4
     },
     "backtest_simulator/venue/fees.py": {
-      "num_statements": 23,
-      "covered_lines": 21,
-      "num_branches": 4,
-      "covered_branches": 2
+      "num_statements": 21,
+      "covered_lines": 20,
+      "num_branches": 2,
+      "covered_branches": 1
     },
     "backtest_simulator/venue/fills.py": {
-      "num_statements": 102,
-      "covered_lines": 51,
-      "num_branches": 44,
-      "covered_branches": 10
+      "num_statements": 67,
+      "covered_lines": 49,
+      "num_branches": 16,
+      "covered_branches": 8
     },
     "backtest_simulator/venue/filters.py": {
-      "num_statements": 38,
-      "covered_lines": 28,
-      "num_branches": 16,
-      "covered_branches": 6
+      "num_statements": 22,
+      "covered_lines": 22,
+      "num_branches": 0,
+      "covered_branches": 0
     },
     "backtest_simulator/venue/simulated.py": {
-      "num_statements": 374,
-      "covered_lines": 271,
+      "num_statements": 375,
+      "covered_lines": 272,
       "num_branches": 100,
       "covered_branches": 45
     },
@@ -297,74 +291,17 @@
     "backtest_simulator/cli/commands/__init__.py",
     "backtest_simulator/feed/__init__.py",
     "backtest_simulator/pipeline/_strategy_templates/__init__.py",
-    "backtest_simulator/reporting/__init__.py",
     "backtest_simulator/sensors/__init__.py",
     "backtest_simulator/venue/__init__.py"
   ],
   "no_executed_lines": [
     {
-      "path": "backtest_simulator/__main__.py",
-      "num_statements": 4
-    },
-    {
-      "path": "backtest_simulator/cli/__main__.py",
-      "num_statements": 5
-    },
-    {
-      "path": "backtest_simulator/determinism.py",
-      "num_statements": 18
-    },
-    {
-      "path": "backtest_simulator/feed/parquet_fixture.py",
-      "num_statements": 24
-    },
-    {
-      "path": "backtest_simulator/honesty/pbo.py",
-      "num_statements": 61
+      "path": "backtest_simulator/honesty/cpcv.py",
+      "num_statements": 30
     },
     {
       "path": "backtest_simulator/pipeline/_strategy_templates/long_on_signal.py",
       "num_statements": 153
-    },
-    {
-      "path": "backtest_simulator/reporting/enriched_results.py",
-      "num_statements": 42
-    },
-    {
-      "path": "backtest_simulator/reporting/ledger.py",
-      "num_statements": 22
-    },
-    {
-      "path": "backtest_simulator/reporting/metrics.py",
-      "num_statements": 56
-    },
-    {
-      "path": "backtest_simulator/strategies/__init__.py",
-      "num_statements": 6
-    },
-    {
-      "path": "backtest_simulator/strategies/buy_and_hold.py",
-      "num_statements": 66
-    },
-    {
-      "path": "backtest_simulator/strategies/inverse_prescient.py",
-      "num_statements": 72
-    },
-    {
-      "path": "backtest_simulator/strategies/over_trading.py",
-      "num_statements": 63
-    },
-    {
-      "path": "backtest_simulator/strategies/random_timing.py",
-      "num_statements": 78
-    },
-    {
-      "path": "backtest_simulator/strategies/zero_trade.py",
-      "num_statements": 27
-    },
-    {
-      "path": "backtest_simulator/wall_clock.py",
-      "num_statements": 24
     }
   ]
 }

@@ -61,11 +61,23 @@
             "integration_id": 15368
           },
           {
+            "context": "pr_checks_canonical_bundle",
+            "integration_id": 15368
+          },
+          {
             "context": "pr_checks_fail_loud",
             "integration_id": 15368
           },
           {
             "context": "pr_checks_golden_sweep",
+            "integration_id": 15368
+          },
+          {
+            "context": "pr_checks_package_coverage",
+            "integration_id": 15368
+          },
+          {
+            "context": "pr_checks_sweep_reference",
             "integration_id": 15368
           },
           {

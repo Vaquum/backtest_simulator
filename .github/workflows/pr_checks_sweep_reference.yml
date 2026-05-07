@@ -1,0 +1,47 @@
+name: pr_checks_sweep_reference
+
+# Sweep-reference contract: re-runs canonical `bts sweep` under
+# coverage, regenerates the live/empty/no-executed-lines classification,
+# and compares against tests/fixtures/canonical/sweep_reference.json.
+# Drift fails the gate — the canonical-coverage snapshot is part of
+# the contract and must be updated in the same PR as any package
+# change that shifts which files are imported / executed.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr_checks_sweep_reference:
+    name: pr_checks_sweep_reference
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+      - name: Set up venv
+        run: python -m venv .venv
+      - name: Install project + integration deps
+        run: |
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.SIBLING_INSTALL_TOKEN }}@github.com" > ~/.git-credentials
+          uv pip install --python .venv/bin/python -e '.[integration]'
+          uv pip install --python .venv/bin/python pytest 'coverage[toml]>=7.6'
+      - name: Install subprocess-coverage auto-init
+        run: |
+          echo 'import coverage; coverage.process_startup()' \
+            > .venv/lib/python3.12/site-packages/_bts_coverage_subprocess.pth
+      - name: Run sweep reference gate
+        run: .venv/bin/python tools/check_sweep_reference.py
