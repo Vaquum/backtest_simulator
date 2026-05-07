@@ -48,6 +48,11 @@ class ClickHouseFeed:
         self._client = _make_client(host=self._config.host, port=self._config.port, username=self._config.user, password=self._config.password, database=self._config.database)
         return self._client
 
+    def get_window(self, symbol: str, kline_size: int, n_rows: int) -> pl.DataFrame:
+        del symbol, kline_size, n_rows
+        msg = 'ClickHouseFeed.get_window: klines are served by limen.HistoricalData().get_spot_klines(); this feed only provides trades via get_trades().'
+        raise NotImplementedError(msg)
+
     def get_trades(self, symbol: str, start: datetime, end: datetime) -> pl.DataFrame:
         return self._get_trades_impl(symbol, start, end, venue_lookahead_seconds=0)
 
@@ -77,6 +82,11 @@ class InMemoryTradesFeed:
     def __init__(self, frame: pl.DataFrame, symbol: str='BTCUSDT') -> None:
         self._frame = frame
         self._symbol = symbol
+
+    def get_window(self, symbol: str, kline_size: int, n_rows: int) -> pl.DataFrame:
+        del symbol, kline_size, n_rows
+        msg = 'InMemoryTradesFeed.get_window: klines are served by limen.HistoricalData().get_spot_klines(); this feed only provides trades via get_trades().'
+        raise NotImplementedError(msg)
 
     def get_trades(self, symbol: str, start: datetime, end: datetime) -> pl.DataFrame:
         return self._slice(symbol, start, end, venue_lookahead_seconds=0)

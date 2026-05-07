@@ -43,8 +43,8 @@
       "covered_branches": 2
     },
     "backtest_simulator/cli/_signals_builder.py": {
-      "num_statements": 70,
-      "covered_lines": 63,
+      "num_statements": 73,
+      "covered_lines": 66,
       "num_branches": 6,
       "covered_branches": 5
     },
@@ -61,8 +61,8 @@
       "covered_branches": 4
     },
     "backtest_simulator/cli/commands/sweep.py": {
-      "num_statements": 428,
-      "covered_lines": 409,
+      "num_statements": 426,
+      "covered_lines": 407,
       "num_branches": 72,
       "covered_branches": 56
     },
@@ -73,8 +73,8 @@
       "covered_branches": 0
     },
     "backtest_simulator/feed/clickhouse.py": {
-      "num_statements": 85,
-      "covered_lines": 45,
+      "num_statements": 93,
+      "covered_lines": 47,
       "num_branches": 2,
       "covered_branches": 0
     },
