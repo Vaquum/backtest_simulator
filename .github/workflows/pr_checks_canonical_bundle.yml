@@ -1,0 +1,30 @@
+name: pr_checks_canonical_bundle
+
+# Canonical fixture lock: SHA256s in tests/fixtures/canonical/checksums.sha256
+# must match the actual fixture bytes. If a contributor regenerates
+# bundle.zip / klines.parquet / trades.parquet without updating the
+# checksum AND the matching expected/* outputs in the same PR, this
+# gate fails — the canonical contract stays byte-pinned.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr_checks_canonical_bundle:
+    name: pr_checks_canonical_bundle
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run canonical bundle gate
+        run: python3 tools/check_canonical_bundle.py

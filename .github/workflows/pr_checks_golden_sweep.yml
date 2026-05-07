@@ -1,0 +1,91 @@
+name: pr_checks_golden_sweep
+
+# Canonical-sweep golden gate (slice 1 per The-Plan.md). Runs the real
+# `bts sweep` CLI as a subprocess twice against the locked
+# `tests/fixtures/canonical/` bundle (2 decoders x 3 days, 5000
+# permutations, all CPCV / kelly / quantile knobs explicit). Asserts
+# that, after `tools/normalize_sweep_outputs.py` scrubs durations /
+# session paths / parallel-completion order, the four artefact streams
+# (stdout, stderr, sweep_per_window.csv, sweep_per_tick.csv) are
+# byte-equal across the two runs AND byte-equal to the saved expected
+# fixtures. Any code change in `bts sweep`'s simulation, prediction,
+# trade execution, or stats summary surfaces here as a fail.
+#
+# Hermetic by construction: the test passes `--trades-tape <fixture>`
+# to the subprocess, which makes sweep skip the ClickHouse tunnel
+# preflight + trades prefetch + per-day buy-hold seed-price lookups
+# entirely. Klines parquet is pre-placed in the canonical cache path
+# so Limen's `HistoricalData.get_spot_klines` cache-hits and skips
+# the HuggingFace fetch. No live ClickHouse, no live HuggingFace, no
+# repo secrets needed.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr_checks_golden_sweep:
+    name: pr_checks_golden_sweep
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install uv
+        # Standard pip's resolver treats `git+https://github.com/Vaquum/Limen`
+        # and `git+https://github.com/Vaquum/Limen@v2.4.3` as two distinct
+        # package URLs and aborts with `ResolutionImpossible` when both
+        # appear in one install. uv's resolver unifies the two URLs onto
+        # the same package - same path Praxis and Nexus use in their own CI.
+        uses: astral-sh/setup-uv@v4
+      - name: Set up venv
+        # Test hardcodes `_REPO_ROOT/.venv/bin/{bts,python}` — workflow
+        # honours that contract.
+        run: python -m venv .venv
+      - name: Install project + integration deps
+        # Editable install of `backtest_simulator` plus the `[integration]`
+        # extra (Praxis / Nexus / Limen sibling libs). The canonical sweep
+        # exercises all three end-to-end; the gate must run them as the
+        # operator would, not stubs. Sibling-pin credentials come from
+        # `SIBLING_INSTALL_TOKEN` (same secret the lint and honesty gates
+        # use to install the same git+https sibling URLs).
+        run: |
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.SIBLING_INSTALL_TOKEN }}@github.com" > ~/.git-credentials
+          uv pip install --python .venv/bin/python -e '.[integration]'
+          uv pip install --python .venv/bin/python pytest
+      - name: Run canonical golden sweep gate
+        # No `CLICKHOUSE_*` env exported - the test asserts the sweep
+        # runs end-to-end without them (`--trades-tape` short-circuits
+        # every CH call site at the source). A red here means either
+        # `bts sweep`'s output drifted vs the locked fixtures OR the
+        # two-run determinism cross-check failed.
+        env:
+          PYTHONHASHSEED: '0'
+        run: |
+          .venv/bin/python -m pytest tests/golden/test_bts_sweep_canonical.py -v --tb=short
+      - name: Upload normalized run-A outputs (always)
+        # Regenerated outputs from CI's Linux Python — fetched via
+        # `gh run download` when fixtures need refreshing after an
+        # upstream sibling-lib version bump shifts byte-equal output.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-run-a-normalized
+          path: |
+            /tmp/pytest-of-runner/pytest-0/canonical_sweep_runs0/A/normalized/stdout.txt
+            /tmp/pytest-of-runner/pytest-0/canonical_sweep_runs0/A/normalized/stderr.txt
+            /tmp/pytest-of-runner/pytest-0/canonical_sweep_runs0/A/normalized/sweep_per_window.csv
+            /tmp/pytest-of-runner/pytest-0/canonical_sweep_runs0/A/normalized/sweep_per_tick.csv
+          retention-days: 14
+          if-no-files-found: warn

@@ -1,0 +1,49 @@
+name: pr_checks_package_coverage
+
+# Package Coverage Law: every line + branch in every `live` file (per
+# tests/fixtures/canonical/sweep_reference.json) is hit by the canonical
+# `bts sweep` invocation, OR the file is in `empty_init` /
+# `no_executed_lines`. No coverage exclusions, no pragma, no whitelist.
+# Anything that fails this gate is dead code — delete it (line-level
+# surgery) or re-classify the file in sweep_reference.json.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr_checks_package_coverage:
+    name: pr_checks_package_coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+      - name: Set up venv
+        run: python -m venv .venv
+      - name: Install project + integration deps
+        run: |
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.SIBLING_INSTALL_TOKEN }}@github.com" > ~/.git-credentials
+          uv pip install --python .venv/bin/python -e '.[integration]'
+          uv pip install --python .venv/bin/python pytest 'coverage[toml]>=7.6'
+      - name: Install subprocess-coverage auto-init
+        run: |
+          echo 'import coverage; coverage.process_startup()' \
+            > .venv/lib/python3.12/site-packages/_bts_coverage_subprocess.pth
+      - name: Run package coverage gate
+        run: |
+          export PATH="$PWD/.venv/bin:$PATH"
+          .venv/bin/python tools/check_package_coverage.py

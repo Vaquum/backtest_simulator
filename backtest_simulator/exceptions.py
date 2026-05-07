@@ -3,32 +3,25 @@ from __future__ import annotations
 
 
 class HonestyViolation(Exception):
-    """Base. Never caught except at the test boundary."""
-
+    pass
 
 class LookAheadViolation(HonestyViolation):
-    """Feed or sensor returned data from the future."""
-
+    pass
 
 class ConservationViolation(HonestyViolation):
-    """Equity / fill / PnL / fee accounting disagreed."""
-
+    pass
 
 class DeterminismViolation(HonestyViolation):
-    """Same seed produced different bytes."""
-
+    pass
 
 class ParityViolation(HonestyViolation):
-    """Backtest spine diverged from Praxis spine on the same scripted scenario."""
-
+    pass
 
 class SanityViolation(HonestyViolation):
-    """A sanity-baseline strategy produced an impossible result."""
-
+    pass
 
 class PerformanceViolation(HonestyViolation):
-    """Perf gate budget exceeded."""
-
+    pass
 
 class StopContractViolation(HonestyViolation):
-    """An Action.ENTER missing a declared stop, or a stop not honored."""
+    pass

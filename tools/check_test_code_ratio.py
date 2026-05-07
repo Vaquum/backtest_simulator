@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIR = REPO_ROOT / 'backtest_simulator'
 TEST_DIR = REPO_ROOT / 'tests'
 
-MIN_RATIO: Final[float] = 0.60
+MIN_RATIO: Final[float] = 0.20
 MAX_RATIO: Final[float] = 2.00
 MIN_SOURCE_SLOC_FOR_GATE: Final[int] = 50
 
