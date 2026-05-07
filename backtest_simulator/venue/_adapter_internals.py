@@ -55,8 +55,6 @@ def resolve_order(account: Account, venue_order_id: str | None, client_order_id:
 
 def reject_reason(order: PendingOrder, filters: BinanceSpotFilters, price: Decimal | None) -> str | None:
     filters.validate(order.qty, price)
-    if price is None and order.order_type == 'MARKET' and (order.stop_price is not None):
-        order.qty * order.stop_price
     return None
 
 def record_rejection(account: Account, order: PendingOrder, client_order_id: str, side: OrderSide, order_type: OrderType, price: Decimal | None) -> None:

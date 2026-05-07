@@ -80,9 +80,4 @@ def assert_signals_parity(*, decoder_id: str, table: SignalsTable, runtime_predi
         captured.append(snapped_ts)
         table.lookup(snapped_ts)
         n_compared += 1
-    from collections import Counter
-    captured_counter = Counter(captured)
-    expected_counter = Counter(expected_ticks)
-    expected_counter - captured_counter
-    {t: cnt for t, cnt in captured_counter.items() if cnt > 1}
     return n_compared

@@ -40,7 +40,7 @@
   "backtest_simulator/sensors/__init__.py": 10,
   "backtest_simulator/sensors/precompute.py": 151,
   "backtest_simulator/cli/__init__.py": 22,
-  "backtest_simulator/cli/_verbosity.py": 44,
+  "backtest_simulator/cli/_verbosity.py": 51,
   "backtest_simulator/cli/_pipeline.py": 273,
   "backtest_simulator/cli/_metrics.py": 121,
   "backtest_simulator/cli/_run_window.py": 233,

@@ -210,7 +210,6 @@ def pick_decoders(n: int, *, exp_code_path: Path, n_permutations: int, trades_q_
     clean_cols = [c for c in (*rank_by, 'backtest_mean_kelly_pct') if c in results.columns]
     before = results.height
     results = results.drop_nulls(subset=clean_cols).filter(pl.all_horizontal([pl.col(c).is_not_nan() for c in clean_cols]))
-    before - results.height
     range_quantiles: dict[str, tuple[float, float]] = {}
     one_sided: list[tuple[str, str, float]] = []
 

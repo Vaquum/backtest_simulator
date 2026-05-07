@@ -25,8 +25,8 @@
       "covered_branches": 29
     },
     "backtest_simulator/cli/_pipeline.py": {
-      "num_statements": 266,
-      "covered_lines": 171,
+      "num_statements": 265,
+      "covered_lines": 170,
       "num_branches": 54,
       "covered_branches": 29
     },
@@ -43,8 +43,8 @@
       "covered_branches": 2
     },
     "backtest_simulator/cli/_signals_builder.py": {
-      "num_statements": 73,
-      "covered_lines": 66,
+      "num_statements": 68,
+      "covered_lines": 61,
       "num_branches": 6,
       "covered_branches": 5
     },
@@ -55,10 +55,10 @@
       "covered_branches": 2
     },
     "backtest_simulator/cli/_verbosity.py": {
-      "num_statements": 43,
-      "covered_lines": 35,
-      "num_branches": 6,
-      "covered_branches": 4
+      "num_statements": 50,
+      "covered_lines": 42,
+      "num_branches": 12,
+      "covered_branches": 10
     },
     "backtest_simulator/cli/commands/sweep.py": {
       "num_statements": 426,
@@ -223,10 +223,10 @@
       "covered_branches": 15
     },
     "backtest_simulator/venue/_adapter_internals.py": {
-      "num_statements": 61,
-      "covered_lines": 47,
-      "num_branches": 16,
-      "covered_branches": 4
+      "num_statements": 59,
+      "covered_lines": 45,
+      "num_branches": 14,
+      "covered_branches": 2
     },
     "backtest_simulator/venue/fees.py": {
       "num_statements": 21,
