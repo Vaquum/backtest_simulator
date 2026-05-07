@@ -39,12 +39,13 @@ dev = [
   "ipykernel>=6.0",
 ]
 
-# Private sibling packages installed from Vaquum GitHub. Intentionally
-# not pinned — Praxis / Nexus / Limen evolve, backtest_simulator evolves
-# with them. If a sibling breaking change lands, the fix is to update
-# the shim, not to freeze a stale SHA. CI configures a git credential
-# helper with ${{ secrets.SIBLING_INSTALL_TOKEN }} before running
-# `pip install -e '.[integration]'`.
+# Private sibling packages installed from Vaquum GitHub. Doctrine: do
+# not freeze SHAs; update the shim when a sibling breaks. The Limen
+# entry below is a *temporary defensive pin* tracked by a slice issue
+# to be unpinned once the canonical bundle migrates to the
+# MLManifest/RuleBasedManifest split (Limen 3.0.3+). CI configures a
+# git credential helper with ${{ secrets.SIBLING_INSTALL_TOKEN }}
+# before running `pip install -e '.[integration]'`.
 integration = [
   # URLs (no .git suffix, no @ref) match the canonical forms used by
   # Praxis and Nexus in their own pyprojects. pip's resolver treats
@@ -70,7 +71,12 @@ integration = [
 # rewrite transitive specifiers; `override-dependencies` does — it's
 # the documented uv knob for resolving sibling-lib URL drift.
 override-dependencies = [
-    "vaquum_limen @ git+https://github.com/Vaquum/Limen",
+    # TEMPORARY pin: vaquum_limen 3.0.3 split Manifest into
+    # MLManifest/RuleBasedManifest, breaking the canonical bundle's
+    # SFD which still instantiates Manifest(). The pin holds CI
+    # determinism until the bundle is regenerated under the new
+    # API. Track unpinning via the linked slice issue.
+    "vaquum_limen @ git+https://github.com/Vaquum/Limen@1b682954",
     "vaquum-nexus @ git+https://github.com/Vaquum/Nexus",
 ]
 
