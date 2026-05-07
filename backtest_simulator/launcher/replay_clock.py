@@ -78,3 +78,11 @@ class ReplayClock:
                 consumed = True
             if not consumed:
                 break
+            if os.times()[4] > deadline:
+                msg = (
+                    'ReplayClock: drain-to-quiescence exceeded real-time cap. '
+                    'Likely cyclic on_outcome chain (action emits new action '
+                    'whose fill emits another). Tighten the strategy or raise '
+                    'real_time_cap_seconds.'
+                )
+                raise ReplayDeadlineExceededError(msg)

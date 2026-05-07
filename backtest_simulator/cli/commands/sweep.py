@@ -55,6 +55,13 @@ def _resolve_grid_interval(picks: list[tuple[int, Decimal, Path, int]]) -> int:
         prior = seen.get(ks)
         if prior is None:
             seen[ks] = exp_dir
+    if len(seen) != 1:
+        msg = (
+            f'_resolve_grid_interval: picks declare more than one '
+            f'kline_size: {seen}. A sweep grid must run at one cadence; '
+            f'mixed-cadence picks would land on the wrong tick boundaries.'
+        )
+        raise ValueError(msg)
     return next(iter(seen))
 
 def _runtime_tick_timestamps(*, days: list[datetime], hours_start: dtime, hours_end: dtime, interval_seconds: int) -> list[datetime]:
@@ -112,6 +119,13 @@ def _run(args: argparse.Namespace) -> int:
         sessions_root = Path.home() / 'sweep' / 'sessions'
         sessions_root.mkdir(parents=True, exist_ok=True)
         _SESSION_ID_RE = _re_session_id_pattern()
+        if not _SESSION_ID_RE.fullmatch(_session_id) or _session_id == '..':
+            sys.stderr.write(
+                f'bts sweep: --session-id {_session_id!r} is not a valid '
+                f'session identifier (allowed: alphanumeric, dash, '
+                f'underscore; not "..").\n',
+            )
+            return 2
         session_dir = sessions_root / _session_id
         session_dir.mkdir(parents=True, exist_ok=False)
         _index_path = sessions_root / 'index.json'
@@ -436,6 +450,8 @@ def _build_and_save_signals_tables(picks: list[tuple[int, Decimal, Path, int]], 
     return tables
 
 def _resolve_hours(args: argparse.Namespace) -> tuple[dtime, dtime]:
+    if args.trading_hours_start is None:
+        return (dtime(0, 0), dtime(23, 59))
     start = datetime.strptime(args.trading_hours_start, '%H:%M').time()
     end = datetime.strptime(args.trading_hours_end, '%H:%M').time()
     return (start, end)
