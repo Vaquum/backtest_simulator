@@ -22,13 +22,17 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 SNAPSHOT: Final[Path] = REPO_ROOT / 'tests' / 'fixtures' / 'canonical' / 'sweep_reference.json'
 FIXTURES: Final[Path] = REPO_ROOT / 'tests' / 'fixtures' / 'canonical'
 PYTHON: Final[Path] = Path(sys.executable)
-_BTS_RESOLVED: Final[str | None] = shutil.which('bts')
-if _BTS_RESOLVED is None:
-    raise RuntimeError(
-        'bts binary not found on PATH. Install the package '
-        '(`uv pip install -e .[integration]`) before running this gate.'
-    )
-BTS: Final[Path] = Path(_BTS_RESOLVED)
+
+
+def _resolve_bts() -> Path:
+    resolved = shutil.which('bts')
+    if resolved is None:
+        msg = (
+            'bts binary not found on PATH. Install the package '
+            "(uv pip install -e '.[integration]') before running this gate."
+        )
+        raise RuntimeError(msg)
+    return Path(resolved)
 
 
 def _classify(coverage_json: dict) -> dict:
@@ -86,7 +90,7 @@ def _run_canonical_sweep_under_coverage(work_dir: Path) -> Path:
     env['COVERAGE_PROCESS_START'] = str(rcfile)
     cmd = [
         str(PYTHON), '-m', 'coverage', 'run', f'--rcfile={rcfile}',
-        str(BTS), 'sweep',
+        str(_resolve_bts()), 'sweep',
         '--bundle', str(FIXTURES / 'bundle.zip'),
         '--n-decoders', '2',
         '--n-permutations', '5000',
