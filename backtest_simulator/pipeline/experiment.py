@@ -15,6 +15,7 @@ import polars as pl
 from limen import Sensor, Trainer, UniversalExperimentLoop
 from limen.experiment.param_domain import ParamDomain
 from limen.experiment.param_search import RandomStrategy
+from limen.sfd import logreg_binary
 
 _log = logging.getLogger(__name__)
 FilterValue = float | int | str | bool | tuple[float, float] | set[object] | frozenset[object]
@@ -28,6 +29,10 @@ class ExperimentFile:
     manifest: Callable[[], object]
 
 class ExperimentPipeline:
+
+    def __init__(self, experiment_dir: Path, sfd: object = logreg_binary) -> None:
+        self._experiment_dir = Path(experiment_dir).resolve()
+        self._sfd = sfd
 
     @staticmethod
     def load_from_file(path: Path) -> ExperimentFile:
