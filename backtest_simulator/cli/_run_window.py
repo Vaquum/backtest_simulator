@@ -223,8 +223,16 @@ def _child_main() -> int:
     if os.environ.get('COVERAGE_PROCESS_START'):
         import coverage
         _cov = coverage.Coverage.current()
-        if _cov is not None:
-            _cov.save()
+        if _cov is None:
+            msg = (
+                'COVERAGE_PROCESS_START is set but coverage.Coverage.current() '
+                'is None — subprocess auto-init did not register. Likely the '
+                '_bts_coverage_subprocess.pth file is not on this Python\'s '
+                'site-packages. Without the .pth, this subprocess emits no '
+                'coverage data; failing loud rather than silently dropping it.'
+            )
+            raise RuntimeError(msg)
+        _cov.save()
     os._exit(0)
 if __name__ == '__main__':
     sys.exit(_child_main())
