@@ -223,9 +223,9 @@
       "covered_branches": 15
     },
     "backtest_simulator/venue/_adapter_internals.py": {
-      "num_statements": 46,
-      "covered_lines": 45,
-      "num_branches": 4,
+      "num_statements": 61,
+      "covered_lines": 47,
+      "num_branches": 16,
       "covered_branches": 4
     },
     "backtest_simulator/venue/fees.py": {

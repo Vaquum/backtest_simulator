@@ -7,7 +7,12 @@ from datetime import timedelta
 from decimal import Decimal
 
 from praxis.core.domain.enums import OrderSide, OrderStatus, OrderType
-from praxis.infrastructure.venue_adapter import ImmediateFill, VenueOrder, VenueTrade
+from praxis.infrastructure.venue_adapter import (
+    ImmediateFill,
+    NotFoundError,
+    VenueOrder,
+    VenueTrade,
+)
 
 from backtest_simulator.venue.fees import FeeSchedule
 from backtest_simulator.venue.filters import BinanceSpotFilters
@@ -30,6 +35,23 @@ def quote_asset(symbol: str) -> str:
 
 def window_seconds(seconds: int) -> timedelta:
     return timedelta(seconds=seconds)
+
+def zero_fill_status(order_type: str, time_in_force: str) -> OrderStatus:
+    if order_type == 'MARKET':
+        return OrderStatus.EXPIRED
+    if time_in_force.upper() == 'GTC':
+        return OrderStatus.OPEN
+    return OrderStatus.EXPIRED
+
+def resolve_order(account: Account, venue_order_id: str | None, client_order_id: str | None) -> VenueOrder:
+    if venue_order_id is not None and venue_order_id in account.orders:
+        return account.orders[venue_order_id]
+    if client_order_id is not None:
+        for o in account.orders.values():
+            if o.client_order_id == client_order_id:
+                return o
+    msg = f'order not found: venue_order_id={venue_order_id} client_order_id={client_order_id}'
+    raise NotFoundError(msg)
 
 def reject_reason(order: PendingOrder, filters: BinanceSpotFilters, price: Decimal | None) -> str | None:
     filters.validate(order.qty, price)
