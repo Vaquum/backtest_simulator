@@ -9,11 +9,11 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from backtest_simulator.venue.filters import BinanceSpotFilters
-from backtest_simulator.venue.types import FillModelConfig, FillResult, PendingOrder
 
 if TYPE_CHECKING:
     from backtest_simulator.honesty.book_gap import BookGapInstrument
     from backtest_simulator.honesty.maker_fill import MakerFillModel
+from backtest_simulator.venue.types import FillModelConfig, FillResult, PendingOrder
 
 
 @dataclass(frozen=True)
