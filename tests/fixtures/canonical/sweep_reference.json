@@ -13,8 +13,8 @@
       "covered_branches": 1
     },
     "backtest_simulator/cli/__init__.py": {
-      "num_statements": 19,
-      "covered_lines": 19,
+      "num_statements": 20,
+      "covered_lines": 20,
       "num_branches": 2,
       "covered_branches": 2
     },
