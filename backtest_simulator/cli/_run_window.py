@@ -272,7 +272,11 @@ def run_window_in_process(
     # stderr was unreadable. The whole `_bts_lap` scaffolding was
     # removed; if per-phase timing is needed again, attach a real
     # logger here rather than a no-op closure.
-    seed_price = seed_price_at(window_start)
+    if trades_parquet_path is not None:
+        from backtest_simulator.cli._stats import make_seed_price_from_parquet
+        seed_price = make_seed_price_from_parquet(Path(trades_parquet_path))(window_start)
+    else:
+        seed_price = seed_price_at(window_start)
     # work_dir uniqueness must follow the human-facing pick identifier,
     # not the trainer permutation index. In the file-list filter mode
     # `perm_id` is hardcoded to 0 across every pick because each pick's
