@@ -105,7 +105,7 @@ jobs:
         run: |
           .venv-lint/bin/python -m coverage run --branch --source=backtest_simulator \
             -m pytest tests/ -q --ignore=tests/golden
-          .venv-lint/bin/python -c "import subprocess as s; s.run(['coverage', 'json', '-o', 'coverage.json'], check=False)"
+          .venv-lint/bin/python -c "import subprocess as s, sys; s.run([sys.executable, '-m', 'coverage', 'json', '-o', 'coverage.json'], check=False)"
           .venv-lint/bin/python tools/check_coverage_floor.py
 
       - name: Budget-raise ratchet gate
