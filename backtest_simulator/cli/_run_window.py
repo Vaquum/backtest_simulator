@@ -75,12 +75,13 @@ class WindowResult(TypedDict):
     runtime_predictions: list[dict[str, object]]
 
 def capture_runtime_prediction(*, wired: object, signal: object, sink: list[dict[str, object]], window_start: datetime | None=None, window_end: datetime | None=None) -> None:
+    del window_start, window_end
     from collections.abc import Mapping
     from typing import cast
     values_obj = getattr(signal, 'values', None)
     values = cast('Mapping[str, object]', values_obj)
     pred_val = values.get('_preds')
-    ts_obj = getattr(signal, 'timestamp', None)
+    ts_obj = cast('datetime', getattr(signal, 'timestamp', None))
     sink.append({'sensor_id': str(getattr(wired, 'sensor_id', '')), 'timestamp': ts_obj.isoformat(), 'pred': pred_val})
 
 def _fresh_work_dir(suffix: str) -> Path:
@@ -210,6 +211,9 @@ def run_window_in_subprocess(perm_id: int, kelly_pct: Decimal, window_start: dat
         s = line.strip()
         if s.startswith('{') and s.endswith('}'):
             last = s
+    if last is None:
+        msg = f'run_window subprocess produced no JSON line on stdout. stderr tail: {proc.stderr[-500:]}'
+        raise RuntimeError(msg)
     return cast('WindowResult', json.loads(last))
 
 def _child_main() -> int:

@@ -38,11 +38,12 @@ class ExperimentPipeline:
     def load_from_file(path: Path) -> ExperimentFile:
         source_path = Path(path).resolve()
         spec = importlib.util.spec_from_file_location(source_path.stem, source_path)
+        assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         sys.modules[module.__name__] = module
         spec.loader.exec_module(module)
-        params_fn_raw = getattr(module, 'params', None)
-        manifest_fn_raw = getattr(module, 'manifest', None)
+        params_fn_raw = cast('Callable[[], object]', getattr(module, 'params'))
+        manifest_fn_raw = cast('Callable[[], object]', getattr(module, 'manifest'))
 
         def params_fn() -> dict[str, list[object]]:
             result: object = params_fn_raw()
@@ -50,7 +51,7 @@ class ExperimentPipeline:
             typed: dict[str, list[object]] = {}
             for raw_key, raw_value in typed_result.items():
                 value_list: list[object] = list(cast('list[object]', raw_value))
-                typed[raw_key] = value_list
+                typed[cast('str', raw_key)] = value_list
             return typed
 
         def manifest_fn() -> object:

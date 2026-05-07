@@ -196,14 +196,15 @@ def pick_decoders(n: int, *, exp_code_path: Path, n_permutations: int, trades_q_
     import polars as pl
     exp_code_path = exp_code_path.expanduser().resolve()
     op_param_keys: tuple[str, ...] = derive_op_param_keys(exp_code_path)
-    file_path: Path | None = None
-    if input_from_file is not None:
-        file_path = Path(input_from_file).expanduser()
-        results = pl.read_csv(file_path)
-        available_cols = list(results.columns)
-        [k for k in op_param_keys if k not in available_cols]
-        str(file_path)
-        print(f'  loaded filter pool from {file_path.name}: {results.height} rows  (exp-code: {exp_code_path.name})', flush=True)
+    if input_from_file is None:
+        msg = 'pick_decoders: input_from_file is required (filter pool CSV path).'
+        raise ValueError(msg)
+    file_path = Path(input_from_file).expanduser()
+    results = pl.read_csv(file_path)
+    available_cols = list(results.columns)
+    [k for k in op_param_keys if k not in available_cols]
+    str(file_path)
+    print(f'  loaded filter pool from {file_path.name}: {results.height} rows  (exp-code: {exp_code_path.name})', flush=True)
     [pl.col(c).str.strip_chars().cast(pl.Float64, strict=False).alias(c) for c in _NUMERIC_COLS if c in results.columns and results[c].dtype == pl.Utf8]
     rank_by = ['backtest_mean_kelly_pct', 'backtest_total_return_net_pct']
     clean_cols = [c for c in (*rank_by, 'backtest_mean_kelly_pct') if c in results.columns]
@@ -217,6 +218,7 @@ def pick_decoders(n: int, *, exp_code_path: Path, n_permutations: int, trades_q_
         series = results[col]
         series = series.drop_nulls().drop_nans()
         q = series.quantile(pct)
+        assert q is not None
         return float(q)
 
     def _numeric_col(col: str) -> pl.Expr:
@@ -280,6 +282,7 @@ def pick_decoders(n: int, *, exp_code_path: Path, n_permutations: int, trades_q_
             _was_cached = _sub_dir.is_dir() and (_sub_dir / 'results.csv').is_file()
             train_single_decoder(_sub_dir, _params, _exp_code_path, op_param_keys)
             _dt_one = _time.perf_counter() - _t_one
+            _status = 'fresh'
             if _was_cached and _dt_one < 0.5:
                 n_cache_hits += 1
                 _status = 'cached'
