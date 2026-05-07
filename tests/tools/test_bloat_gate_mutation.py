@@ -89,7 +89,7 @@ def test_file_size_balance_mutation_fires(tmp_path: Path) -> None:
 
 def test_test_code_ratio_mutation_fires(tmp_path: Path) -> None:
     # source with enough SLOC to bypass the vacuous-pass boundary (50),
-    # but tests too small -> ratio < 0.60.
+    # but tests too small -> ratio < MIN_RATIO (0.20 post-temporary-relax).
     source_dir = tmp_path / 'backtest_simulator'
     source_dir.mkdir()
     (source_dir / 'big.py').write_text('\n'.join(f'x_{i} = {i}' for i in range(60)) + '\n', encoding='utf-8')
