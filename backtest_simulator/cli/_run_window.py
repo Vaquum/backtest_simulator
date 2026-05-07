@@ -93,7 +93,7 @@ def run_window_in_process(perm_id: int, kelly_pct: Decimal, window_start: dateti
     from praxis.launcher import InstanceConfig
     from praxis.trading_config import TradingConfig
 
-    from backtest_simulator.feed.clickhouse import ClickHouseFeed, InMemoryTradesFeed
+    from backtest_simulator.feed.clickhouse import ClickHouseConfig, ClickHouseFeed, InMemoryTradesFeed
     from backtest_simulator.launcher import BacktestLauncher
     from backtest_simulator.pipeline.manifest_builder import (
         AccountSpec,
