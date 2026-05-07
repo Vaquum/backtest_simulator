@@ -20,6 +20,8 @@ from backtest_simulator.cli._pipeline import SYMBOL, WORK_DIR, op_sfd_pythonpath
 
 
 def _effective_kelly_pct_for_allocation(kelly_pct: Decimal, max_allocation_per_trade_pct: Decimal | None) -> Decimal:
+    if max_allocation_per_trade_pct is None:
+        return kelly_pct
     from backtest_simulator.launcher.action_submitter import NOTIONAL_RESERVATION_BUFFER
     max_kelly_pct = (max_allocation_per_trade_pct / (Decimal('1') + NOTIONAL_RESERVATION_BUFFER) * Decimal('100')).quantize(Decimal('0.000001'), rounding=ROUND_DOWN)
     return min(kelly_pct, max_kelly_pct)
@@ -93,7 +95,11 @@ def run_window_in_process(perm_id: int, kelly_pct: Decimal, window_start: dateti
     from praxis.launcher import InstanceConfig
     from praxis.trading_config import TradingConfig
 
-    from backtest_simulator.feed.clickhouse import ClickHouseConfig, ClickHouseFeed, InMemoryTradesFeed
+    from backtest_simulator.feed.clickhouse import (
+        ClickHouseConfig,
+        ClickHouseFeed,
+        InMemoryTradesFeed,
+    )
     from backtest_simulator.launcher import BacktestLauncher
     from backtest_simulator.pipeline.manifest_builder import (
         AccountSpec,

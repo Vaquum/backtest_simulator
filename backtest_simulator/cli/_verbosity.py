@@ -25,16 +25,17 @@ def configure(verbosity: int) -> None:
         _silence_tqdm_and_structlog(level)
 
 def _silence_tqdm_and_structlog(level: int) -> None:
+    from collections.abc import Iterable, Iterator
+
     import structlog
     import tqdm as _tqdm
-    from collections.abc import Iterable, Iterator
 
     class _NoopTqdm:
         def __init__(self, iterable: Iterable[object] = (), *_: object, **__: object) -> None:
             self._iterable = iterable
         def __iter__(self) -> Iterator[object]:
             return iter(self._iterable)
-        def __enter__(self) -> '_NoopTqdm':
+        def __enter__(self) -> _NoopTqdm:
             return self
         def __exit__(self, *_: object) -> None:
             return None

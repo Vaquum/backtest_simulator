@@ -37,10 +37,10 @@ class ClickHouseConfig:
 
 class ClickHouseFeed:
 
-    def __init__(self, config: 'ClickHouseConfig', symbol: str = 'BTCUSDT') -> None:
+    def __init__(self, config: ClickHouseConfig, symbol: str = 'BTCUSDT') -> None:
         self._config = config
         self._symbol = symbol
-        self._client: 'Client | None' = None
+        self._client: Client | None = None
 
     def _connect(self) -> Client:
         if self._client is not None:
