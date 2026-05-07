@@ -70,6 +70,8 @@ jobs:
         # every CH call site at the source). A red here means either
         # `bts sweep`'s output drifted vs the locked fixtures OR the
         # two-run determinism cross-check failed.
+        env:
+          PYTHONHASHSEED: '0'
         run: |
           .venv/bin/python -m pytest tests/golden/test_bts_sweep_canonical.py -v --tb=short
       - name: Upload normalized run-A outputs (always)
