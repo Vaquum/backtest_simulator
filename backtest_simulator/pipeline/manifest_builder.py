@@ -21,72 +21,33 @@ _log = logging.getLogger(__name__)
 
 _TEMPLATES_DIR = Path(__file__).parent / '_strategy_templates'
 
-
 @dataclass(frozen=True)
 class StrategyParamsSpec:
-    """Runtime parameters the generated strategy will read at on_startup.
-
-    Binary regime on `_preds`, long-only. Sizing is Kelly-fraction of capital:
-      qty = (capital * kelly_pct / 100) / estimated_price
-
-    `kelly_pct` is baked from the selected decoder's
-    `backtest_mean_kelly_pct` (a mean over the full decoder test period).
-    `estimated_price` is the seed price at window start — the real fill
-    price comes from the venue adapter's historical-trade walk.
-
-    `stop_bps` is kept in the spec for Part 2 honesty hardening
-    (declared-stop enforcement); the Part 1 path writes it into
-    `execution_params` but does not enforce it yet.
-    """
 
     symbol: str
     capital: Decimal
     kelly_pct: Decimal
     estimated_price: Decimal
     stop_bps: Decimal
-    # `force_flatten_after` is the cutoff after which the strategy
-    # emits a SELL on any new signal if it holds inventory, regardless
-    # of `_preds`, AND blocks new BUYs. Set by the caller (sweep / run)
-    # to `window_end - kline_size` so the strategy uses its last
-    # in-window signal to close any open position. Without this,
-    # positions opened late in a window survive past `run_window`
-    # without a closing SELL — the per-day trade summary shows
-    # `trades 0` while EventSpine has BUY events without closes.
     force_flatten_after: datetime | None = None
-    # When True, ENTER actions emit LIMIT orders at the
-    # estimated price (passive maker post). When False, MARKET
-    # (default behavior). Plumbed via `bts run --maker` and
-    # `bts sweep --maker` flags so the operator can A/B compare
-    # MARKET vs LIMIT-with-maker-engine fills end-to-end on
-    # the load-bearing sweep path.
     maker_preference: bool = False
-
 
 @dataclass(frozen=True)
 class AccountSpec:
-    """Account + capital sizing for the generated manifest.
-
-    Bundles the three account/capital fields so `ManifestBuilder.build`
-    takes one argument for them instead of three.
-    """
 
     account_id: str
     allocated_capital: Decimal
     capital_pool: Decimal
 
-
 @dataclass(frozen=True)
 class SensorBinding:
-    """Wire one Limen experiment_dir + permutation_ids to one strategy."""
 
     experiment_dir: Path
     permutation_ids: tuple[int, ...]
     interval_seconds: int
 
-
 @dataclass(frozen=True)
 class BuiltManifest:
-    """Paths emitted by ManifestBuilder — everything BacktestLauncher needs."""
 
     manifest_path: Path
     strategies_base_path: Path
@@ -95,9 +56,7 @@ class BuiltManifest:
         default_factory=lambda: dict[str, object](),
     )
 
-
 class ManifestBuilder:
-    """Produce a Nexus manifest + strategy file from an ExperimentPipeline result."""
 
     DEFAULT_TEMPLATE: str = 'long_on_signal.py'
 
@@ -118,25 +77,9 @@ class ManifestBuilder:
         strategy_params: StrategyParamsSpec,
         capital_pct: Decimal = Decimal('100'),
     ) -> BuiltManifest:
-        """Write manifest.yaml + <template>.py side-by-side; return the paths.
-
-        Nexus's `load_manifest` resolves `StrategySpec.file` relative to the
-        manifest's parent directory. Keeping manifest.yaml and the strategy
-        .py in the same directory means `file: long_on_signal.py` is the
-        literal filename and the loader finds it without further path-joining.
-        """
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
-        # `force_flatten_after` must be tz-aware. The strategy's
-        # `on_signal` compares it against `signal.timestamp`, which
-        # is UTC-aware everywhere in the runtime path (Nexus emits
-        # `datetime.now(tz=timezone.utc)`). A naive cutoff would
-        # raise `TypeError: can't compare offset-naive and offset-aware
-        # datetimes` on the first signal — fail loud at config build.
         ffa = strategy_params.force_flatten_after
-        # `tzinfo is None` is not sufficient: a tzinfo subclass whose
-        # utcoffset() returns None is effectively naive (Python treats
-        # it as such for comparisons). Check utcoffset() to catch both.
         if ffa is not None and ffa.utcoffset() is None:
             msg = (
                 f'StrategyParamsSpec.force_flatten_after must be '
@@ -157,12 +100,6 @@ class ManifestBuilder:
                 None if ffa is None else ffa.isoformat()
             ),
         }
-        # Nexus's StrategySpec schema has no `params` field, and its
-        # startup sequencer constructs `StrategyParams(raw={})` — there's
-        # no runtime channel for per-instance config. We work around it
-        # by templating the strategy .py file with the config inlined:
-        # the `__BTS_PARAMS__` sentinel in the template is replaced
-        # with a JSON string that the strategy parses at on_startup.
         template_source = self._template_path.read_text(encoding='utf-8')
         strategy_file = self._output_dir / self._template_path.name
         strategy_file.write_text(
@@ -180,9 +117,6 @@ class ManifestBuilder:
         manifest_path = self._output_dir / 'manifest.yaml'
         manifest_path.write_text(yaml_payload, encoding='utf-8')
 
-        # Round-trip through Nexus's own loader so we fail fast on any
-        # schema drift. Without this, invalid YAML would only surface at
-        # BacktestLauncher boot time deep inside Nexus threading code.
         validated = load_manifest(manifest_path)
 
         _log.info(
@@ -193,7 +127,6 @@ class ManifestBuilder:
             manifest_path=manifest_path, strategies_base_path=self._output_dir,
             manifest=validated, strategy_params=raw_params,
         )
-
 
 def _assemble_manifest(
     *,
@@ -223,7 +156,6 @@ def _assemble_manifest(
         capital_pool=account.capital_pool,
         strategies=(strategy,),
     )
-
 
 def _manifest_to_yaml(manifest: Manifest, strategy_params: dict[str, object]) -> str:
     data = {

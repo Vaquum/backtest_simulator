@@ -1,18 +1,6 @@
 """Ledger parity — backtest event spine vs Praxis paper-trade spine."""
 from __future__ import annotations
 
-# Slice #17 Task 18. The M3 unlock is "backtest ≡ paper-Praxis ≡
-# live, byte-identical event spine on a deterministic scenario".
-# `assert_ledger_parity` enforces this contract: given two event-
-# spine paths (each a JSON-lines log of the runtime's event
-# sequence), they must agree under the chosen tolerance.
-#
-# `ParityTolerance.STRICT` requires byte-identical spines.
-# `ParityTolerance.CLOCK_NORMALIZED` strips the envelope
-# `event_seq` (sqlite-assigned) + envelope `timestamp` (wall-
-# clock vs frozen) but leaves payload bytes intact. Use it for
-# the cross-runtime case where the same scripted Praxis runs at
-# different wall-clock times.
 import base64
 import json
 import sqlite3
@@ -25,11 +13,9 @@ from backtest_simulator.exceptions import ParityViolation
 
 
 class ParityTolerance(Enum):
-    """Comparison strictness for `assert_ledger_parity`."""
 
     STRICT = auto()
     CLOCK_NORMALIZED = auto()
-
 
 @dataclass(frozen=True)
 class _ParityFailure:
@@ -37,13 +23,11 @@ class _ParityFailure:
     backtest_line: str
     paper_line: str
 
-
 def _read_lines(path: Path) -> list[str]:
     if not path.is_file():
         msg = f'assert_ledger_parity: event-spine file missing: {path}'
         raise FileNotFoundError(msg)
     return path.read_text(encoding='utf-8').splitlines()
-
 
 def _strict_diff(a: list[str], b: list[str]) -> list[_ParityFailure]:
     failures: list[_ParityFailure] = []
@@ -53,7 +37,6 @@ def _strict_diff(a: list[str], b: list[str]) -> list[_ParityFailure]:
                 line_no=i + 1, backtest_line=al, paper_line=bl,
             ))
     if len(a) != len(b):
-        # Length mismatch surfaces as a tail diff.
         if len(a) > len(b):
             for i, line in enumerate(a[len(b):], start=len(b) + 1):
                 failures.append(_ParityFailure(
@@ -66,25 +49,12 @@ def _strict_diff(a: list[str], b: list[str]) -> list[_ParityFailure]:
                 ))
     return failures
 
-
 def assert_ledger_parity(
     *,
     backtest_event_spine: Path,
     paper_event_spine: Path,
     tolerance: ParityTolerance = ParityTolerance.STRICT,
 ) -> None:
-    """Assert that two event-spine files agree under `tolerance`.
-
-    `STRICT` requires byte-identical lines.
-    `CLOCK_NORMALIZED` strips the envelope `event_seq` (sqlite-
-    assigned) + envelope `timestamp` (wall-clock vs frozen) from
-    each line before comparison; payload bytes (`payload_raw_b64`)
-    stay intact so a payload-content drift still raises.
-
-    Raises `ParityViolation` on the first mismatch (or all of
-    them — production may want a delta report; the MVC pin is the
-    raise itself).
-    """
     a = _read_lines(backtest_event_spine)
     b = _read_lines(paper_event_spine)
     if tolerance == ParityTolerance.CLOCK_NORMALIZED:
@@ -103,22 +73,11 @@ def assert_ledger_parity(
         )
         raise ParityViolation(msg)
 
-
 def _clock_normalize(line: str) -> str:
-    """Strip envelope `event_seq` + `timestamp`; keep payload bytes.
-
-    The envelope timestamp is wall-clock vs frozen across runtimes;
-    event_seq is sqlite-assigned and cross-DB-volatile. Both
-    legitimately differ between bts and paper-Praxis. The payload
-    bytes (`payload_raw_b64`) stay — they encode the deterministic
-    event content (signal, action, fill data) and any drift there
-    is a real divergence.
-    """
     obj = json.loads(line)
     obj.pop('event_seq', None)
     obj.pop('timestamp', None)
     return json.dumps(obj, sort_keys=True)
-
 
 def dump_event_spine_to_jsonl(
     *,
@@ -126,24 +85,6 @@ def dump_event_spine_to_jsonl(
     jsonl_path: Path,
     epoch_id: int | None = None,
 ) -> int:
-    """Dump events from an EventSpine sqlite DB into JSONL.
-
-    Each line is a JSON object with keys: `epoch_id`, `event_seq`,
-    `timestamp`, `event_type`, `payload_raw_b64`. The payload is
-    stored as base64 of the literal sqlite payload bytes —
-    `CAST(payload AS BLOB)` forces the column-affinity coercion at
-    the sqlite layer so we get the underlying byte array regardless
-    of whether the row was inserted via TEXT or BLOB binding. base64
-    is bijective, so `STRICT` line equality on the dumped JSONL
-    implies byte-equality on the underlying event row.
-
-    `epoch_id`: optional filter — only dump events for that epoch.
-    Returns the number of events dumped.
-
-    Raises:
-        FileNotFoundError: sqlite file missing.
-        ValueError: events table missing or schema unexpected.
-    """
     if not sqlite_path.is_file():
         msg = (
             f'dump_event_spine_to_jsonl: sqlite event-spine missing '
@@ -152,9 +93,6 @@ def dump_event_spine_to_jsonl(
         raise FileNotFoundError(msg)
     conn = sqlite3.connect(sqlite_path)
     try:
-        # Validate schema loudly — sqlite version drift could change
-        # column names/order; better to fail with row context than
-        # silently dump garbage.
         schema_cursor = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='events'",
         )
@@ -204,15 +142,12 @@ def dump_event_spine_to_jsonl(
     finally:
         conn.close()
 
-
 _REJECT_EVENT_TYPES = frozenset({
     'OrderRejected', 'OrderExpired',
     'OrderCanceled', 'OrderSubmitFailed',
 })
 
-
 def _trade_outcome_is_pending(payload_blob: object) -> bool:
-    """`TradeOutcomeProduced` payload encodes `status` as JSON bytes."""
     if not isinstance(payload_blob, bytes):
         return False
     try:
@@ -224,11 +159,9 @@ def _trade_outcome_is_pending(payload_blob: object) -> bool:
     payload = cast('dict[str, object]', payload_obj)
     return payload.get('status') == 'PENDING'
 
-
 def _classify_spine_event(
     event_type: str, payload_blob: object, counts: dict[str, int],
 ) -> None:
-    """Bump the right counter bucket for one event row. Mutates `counts`."""
     counts['total'] += 1
     if event_type == 'OrderSubmitIntent':
         counts['intents'] += 1
@@ -243,33 +176,11 @@ def _classify_spine_event(
     ):
         counts['pending'] += 1
 
-
 def count_event_spine_events(
     *,
     sqlite_path: Path,
     epoch_id: int | None = None,
 ) -> dict[str, int]:
-    """Count operationally-significant events in an EventSpine sqlite DB.
-
-    Returns a dict with keys: `intents`, `submitted`, `fills`,
-    `pending`, `rejects`, `total`. The first five answer the trader's
-    five-question scan after each window:
-      - intents: did my strategy decide to act? (`OrderSubmitIntent`)
-      - submitted: did the venue accept the action? (`OrderSubmitted`)
-      - fills: did money move? (`FillReceived`)
-      - pending: what's still hanging at window close?
-        (`TradeOutcomeProduced` with payload `status == 'PENDING'`)
-      - rejects: what got blocked or expired? (`OrderRejected`,
-        `OrderExpired`, `OrderCanceled`, `OrderSubmitFailed`)
-
-    `total` is the unfiltered event count for cross-checking against
-    `dump_event_spine_to_jsonl`'s return.
-
-    Returns all-zero counts when the file is missing rather than
-    raising — the per-run summary should degrade gracefully when a
-    window's spine wasn't written (e.g. the launcher crashed before
-    flush).
-    """
     counts: dict[str, int] = {
         'intents': 0,
         'submitted': 0,

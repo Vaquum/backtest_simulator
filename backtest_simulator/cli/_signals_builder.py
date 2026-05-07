@@ -1,26 +1,5 @@
 """Build a `SignalsTable` from a Limen experiment for one decoder via the runtime predict-recipe (sweep-time parity reference)."""
 
-# Slice #17 Task 16. Builds a precomputed cache of EXACTLY the
-# predictions Nexus's `produce_signal` would emit at runtime — same
-# recipe (`manifest_full = manifest.with_params_override(split_config=
-# (1,0,0))` → `prepare_data(causal_window, round_params)` →
-# `sensor.predict({'x_test': x_train.tail(1)})`), batched across the
-# sweep's replay window. Strategy code is unchanged ("strategy tested,
-# strategy deployed").
-#
-# Auditor (post-v2.0.2) "make it real": SignalsTable is now the
-# sweep-time PARITY REFERENCE. After every per-window run, the
-# deployed strategy's per-tick predictions (captured via Limen
-# `Sensor.predict` calls inside the BacktestLauncher) are compared
-# against this table; a mismatch raises `ParityViolation`. The
-# table feeds operator-side analysis directly because the runtime
-# CONFIRMED it matches the deployed predictions tick-by-tick.
-#
-# Every field is real, sourced from the manifest or the runtime Sensor
-# — no placeholders, no hardcoded windows. Heavy by design (~50 ms per
-# bar of `prepare_data`, dominated by feature transforms); the cost
-# scales with the OPERATOR's `--replay-period` window (sweep-window
-# bars + feature warmup), not with the experiment's training span.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -29,7 +8,6 @@ from typing import Protocol
 import numpy as np
 import polars as pl
 
-# tqdm removed — sweep emits one log line per phase, no progress bars.
 from backtest_simulator.launcher.poller import (
     DEFAULT_N_ROWS as POLLER_N_ROWS,
 )
@@ -42,14 +20,7 @@ from backtest_simulator.sensors.precompute import (
 class _DataSourceConfigProtocol(Protocol):
     params: dict[str, object]
 
-
 class _ManifestProtocol(Protocol):
-    """Subset of the Limen manifest API we exercise here.
-
-    Limen leaves these untyped at runtime; defining the subset
-    lets pyright check our usage without importing private
-    Limen internals or pulling in `Any`.
-    """
 
     split_config: tuple[int, int, int]
     data_source_config: _DataSourceConfigProtocol | None
@@ -57,8 +28,6 @@ class _ManifestProtocol(Protocol):
     def with_params_override(
         self, *, split_config: tuple[int, int, int],
     ) -> _ManifestProtocol:
-        # Protocol stub — implementations supply the body. `del` keeps
-        # vulture from flagging the Protocol-required parameters as unused.
         del split_config
         raise NotImplementedError
 
@@ -68,12 +37,10 @@ class _ManifestProtocol(Protocol):
         del raw_data, round_params
         raise NotImplementedError
 
-
 class _SensorProtocol(Protocol):
     def predict(self, data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         del data
         raise NotImplementedError
-
 
 def build_signals_table_for_decoder(
     *,
@@ -86,53 +53,6 @@ def build_signals_table_for_decoder(
     predict_lookback: int | None = None,
     n_rows: int | None = None,
 ) -> SignalsTable:
-    """Build SignalsTable for one decoder via per-bar runtime replay.
-
-    Args:
-        manifest: Limen manifest from the experiment's exp.py. Used
-            for split_config (label) + kline_size (bar cadence) +
-            the feature-prep recipe (manifest_full).
-        sensor: Trained Pass-2 (1,0,0) Sensor returned by
-            `Trainer.train([perm_id])[0]`. The SAME object Nexus's
-            launcher would wire as the runtime predictor.
-        klines: Pre-fetched klines covering at least
-            `[earliest_tick - feature_warmup, latest_tick]` at the
-            launcher's cadence (`manifest.data_source_config.params
-            ['kline_size']`). Caller (sweep) fetches via
-            `HistoricalData.get_spot_klines` with `start_date_limit
-            = DEFAULT_START_DATE_LIMIT` so the data source matches
-            `BacktestMarketDataPoller`'s fetch path byte-for-byte.
-        tick_timestamps: The exact timestamps the runtime
-            `praxis.PredictLoop` timer would fire at. Computed by
-            the sweep from `(days, hours_start, hours_end,
-            interval_seconds)` using the same epoch-aligned "next
-            boundary after window_start" semantics as
-            `launcher/clock.py`. The builder iterates these
-            verbatim — it does NOT iterate the kline grid (codex
-            round 4 P0: per-day tick schedule != continuous kline
-            stream).
-        round_params: Hyperparameters for this perm_id (from
-            `round_data.jsonl`'s `round_params` field). Drives
-            label_horizon_bars (from `shift`) and is passed to
-            `prepare_data` so feature transforms get the same
-            params they had at training time.
-        decoder_id: Identifier carried on the SignalsTable for
-            cross-decoder bookkeeping (typically `str(perm_id)`).
-
-    Returns:
-        SignalsTable with one row per replay-window bar. `lookup(t)`
-        returns the prediction the strategy would have seen at `t`
-        if Nexus had emitted it from per-bar predict on the same
-        data — which is what the strategy DOES see, byte-for-byte.
-
-    Raises:
-        ValueError: if manifest is missing kline_size or split_config;
-            if replay_window contains no bars; if every bar gets
-            consumed by feature warmup (replay_window too short or
-            warmup bars too few in `klines`).
-        TypeError: if `round_params['shift']` is not an int (logreg
-            requires it).
-    """
     cfg = manifest.data_source_config
     if cfg is None or 'kline_size' not in cfg.params:
         msg = (
@@ -148,10 +68,6 @@ def build_signals_table_for_decoder(
         int(manifest.split_config[1]),
         int(manifest.split_config[2]),
     )
-    # `shift` shifts the target column by N bars; |shift| is the
-    # label horizon (purge math in lookup needs it). bool is a
-    # subclass of int — reject explicitly so a `True/False` shift
-    # doesn't slip through and break label_t1 silently.
     shift_raw = round_params.get('shift')
     if isinstance(shift_raw, bool) or not isinstance(shift_raw, int):
         msg = (
@@ -170,12 +86,6 @@ def build_signals_table_for_decoder(
         )
         raise ValueError(msg)
 
-    # Per-tick replay — Nexus's exact recipe, batched. Match
-    # `BacktestMarketDataPoller.get_market_data` byte-for-byte at
-    # each tick: causal slice + `tail(n_rows)` where `n_rows`
-    # comes from the bundle's `data_source.params` (falls back to
-    # POLLER_N_ROWS if the bundle didn't declare it). Iterate at
-    # the runtime tick instants (codex round-4 P0).
     if predict_lookback is not None and predict_lookback < 1:
         msg = (
             f'build_signals_table_for_decoder: predict_lookback must be '
@@ -197,14 +107,6 @@ def build_signals_table_for_decoder(
     timestamps: list[datetime] = []
     preds_list: list[int] = []
     probs_list: list[float] = []
-    # Per-tick `prepare_data` — Nexus's runtime recipe byte-for-byte.
-    # An earlier optimisation called `prepare_data` ONCE per decoder
-    # over the full window and sliced per tick; that was faster but
-    # fit Limen's scaler on a single window instead of the per-tick
-    # `tail(n_rows)` window the runtime uses. At decision boundaries
-    # the float scaler delta flipped int `pred`, raising
-    # `ParityViolation`. Strict mandate (strategy tested = strategy
-    # deployed) means we mirror runtime exactly here.
     for raw_tick in tick_timestamps:
         tick = _as_utc_datetime(raw_tick)
         causal = klines.filter(pl.col('datetime') <= tick).tail(effective_n_rows)
@@ -241,9 +143,7 @@ def build_signals_table_for_decoder(
         ),
     )
 
-
 def _as_utc_datetime(ts: object) -> datetime:
-    """Normalise polars datetime to a tz-aware UTC `datetime`."""
     if not isinstance(ts, datetime):
         msg = f'_as_utc_datetime: expected datetime, got {type(ts).__name__}'
         raise TypeError(msg)
@@ -251,25 +151,10 @@ def _as_utc_datetime(ts: object) -> datetime:
         return ts.replace(tzinfo=UTC)
     return ts
 
-
 def _snap_runtime_to_expected(
     *, ts: datetime, expected_ticks: list[datetime],
     interval_seconds: int,
 ) -> datetime | None:
-    """Find the unique `expected_tick e` such that `e <= ts < e + interval_seconds`.
-
-    The PredictLoop's Timer fires at an exact `expected_tick` boundary,
-    but the strategy's signal carries `signal.timestamp = datetime.now
-    (UTC)` at signal-construction time — which lands AFTER the boundary
-    by the launcher's main-loop callback drift (documented in
-    `launcher.py:_advance_clock_until` as "~10 min per main tick").
-    Each runtime tick belongs to the unique expected_tick whose half-
-    open `[e, e + interval_seconds)` window contains it.
-
-    Returns the matching `e` on success; `None` if no expected_tick is
-    within `interval_seconds` of `ts` (drift > one interval is a real
-    cadence divergence, not just callback jitter).
-    """
     matches = [
         e for e in expected_ticks
         if e <= ts < e + timedelta(seconds=interval_seconds)
@@ -278,7 +163,6 @@ def _snap_runtime_to_expected(
         return matches[0]
     return None
 
-
 def assert_signals_parity(
     *, decoder_id: str,
     table: SignalsTable,
@@ -286,65 +170,8 @@ def assert_signals_parity(
     expected_ticks: list[datetime],
     interval_seconds: int,
 ) -> int:
-    """Verify SignalsTable matches per-tick runtime predictions.
-
-    Auditor (post-v2.0.2) "make it real": SignalsTable was being
-    built every sweep without being consumed by any decision metric
-    (CPCV moved to deployed-strategy daily returns in v2.0.2). Per
-    the Five Principles, sweep-time work that nothing reads is
-    ornamentation. The fix turns the table into the SWEEP-TIME
-    PARITY REFERENCE: after each per-window run captures Limen
-    `Sensor.predict` outputs via the `produce_signal` hook in
-    `_run_window`, this function compares them against the
-    SignalsTable for the same decoder.
-
-    The comparison is per-tick: for every captured `(timestamp,
-    pred)` whose timestamp is IN the table's `tick_timestamps`
-    grid, `SignalsTable.lookup(timestamp).pred` must equal the
-    captured `pred`. Any mismatch raises `ParityViolation` — the
-    deployed strategy is operating on different predictions than
-    the sweep-time replay says it should be. That divergence
-    violates "strategy tested, strategy deployed" and the
-    operator must see it loudly.
-
-    Captured ticks NOT in `tick_timestamps` (e.g. PredictLoop
-    timer ticks that fired between scheduled boundaries, or
-    post-window ticks if the launcher kept ticking past
-    window_end) are silently skipped. `SignalsTable.lookup(t)`
-    forward-fills past the last covered row by contract, so we
-    cannot rely on `lookup(...) is None` alone to distinguish
-    "covered" from "post-window"; the explicit allow-list via
-    `tick_timestamps` is the precise gate.
-
-    Auditor (post-v2.0.3): the prior round let `runtime_predictions=
-    []` reach the helper as a no-op (return 0). The sweep summary
-    then printed "no comparisons made" cheerfully — the mandatory
-    parity check could silently NOT RUN if the capture hook broke
-    or the subprocess result was missing the `runtime_predictions`
-    payload. Now ZERO comparisons is a `ParityViolation`.
-
-    Codex (post-auditor-4) P1: the prior round ALSO silently
-    skipped malformed entries (non-string timestamp, non-int pred)
-    and out-of-grid timestamps. Codex repro:
-    `runtime=[valid match, out-of-grid pred=99]` returned `1` with
-    no violation, so a partial capture-hook failure (one bad row
-    among many good) was silently OK. Fix: ANY skipped entry
-    raises. The operator either gets a clean run (every entry
-    comparable + matched) or a loud violation naming what went
-    wrong.
-
-    Returns: the count of TICKS THAT WERE SUCCESSFULLY COMPARED.
-    Equal to `len(runtime_predictions)` on success — every entry
-    matched. Anything less raises.
-    """
     from backtest_simulator.exceptions import ParityViolation
 
-    # Codex (post-auditor-4 round-2) P1: parity must be a TWO-WAY
-    # multiset match. Every expected tick MUST appear exactly once
-    # in `runtime_predictions`. Missing ticks (capture skipped a
-    # boundary), duplicate ticks (PredictLoop double-fired), and
-    # extra/out-of-grid ticks all raise. Operator-side caller passes
-    # PER-WINDOW expected ticks, NOT the whole sweep grid.
     if len(set(expected_ticks)) != len(expected_ticks):
         msg = (
             f'assert_signals_parity: expected_ticks contains '
@@ -359,9 +186,6 @@ def assert_signals_parity(
     for entry in runtime_predictions:
         ts_raw = entry['timestamp']
         if not isinstance(ts_raw, str):
-            # Codex (post-auditor-4) P1: non-string timestamp is
-            # a capture-side serialiser bug — the entry can't be
-            # compared against the table. Loud, not silent.
             msg = (
                 f'SignalsTable parity violation for decoder '
                 f'{decoder_id!r}: runtime entry has non-string '
@@ -383,16 +207,6 @@ def assert_signals_parity(
                 f'Capture serialiser produced unverifiable data.'
             )
             raise ParityViolation(msg)
-        # Snap the runtime tick down to its anchoring expected_tick.
-        # Why: the PredictLoop's Timer fires at `target` (an exact
-        # `expected_tick` boundary), but the strategy's signal then
-        # carries `signal.timestamp = datetime.now(UTC)` at the moment
-        # of signal-construction — which lands AFTER `target` by the
-        # launcher's main-loop callback drift (the documented
-        # "~10 min per main tick" in `launcher.py:_advance_clock_until`).
-        # The runtime tick belongs to the unique `expected_tick e`
-        # such that `e <= ts < e + interval_seconds`. Drifts BEYOND
-        # one interval are real bugs and still raise.
         snapped_ts = _snap_runtime_to_expected(
             ts=ts, expected_ticks=expected_ticks,
             interval_seconds=interval_seconds,
@@ -416,10 +230,6 @@ def assert_signals_parity(
         captured.append(snapped_ts)
         row = table.lookup(snapped_ts)
         if row is None:
-            # In-grid timestamp with no row is a build-side bug
-            # (the table failed to write the row it scheduled).
-            # Loud: the parity check cannot proceed without the
-            # row to compare against.
             msg = (
                 f'SignalsTable parity violation for decoder '
                 f'{decoder_id!r}: scheduled tick {snapped_ts.isoformat()} '
@@ -445,12 +255,6 @@ def assert_signals_parity(
             )
             raise ParityViolation(msg)
         n_compared += 1
-    # Codex (post-auditor-4 round-2) P1: two-way multiset check.
-    # Every expected tick MUST appear in `captured` exactly once.
-    # Missing → capture-side skipped a scheduled boundary.
-    # Duplicate → PredictLoop double-fired (or capture-side
-    # double-emitted). Both are honesty violations — neither is
-    # a "valid" PredictLoop output the sweep should accept.
     from collections import Counter
     captured_counter = Counter(captured)
     expected_counter = Counter(expected_ticks)
@@ -483,11 +287,6 @@ def assert_signals_parity(
         )
         raise ParityViolation(msg)
     if n_compared == 0:
-        # Belt-and-braces: even after the multiset check, if
-        # neither runtime_predictions nor expected_ticks contained
-        # comparable entries, the parity body did not run. The
-        # caller (sweep) should never pass empty expected_ticks;
-        # but if it does, this raise surfaces it.
         n_runtime = len(runtime_predictions)
         n_covered = len(covered)
         msg_zero = (

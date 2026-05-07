@@ -16,11 +16,6 @@ from backtest_simulator.venue.fees import FeeSchedule
 from backtest_simulator.venue.filters import BinanceSpotFilters
 from backtest_simulator.venue.types import FillModelConfig
 
-# Integration re-exports require the `[integration]` extra (Praxis +
-# Nexus + Limen). On a slim install the imports fail and accessing one
-# of the integration names raises `ImportError` with install guidance via
-# `__getattr__` below — the pure-Python surface above stays available
-# either way.
 _LAZY_NAMES = (
     'install_cache', 'BacktestLauncher',
     'BacktestMarketDataPoller', 'SimulatedVenueAdapter',
@@ -31,18 +26,10 @@ try:
     from backtest_simulator.venue.simulated import SimulatedVenueAdapter
 except ImportError as _e:
     _integration_error: ImportError | None = _e
-    # Drop any names that succeeded before the failed import. Without
-    # this cleanup a partial-integration env (e.g. limen installed but
-    # praxis absent) leaves the earlier name in globals and bypasses
-    # `__getattr__`'s ImportError path — `bs.install_cache` would
-    # return the live function while `bs.BacktestLauncher` correctly
-    # raises, an inconsistent surface. `dict.pop(name, None)` is
-    # idempotent for names that were never assigned.
     for _n in _LAZY_NAMES:
         globals().pop(_n, None)
 else:
     _integration_error = None
-
 
 def __getattr__(name: str) -> object:
     if _integration_error is not None and name in _LAZY_NAMES:
@@ -53,7 +40,6 @@ def __getattr__(name: str) -> object:
         )
         raise ImportError(msg) from _integration_error
     raise AttributeError(f'module backtest_simulator has no attribute {name!r}')
-
 
 __all__ = [
     'BacktestLauncher', 'BacktestMarketDataPoller', 'BinanceSpotFilters',

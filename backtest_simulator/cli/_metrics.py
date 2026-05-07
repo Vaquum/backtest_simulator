@@ -1,14 +1,5 @@
 """Per-run metrics + formatting for `bts run` / `bts sweep` output."""
 
-# Pairs BUY -> SELL round trips, computes per-pair (net PnL, return %,
-# R multiple), running max-drawdown, profit factor, and the printable
-# one-line summary the operator sees per window.
-#
-# `R multiple` is `(sell-buy)*qty / |buy-stop|*qty` — the strict-live-
-# reality measurement: net PnL divided by declared risk (the absolute
-# distance from entry to declared stop). `None` when no stop was
-# declared on the BUY — the strategy is responsible for emitting a
-# stop-bearing action; bts no longer pre-checks this on the INTAKE side.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,20 +9,11 @@ from typing import Final
 
 STARTING_CAPITAL: Final[Decimal] = Decimal('100000')
 
-
 @dataclass(frozen=True, slots=True)
 class _Side:
-    """Side wrapper with `.name` (matches Praxis's OrderSide.name)."""
     name: str
 
-
 class Trade:
-    """Re-hydrated trade tuple from the subprocess result.
-
-    Lightweight to cross the JSON wire — `_run_window`'s subprocess
-    serialises trades to tuples so they survive the asyncio / freezegun
-    state stripped at process boundary.
-    """
 
     __slots__ = ('client_order_id', 'fee', 'fee_asset', 'price', 'qty', 'side', 'timestamp')
 
@@ -47,9 +29,7 @@ class Trade:
         self.fee_asset = fee_asset
         self.timestamp = datetime.fromisoformat(ts)
 
-
 def pair_trades(trades: list[Trade]) -> tuple[list[tuple[Trade, Trade]], list[Trade]]:
-    """Pair BUY→SELL round trips. Returns (pairs, trailing_unclosed)."""
     pairs: list[tuple[Trade, Trade]] = []
     open_buy: Trade | None = None
     for t in trades:
@@ -60,16 +40,9 @@ def pair_trades(trades: list[Trade]) -> tuple[list[tuple[Trade, Trade]], list[Tr
             open_buy = None
     return pairs, [open_buy] if open_buy is not None else []
 
-
 def pair_metrics(
     pair: tuple[Trade, Trade], declared_stop: Decimal | None,
 ) -> tuple[Decimal, Decimal, Decimal | None]:
-    """`(net_pnl, net_return_pct, r_mult|None)` for one BUY→SELL pair.
-
-    `net_return_pct = net / (buy.price * qty) * 100` — net of
-    both legs' fees. Coherent accounting basis with PF/R/DD on
-    the summary line (zero-bang post-auditor-4 P1).
-    """
     buy, sell = pair
     qty = buy.qty
     net = (sell.price - buy.price) * qty - (buy.fee + sell.fee)
@@ -80,9 +53,7 @@ def pair_metrics(
     risk = abs(buy.price - declared_stop) * qty
     return net, return_pct, (None if risk == 0 else net / risk)
 
-
 def max_drawdown_pct(net_pnls: list[Decimal], capital: Decimal) -> Decimal:
-    """Max drawdown as % of starting capital across the equity curve."""
     if not net_pnls:
         return Decimal('0')
     equity = capital
@@ -95,17 +66,14 @@ def max_drawdown_pct(net_pnls: list[Decimal], capital: Decimal) -> Decimal:
         max_dd_abs = max(max_dd_abs, dd)
     return (max_dd_abs / capital) * Decimal('100')
 
-
 def fmt_dec(value: Decimal, digits: int = 2) -> str:
     sign = '+' if value > 0 else ('' if value == 0 else '-')
     magnitude = abs(value)
     q = Decimal('1').scaleb(-digits)
     return f'{sign}{magnitude.quantize(q)}'
 
-
 def fmt_price(value: Decimal) -> str:
     return f'{value.quantize(Decimal("0.01"))}'
-
 
 def print_run(
     perm_id: int, day_label: str,
@@ -132,22 +100,6 @@ def print_run(
     market_impact_n_flagged: int = 0,
     market_impact_n_uncalibrated: int = 0,
 ) -> None:
-    """One-line headline + per-pair detail.
-
-    `slippage_cost_bps` is the side-normalized realised cost from
-    `SimulatedVenueAdapter.slippage_realised_cost_bps` — positive
-    means the run paid spread on average, negative means it
-    captured price improvement, None means no slippage model was
-    attached. The headline includes a `slip` column so the
-    operator on `bts sweep` (the load-bearing surface) sees what
-    the run paid relative to mid.
-
-    `slippage_predict_vs_realised_gap_bps` is the calibration-
-    loop signal: realised cost minus predicted cost averaged
-    across measured fills. Zero = calibration matches reality;
-    large = recalibrate. The headline appends `gap <±bp>` after
-    the slip column when the gap is non-None.
-    """
     pairs, trailing = pair_trades(trades)
     n_open = len(trailing)
     net_pnls: list[Decimal] = []
@@ -187,11 +139,6 @@ def print_run(
             f'slip {fmt_dec(slippage_cost_bps, 2)}bp '
             f'n={slippage_n_samples}/excl={slippage_n_excluded}'
         )
-        # Only show the gap when there's actually a calibration
-        # signal — at least one fill where both realised AND
-        # predicted succeeded. Otherwise `gap 0.00bp` would
-        # falsely imply "calibration matched reality" when the
-        # truth is "no signal." Codex / auditor pinned this.
         if slippage_predict_vs_realised_gap_bps is not None and (
             slippage_n_predicted_samples > 0
         ):
@@ -203,8 +150,6 @@ def print_run(
                 slip_str += f'/uncal={slippage_n_uncalibrated_predict}'
             slip_str += ')'
         elif slippage_n_uncalibrated_predict > 0:
-            # No successful predictions at all — operator must see
-            # this distinct from "gap was zero".
             slip_str += (
                 f' gap n/a (uncal={slippage_n_uncalibrated_predict})'
             )
@@ -222,11 +167,6 @@ def print_run(
         )
     else:
         maker_str = ''
-    # Market impact column: only render when the model surfaced
-    # at least one calibrated sample OR an uncalibrated submit;
-    # otherwise the model wasn't attached / didn't see any
-    # orders this run. Format: `imp <bps>bp n=<N>/flagged=<F>`,
-    # plus `/uncal=<U>` when there was a calibration gap.
     if (
         market_impact_realised_bps is not None
         and (market_impact_n_samples > 0
@@ -241,17 +181,6 @@ def print_run(
         impact_str = impact_core
     else:
         impact_str = ''
-    # `trades N` counts CLOSED BUY->SELL round trips. A day with
-    # order activity that did not close a round trip used to read
-    # as `trades 0` and was indistinguishable from a genuinely flat
-    # day. The parenthetical extras below answer the trader's
-    # five-question scan, ordered by lifecycle stage:
-    #   intents  → did my strategy decide to act?
-    #   fills    → did money move?
-    #   pending  → what's still hanging at window close?
-    #   rejects  → what got blocked or expired?
-    #   +N open  → unmatched filled inventory (BUY without closing SELL)
-    # Only non-zero counts are rendered to keep the headline tight.
     activity_extras: list[str] = []
     if n_intents > 0:
         activity_extras.append(f'intents {n_intents}')

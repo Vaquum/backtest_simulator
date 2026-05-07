@@ -10,29 +10,10 @@ from limen import HistoricalData
 
 _log = logging.getLogger(__name__)
 
-# Fallbacks used only when the manifest's `data_source_config.params`
-# does not declare `n_rows` / `start_date_limit`. Bundle path reads
-# the manifest; `--exp-code` path may rely on these.
 DEFAULT_START_DATE_LIMIT = '2019-01-01 00:00:00'
 DEFAULT_N_ROWS = 5000
 
-
 class BacktestMarketDataPoller:
-    """Drop-in replacement for `praxis.market_data_poller.MarketDataPoller`.
-
-    Same public surface (`start`/`stop`/`running`/`get_market_data`/
-    `add_kline_size`/`remove_kline_size`) so `praxis.Launcher` consumes
-    it interchangeably. Klines come from Limen `HistoricalData`, not
-    live Binance REST.
-
-    `params_by_kline_size` holds the manifest's `data_source.params` per
-    kline_size; the poller forwards them to `get_spot_klines`. Empty for
-    a kline_size means use the constructor-level `n_rows` /
-    `start_date_limit` fallbacks.
-
-    Under freezegun, `get_market_data` filters by `datetime.now(UTC)`;
-    under real time, it yields everything up to now.
-    """
 
     def __init__(
         self,
@@ -74,7 +55,7 @@ class BacktestMarketDataPoller:
             self._started = False
 
     def add_kline_size(self, kline_size: int, interval: int) -> None:
-        del interval  # poll interval is meaningless when data is historical
+        del interval
         with self._lock:
             self._kline_sizes.add(kline_size)
             if self._started and kline_size not in self._klines:
@@ -106,11 +87,6 @@ class BacktestMarketDataPoller:
     def _fetch(self, kline_size: int) -> pl.DataFrame:
         params = dict(self._params_by_kline_size.get(kline_size, {}))
         params.pop('kline_size', None)
-        # Bundle's declared `n_rows` wins; fall back to the constructor
-        # default rather than `None`. Passing `n_rows=None` to Limen
-        # asks for the full dataset, which is a large perf/memory
-        # regression versus the prior 5000-row fetch and contradicts
-        # the class docstring's "constructor-level fallback" claim.
         n_rows_obj = params.pop('n_rows', self._n_rows)
         start_date_limit_obj = params.pop(
             'start_date_limit', self._start_date_limit,

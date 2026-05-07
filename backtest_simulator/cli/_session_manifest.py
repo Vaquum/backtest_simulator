@@ -12,41 +12,12 @@ from typing import cast
 
 
 def re_session_id_pattern() -> re.Pattern[str]:
-    """ASCII alnum + `-_.`, no leading dot. Path-traversal-safe."""
     return re.compile(r'[A-Za-z0-9_\-][A-Za-z0-9_\-.]*')
-
 
 def atomic_index_update(
     index_path: Path,
     mutate: Callable[[list[dict[str, object]]], None],
 ) -> None:
-    """Read-modify-write `index.json` under a flock + atomic temp+replace.
-
-    Concurrency:
-      - flock is taken on a SEPARATE `index.json.lock` file (not on
-        the data file itself), so the lock survives the
-        rename-into-place that the writer performs.
-      - The new JSON is written to `<path>.tmp` first, then
-        `Path.replace`d into place. Readers (the dashboard, anyone
-        else that opens `index.json` without holding the lock) see
-        either the OLD complete file or the NEW complete file —
-        never the partial in-place truncate-then-write window of a
-        single open file (Copilot P1).
-
-    Serialises start-of-sweep `append` and end-of-sweep `ended_at`
-    updates from concurrent `bts sweep` processes against a shared
-    `~/sweep/sessions/index.json`. Without the lock the two
-    processes' read-modify-write windows can overlap and the
-    loser's update is silently lost (bit-mis P1).
-
-    Failure modes are explicit:
-      - missing file → seed with `{"sessions": []}` and proceed.
-      - malformed JSON or unreadable file → write to stderr and BAIL
-        without rewriting (do NOT clobber other operators' sessions
-        with `{"sessions": []}`; bit-mis P1 silent-data-loss).
-      - mutate raises → propagate; the temp file is left on disk
-        for diagnostics but `index_path` is never overwritten.
-    """
     index_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = index_path.with_suffix(index_path.suffix + '.lock')
     try:
@@ -59,12 +30,6 @@ def atomic_index_update(
         return
     try:
         fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
-        # Seed inside the flock so two concurrent sweeps starting on
-        # a fresh machine (no `index.json` yet) cannot race the
-        # initial write — Copilot P1. Without the lock, both
-        # processes saw `not is_file()` and both raced to write the
-        # seed; if both writes interleaved the file could end up
-        # partial / empty before either took the flock.
         try:
             raw = index_path.read_text(encoding='utf-8')
         except FileNotFoundError:
@@ -109,21 +74,7 @@ def atomic_index_update(
     finally:
         lock_fp.close()
 
-
 def finalize_session(index_path: Path, session_id: str) -> None:
-    """Stamp `ended_at` for `session_id` in `index.json`.
-
-    Registered via `atexit` immediately after the session is appended at
-    sweep start, so the dashboard's `live` indicator clears whether the
-    sweep returned cleanly, raised `ParityViolation`,
-    `RuntimeError("sweep aborted")`, or was interrupted (Ctrl-C lets
-    `atexit` run; `os._exit` does not — that's only used post-success in
-    subprocess children, not the parent).
-
-    Idempotent: only stamps when `ended_at is None`. atexit handlers are
-    not re-entered automatically, but the guard makes a manual second
-    call harmless too.
-    """
     def _stamp(sessions: list[dict[str, object]]) -> None:
         now_iso = datetime.now(UTC).isoformat()
         for entry in sessions:

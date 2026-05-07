@@ -29,7 +29,6 @@ _RUNTIME_BODY_MARKERS: frozenset[str] = frozenset({
     'run',
 })
 
-
 @dataclass(frozen=True)
 class BundleSpec:
     bundle_path: Path
@@ -41,9 +40,7 @@ class BundleSpec:
     data_source: dict[str, object]
     uel_run: dict[str, object]
 
-
 def extract_bundle(bundle_zip: Path, work_dir: Path) -> BundleSpec:
-    """Unzip + parse JSON. Validates the three-file shape and required keys."""
     bundle_zip = bundle_zip.expanduser().resolve()
     if not bundle_zip.is_file():
         msg = f'extract_bundle: bundle zip not found: {bundle_zip}'
@@ -74,9 +71,6 @@ def extract_bundle(bundle_zip: Path, work_dir: Path) -> BundleSpec:
             f'non-empty string, got {sfd_identifier!r}'
         )
         raise ValueError(msg)
-    # Identifier flows into generated Python source for the shim;
-    # validate it's a real Python identifier so a malformed bundle
-    # cannot inject arbitrary code (`"Foo; rm -rf /"`).
     if not sfd_identifier.isidentifier():
         msg = (
             f'extract_bundle: {json_path}::sfd_identifier must be a valid '
@@ -108,9 +102,7 @@ def extract_bundle(bundle_zip: Path, work_dir: Path) -> BundleSpec:
         uel_run=cast('dict[str, object]', uel_run),
     )
 
-
 def _strip_runtime_body(source: str) -> str:
-    """Cut at first top-level Call to a runtime-body marker; drop the rest."""
     tree = ast.parse(source)
     kept: list[ast.stmt] = []
     for stmt in tree.body:
@@ -120,26 +112,15 @@ def _strip_runtime_body(source: str) -> str:
     new_tree = ast.Module(body=kept, type_ignores=[])
     return ast.unparse(new_tree)
 
-
 def _is_runtime_body_stmt(stmt: ast.stmt) -> bool:
-    # FunctionDef / AsyncFunctionDef / ClassDef / Lambda are
-    # definitions, not runtime side effects — their bodies fire on
-    # CALL, not on module import. The cut must look only at statements
-    # whose execution at import time runs arbitrary code (Expr,
-    # Assign with Call value, AugAssign, AnnAssign with Call value, etc.).
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        # Decorator expressions DO run at import; check those alone.
         for dec in stmt.decorator_list:
             if _expr_calls_runtime_marker(dec):
                 return True
         return False
-    # Walk the statement, but stop descending when we hit a nested
-    # def / class / lambda — its body is scoped, not runtime.
     return _expr_calls_runtime_marker(stmt)
 
-
 def _expr_calls_runtime_marker(node: ast.AST) -> bool:
-    """Walk `node` for a runtime-marker Call without entering nested scopes."""
     stack: list[ast.AST] = [node]
     while stack:
         current = stack.pop()
@@ -157,9 +138,7 @@ def _expr_calls_runtime_marker(node: ast.AST) -> bool:
             stack.append(child)
     return False
 
-
 def load_bundled_experiment(spec: BundleSpec) -> ExperimentFile:
-    """Exec stripped .py in a fresh module; expose SFD's params + JSON-overridden manifest."""
     module = _exec_stripped_module(spec)
     sfd_class = _get_sfd_class(module, spec)
     params_fn_raw, base_manifest_fn = _get_sfd_callables(sfd_class, spec)
@@ -184,7 +163,6 @@ def load_bundled_experiment(spec: BundleSpec) -> ExperimentFile:
         manifest=manifest_with_override,
     )
 
-
 def _exec_stripped_module(spec: BundleSpec) -> ModuleType:
     stripped = _strip_runtime_body(spec.py_path.read_text(encoding='utf-8'))
     module_name = f'_bts_bundle_{spec.py_path.stem.replace("-", "_")}'
@@ -197,7 +175,6 @@ def _exec_stripped_module(spec: BundleSpec) -> ModuleType:
     exec(compile(stripped, str(spec.py_path), 'exec'), module.__dict__)
     return module
 
-
 def _get_sfd_class(module: ModuleType, spec: BundleSpec) -> object:
     sfd_class = getattr(module, spec.sfd_identifier, None)
     if sfd_class is None:
@@ -206,7 +183,6 @@ def _get_sfd_class(module: ModuleType, spec: BundleSpec) -> object:
         )
         raise AttributeError(msg)
     return sfd_class
-
 
 def _get_sfd_callables(
     sfd_class: object, spec: BundleSpec,
@@ -222,7 +198,6 @@ def _get_sfd_callables(
         cast('Callable[[], object]', params_fn),
         cast('Callable[[], object]', manifest_fn),
     )
-
 
 def _validate_params_shape(
     result: object, sfd_identifier: str,
@@ -246,7 +221,6 @@ def _validate_params_shape(
             raise TypeError(msg)
         typed[k] = cast('list[object]', v)
     return typed
-
 
 def _override_data_source(
     base: LimenManifest, override: dict[str, object],
@@ -278,10 +252,6 @@ def _override_data_source(
         ),
     )
 
-
-# Single source of truth: the shim source the CLI writes to disk imports
-# `_override_data_source` and calls it, so the in-memory and CLI paths
-# share the same code (no f-string-templated lookalike to drift).
 _SHIM_TEMPLATE: str = '''
 from backtest_simulator.pipeline.bundle import _override_data_source as _bts_override
 
@@ -294,19 +264,9 @@ def manifest():
     return _bts_override(_BTS_SFD_CLASS.manifest(), _BTS_DATA_SOURCE)
 '''
 
-
 def materialize_bundle_for_cli(
     bundle_zip: Path, work_dir: Path,
 ) -> tuple[Path, Path, BundleSpec]:
-    """Extract a bundle, write a synthetic shim, return (shim_path, csv_path, spec).
-
-    Concurrent `bts run --bundle X` invocations race on extract+shim
-    writes; serialize via `fcntl.LOCK_EX` on a sibling lock file. The
-    spec is returned alongside the paths so the caller does not need
-    to re-call `extract_bundle` outside the lock to recover JSON
-    metadata (which would race with the very serialization this
-    helper guarantees).
-    """
     work_dir.mkdir(parents=True, exist_ok=True)
     lock_path = work_dir / '.bundle.lock'
     with _exclusive_dir_lock(lock_path):
@@ -320,7 +280,6 @@ def materialize_bundle_for_cli(
         shim_path.write_text(shim_source, encoding='utf-8')
         return shim_path, spec.csv_path, spec
 
-
 @contextlib.contextmanager
 def _exclusive_dir_lock(lock_path: Path) -> Iterator[None]:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -331,30 +290,11 @@ def _exclusive_dir_lock(lock_path: Path) -> Iterator[None]:
         finally:
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
-
-# Sentinel default for --n-permutations on both run.py and sweep.py.
-# argparse stores `None` when the flag is unsupplied; the resolver
-# below picks the bundle's value (if any) or the canonical fallback.
-# The operator's explicit value (any int) is identity-comparable
-# against `None`, so `--n-permutations 30` (operator chose 30) is
-# distinguishable from operator silence.
 N_PERMUTATIONS_DEFAULT: int = 30
-
 
 def materialize_bundle_on_args(
     args: argparse.Namespace, work_root: Path,
 ) -> None:
-    """If --bundle was supplied, populate args from the bundle's JSON.
-
-    Resolution order for `n_permutations`:
-      1. Operator explicit `--n-permutations <int>` wins.
-      2. Otherwise, bundle's JSON `uel_run.n_permutations` wins.
-      3. Otherwise, fall back to `N_PERMUTATIONS_DEFAULT`.
-
-    The parser's default is `None`; the resolver below applies the
-    fallback. This sentinel-default pattern is the only way to
-    distinguish operator silence from operator explicit-equal-to-default.
-    """
     bundle = getattr(args, 'bundle', None)
     if bundle is None:
         if getattr(args, 'n_permutations', None) is None:

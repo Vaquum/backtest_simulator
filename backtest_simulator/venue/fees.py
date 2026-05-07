@@ -9,10 +9,8 @@ _DEFAULT_MAKER: Final[Decimal] = Decimal('0.001')
 _DEFAULT_TAKER: Final[Decimal] = Decimal('0.001')
 _BNB_DISCOUNT: Final[Decimal] = Decimal('0.25')
 
-
 @dataclass(frozen=True)
 class FeeSchedule:
-    """Maker/taker schedule with optional BNB discount and per-symbol overrides."""
 
     maker: Decimal = _DEFAULT_MAKER
     taker: Decimal = _DEFAULT_TAKER
@@ -25,7 +23,6 @@ class FeeSchedule:
     )
 
     def rate(self, symbol: str, *, is_maker: bool) -> Decimal:
-        """Effective fee rate for this symbol + liquidity role."""
         if is_maker:
             base = self.per_symbol_maker.get(symbol, self.maker)
         else:
@@ -35,5 +32,4 @@ class FeeSchedule:
         return base
 
     def fee(self, symbol: str, notional: Decimal, *, is_maker: bool) -> Decimal:
-        """Fee amount in quote currency. notional = qty * fill_price."""
         return notional * self.rate(symbol, is_maker=is_maker)

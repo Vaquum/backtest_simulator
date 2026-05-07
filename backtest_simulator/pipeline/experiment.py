@@ -26,45 +26,22 @@ FilterValue = (
 )
 FilterCriteria = dict[str, FilterValue]
 
-
 @dataclass(frozen=True)
 class ExperimentFile:
-    """Loaded user experiment file with `params()` and `manifest()` callables.
-
-    `params()` returns the grid dict passed to `ParamDomain` — Limen
-    requires `dict[str, list[object]]` (value-lists over which the
-    search strategy grids).
-    `manifest()` returns the experiment manifest Limen consumes; its exact
-    shape belongs to Limen, so we carry it as `object` and hand it through.
-    """
 
     source_path: Path
     module: ModuleType
     params: Callable[[], dict[str, list[object]]]
     manifest: Callable[[], object]
 
-
 class ExperimentPipeline:
-    """Three-step pipeline: load → run → filter → train the selected sensors."""
 
     def __init__(self, experiment_dir: Path, sfd: object = logreg_binary) -> None:
-        # `sfd` is Limen's plug-in strategy-family-descriptor — a module or
-        # instance exposing the required hooks. Limen itself leaves it
-        # untyped; `object` is the honest narrowest Python type for a
-        # duck-typed arg.
         self._experiment_dir = Path(experiment_dir).resolve()
         self._sfd = sfd
 
     @staticmethod
     def load_from_file(path: Path) -> ExperimentFile:
-        """Import a user-supplied Python module by path; return its `params`/`manifest`.
-
-        The file must define two module-level callables (module functions OR
-        class instances whose methods match):
-
-          def params() -> dict[str, list[object]]
-          def manifest() -> limen.experiment.Manifest
-        """
         source_path = Path(path).resolve()
         if not source_path.is_file():
             msg = f'experiment file not found: {source_path}'
@@ -75,16 +52,6 @@ class ExperimentPipeline:
             msg = f'could not build import spec for {source_path}'
             raise ImportError(msg)
         module = importlib.util.module_from_spec(spec)
-        # Register before exec so circular intra-module imports
-        # (operator's file importing back into itself by name)
-        # resolve, AND so Limen's later `importlib.import_module(
-        # metadata['sfd_module'])` finds the already-loaded
-        # module without re-executing it. Codex round-2 P0:
-        # without this, `Trainer.train()` does a fresh
-        # `import_module(...)` and gets a SECOND module object
-        # whose `params`/`manifest` aliases are re-bound — fine
-        # for pure-Python aliases but lossy if exec_module had
-        # side effects (e.g. registration in a global registry).
         sys.modules[module.__name__] = module
         spec.loader.exec_module(module)
 
@@ -105,10 +72,6 @@ class ExperimentPipeline:
                     f'dict[str, list[object]], got {type(result).__name__}'
                 )
                 raise TypeError(msg)
-            # Pyright narrows `dict` to `dict[Unknown, Unknown]` after
-            # the isinstance check; the Mapping annotation alone won't
-            # propagate type parameters. Use cast() (banned only when
-            # the target type is Any; Mapping[object, object] is fine).
             typed_result = cast('Mapping[object, object]', result)
             typed: dict[str, list[object]] = {}
             for raw_key, raw_value in typed_result.items():
@@ -124,7 +87,6 @@ class ExperimentPipeline:
                         f'must be a list, got {type(raw_value).__name__}'
                     )
                     raise TypeError(msg)
-                # Same widening for the inner list.
                 value_list: list[object] = list(
                     cast('list[object]', raw_value),
                 )
@@ -148,32 +110,9 @@ class ExperimentPipeline:
         seed: int = 42,
         resume: bool = False,
     ) -> Path:
-        """Run UEL via the MSQ path; persists every artifact Trainer needs.
-
-        The legacy UEL path keeps results in-memory and does NOT write
-        `metadata.json`, `round_data.jsonl`, or the per-permutation model
-        artifacts. Only the MSQ (search-strategy) path writes them, and
-        `Trainer` hard-requires all three. So we always go through MSQ
-        — a `RandomStrategy` constructed from the user's `params()` dict
-        is the thinnest wrapper that unlocks the full persistence.
-
-        Every param-grid coordinate still comes from the user's experiment
-        file: `ParamDomain(experiment_file.params())` is authoritative.
-        """
         self._experiment_dir.mkdir(parents=True, exist_ok=True)
         domain = ParamDomain(experiment_file.params())
         strategy = RandomStrategy(domain, seed=seed)
-        # Use the operator's module as the SFD (codex round-1 P0):
-        # the constructor's `sfd=logreg_binary` default was passing
-        # logreg_binary's manifest to UEL even when the operator's
-        # file defined its own SFD class with `params`/`manifest`
-        # aliases. The operator's module ITSELF carries those
-        # aliases at module level (per the load_from_file
-        # contract), so passing the module as the SFD makes UEL
-        # use the operator's manifest. That also makes
-        # `metadata.json["sfd_module"]` point at the operator's
-        # module, so Limen's `Trainer.train()` re-imports the
-        # operator's module on retrain (not logreg_binary).
         uel = UniversalExperimentLoop(
             sfd=experiment_file.module, search_strategy=strategy,
             experiment_dir=self._experiment_dir,
@@ -186,7 +125,6 @@ class ExperimentPipeline:
         return self._experiment_dir
 
     def read_results(self) -> pl.DataFrame:
-        """Read `results.csv` and flatten `round_params` JSON into top-level columns."""
         results_path = self._experiment_dir / 'results.csv'
         if not results_path.is_file():
             msg = f'results.csv not found at {results_path}; run the experiment first'
@@ -218,7 +156,6 @@ class ExperimentPipeline:
 
     @staticmethod
     def filter_results(df: pl.DataFrame, criteria: FilterCriteria) -> pl.DataFrame:
-        """Apply user filter: {col: value|(lo,hi)|set} — equality | range | membership."""
         result = df
         for column, spec in criteria.items():
             if column not in result.columns:
@@ -228,7 +165,6 @@ class ExperimentPipeline:
         return result
 
     def train(self, permutation_ids: Iterable[int]) -> list[Sensor]:
-        """Train the selected permutations via Limen Trainer; return Sensor objects."""
         ids = sorted({int(pid) for pid in permutation_ids})
         if not ids:
             msg = 'train requires at least one permutation_id'
@@ -244,7 +180,6 @@ class ExperimentPipeline:
     def experiment_dir(self) -> Path:
         return self._experiment_dir
 
-
 def _column_predicate(column: str, spec: FilterValue) -> pl.Expr:
     col = pl.col(column)
     if isinstance(spec, tuple) and len(spec) == 2:
@@ -254,16 +189,7 @@ def _column_predicate(column: str, spec: FilterValue) -> pl.Expr:
         return col.is_in(list(spec))
     return col == spec
 
-
 class _UELRunProtocol(Protocol):
-    """Pyright-friendly Protocol for the UEL.run signature we actually use.
-
-    Limen's `UniversalExperimentLoop.run` signature includes bare
-    `Callable | None` / `dict | None` parameters. Reading the method
-    via attribute access propagates those as partially-unknown.
-    Defining a Protocol with the exact concrete types we pass lets
-    pyright type-check the call without the Unknown propagation.
-    """
 
     def __call__(
         self, *,
@@ -272,7 +198,6 @@ class _UELRunProtocol(Protocol):
         resume: bool,
     ) -> None: ...
 
-
 def _run_uel(
     uel: UniversalExperimentLoop,
     experiment_name: str,
@@ -280,12 +205,6 @@ def _run_uel(
     *,
     resume: bool,
 ) -> None:
-    """Call `uel.run(...)` with the MSQ triplet we exercise.
-
-    See `_UELRunProtocol` above — it pins the shape of the call we
-    make here so pyright doesn't have to chase the bare-Callable
-    parameters in Limen's full signature.
-    """
     run_fn = cast('_UELRunProtocol', uel.run)
     run_fn(
         experiment_name=experiment_name,

@@ -1,14 +1,6 @@
 """CPCV — Combinatorially Purged Cross-Validation paths."""
 from __future__ import annotations
 
-# Slice #17 Task 17 (CPCV portion). Reference: López de Prado,
-# Advances in Financial ML §7. Splits the data into `n_groups`
-# contiguous time-ordered blocks, generates all
-# C(n_groups, n_test_groups) test partitions, and for each one
-# yields a path with that test-group set + remainder as training.
-# Each path carries the same `purge_seconds` and `embargo_seconds`
-# that downstream `SignalsTable.lookup(path_id, ...)` (Task 16)
-# uses to filter signals around test-group boundaries.
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from itertools import combinations
@@ -16,7 +8,6 @@ from itertools import combinations
 
 @dataclass(frozen=True)
 class CpcvPath:
-    """One (train, test) partition of `n_groups` contiguous blocks."""
 
     path_id: int
     train_groups: tuple[int, ...]
@@ -24,10 +15,8 @@ class CpcvPath:
     purge_seconds: int
     embargo_seconds: int
 
-
 @dataclass
 class CpcvPaths:
-    """Enumerated CPCV partitions; iterable of `CpcvPath`."""
 
     _paths: tuple[CpcvPath, ...] = field(default_factory=tuple)
 
