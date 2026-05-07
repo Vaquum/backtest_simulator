@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from nexus.startup.sequencer import WiredSensor
 
     class _FreezerFactory(Protocol):
-        def move_to(self, target: datetime) -> None:
+        def move_to(self, target_datetime: datetime, /) -> None:
             ...
 
 _log = logging.getLogger(__name__)

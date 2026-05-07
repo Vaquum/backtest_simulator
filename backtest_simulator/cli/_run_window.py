@@ -235,9 +235,18 @@ def _child_main() -> int:
     sys.stdout.flush()
     sys.stderr.flush()
     if os.environ.get('COVERAGE_PROCESS_START'):
+        from typing import Protocol
+
+        class _CovInstance(Protocol):
+            def save(self) -> None: ...
+
+        class _CovClass(Protocol):
+            @classmethod
+            def current(cls) -> _CovInstance | None: ...
+
         import importlib
         _coverage_mod = importlib.import_module('coverage')
-        _coverage_cls = cast('type', getattr(_coverage_mod, 'Coverage'))
+        _coverage_cls = cast('type[_CovClass]', getattr(_coverage_mod, 'Coverage'))
         _cov = _coverage_cls.current()
         if _cov is None:
             msg = (
