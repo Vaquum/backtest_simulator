@@ -27,8 +27,24 @@ def configure(verbosity: int) -> None:
 def _silence_tqdm_and_structlog(level: int) -> None:
     import structlog
     import tqdm as _tqdm
+    from collections.abc import Iterable, Iterator
 
     class _NoopTqdm:
-        pass
+        def __init__(self, iterable: Iterable[object] = (), *_: object, **__: object) -> None:
+            self._iterable = iterable
+        def __iter__(self) -> Iterator[object]:
+            return iter(self._iterable)
+        def __enter__(self) -> '_NoopTqdm':
+            return self
+        def __exit__(self, *_: object) -> None:
+            return None
+        def update(self, *_: object, **__: object) -> None:
+            return None
+        def close(self) -> None:
+            return None
+        def set_description(self, *_: object, **__: object) -> None:
+            return None
+        def set_postfix(self, *_: object, **__: object) -> None:
+            return None
     _tqdm.tqdm = _NoopTqdm
     structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(level))
