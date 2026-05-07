@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -155,10 +156,14 @@ def train_single_decoder(sub_dir: Path, params: dict[str, object], exp_code_path
     pd_module_name = f'_bts_pd_{pd_digest}'
     _OP_SFD_CACHE.mkdir(parents=True, exist_ok=True)
     pd_snapshot_path = _OP_SFD_CACHE / f'{pd_module_name}.py'
+    if not pd_snapshot_path.is_file() or hashlib.sha256(pd_snapshot_path.read_bytes()).hexdigest()[:16] != pd_digest:
+        _atomic_write_text(pd_snapshot_path, body)
     lock_path = sub_dir.parent / f'.{sub_dir.name}.lock'
     with _exclusive_dir_lock(lock_path):
         if _cache_dir_matches_expected_module(sub_dir, pd_module_name):
             return
+        if sub_dir.is_dir():
+            shutil.rmtree(sub_dir)
         sub_dir.mkdir(parents=True)
         _atomic_write_text(sub_dir / 'exp.py', body)
         from backtest_simulator.pipeline import ExperimentPipeline
@@ -167,13 +172,21 @@ def train_single_decoder(sub_dir: Path, params: dict[str, object], exp_code_path
         pipe.run(loaded, experiment_name='single', n_permutations=1, seed=42)
 
 def _cache_dir_matches_expected_module(cache_dir: Path, expected_module_name: str) -> bool:
-    cache_dir / 'results.csv'
+    results_csv = cache_dir / 'results.csv'
     metadata_path = cache_dir / 'metadata.json'
+    if not (results_csv.is_file() and metadata_path.is_file()):
+        return False
     try:
         metadata: object = json.loads(metadata_path.read_text(encoding='utf-8'))
     except json.JSONDecodeError:
         return False
-    cast('dict[str, object]', metadata)
+    if not isinstance(metadata, dict):
+        return False
+    typed_metadata = cast('dict[str, object]', metadata)
+    if typed_metadata.get('sfd_module') != expected_module_name:
+        return False
+    snapshot_path = _OP_SFD_CACHE / f'{expected_module_name}.py'
+    return snapshot_path.is_file()
     snapshot_path = _OP_SFD_CACHE / f'{expected_module_name}.py'
     return snapshot_path.is_file()
 
