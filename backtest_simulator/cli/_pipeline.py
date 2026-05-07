@@ -69,6 +69,8 @@ def _snapshot_exp_code(exp_code_path: Path) -> tuple[str, Path]:
     module_name = f'{_OP_SFD_MODULE_PREFIX}{digest}'
     _OP_SFD_CACHE.mkdir(parents=True, exist_ok=True)
     snapshot_path = _OP_SFD_CACHE / f'{module_name}.py'
+    if not snapshot_path.is_file() or hashlib.sha256(snapshot_path.read_bytes()).hexdigest()[:16] != digest:
+        _atomic_write_bytes(snapshot_path, content)
     sys_path_entry = str(_OP_SFD_CACHE)
     if sys_path_entry not in sys.path:
         sys.path.insert(0, sys_path_entry)
