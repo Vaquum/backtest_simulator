@@ -16,10 +16,7 @@ from backtest_simulator.venue.fees import FeeSchedule
 from backtest_simulator.venue.filters import BinanceSpotFilters
 from backtest_simulator.venue.types import FillModelConfig
 
-_LAZY_NAMES = (
-    'install_cache', 'BacktestLauncher',
-    'BacktestMarketDataPoller', 'SimulatedVenueAdapter',
-)
+_LAZY_NAMES = ('install_cache', 'BacktestLauncher', 'BacktestMarketDataPoller', 'SimulatedVenueAdapter')
 try:
     from backtest_simulator._limen_cache import install_cache
     from backtest_simulator.launcher import BacktestLauncher, BacktestMarketDataPoller
@@ -30,22 +27,4 @@ except ImportError as _e:
         globals().pop(_n, None)
 else:
     _integration_error = None
-
-def __getattr__(name: str) -> object:
-    if _integration_error is not None and name in _LAZY_NAMES:
-        msg = (
-            f'backtest_simulator.{name} requires the [integration] extra. '
-            f'Install: pip install backtest_simulator[integration]. '
-            f'Underlying ImportError: {_integration_error}'
-        )
-        raise ImportError(msg) from _integration_error
-    raise AttributeError(f'module backtest_simulator has no attribute {name!r}')
-
-__all__ = [
-    'BacktestLauncher', 'BacktestMarketDataPoller', 'BinanceSpotFilters',
-    'ClickHouseConfig', 'ClickHouseFeed', 'ConservationViolation',
-    'DeterminismViolation', 'FeeSchedule', 'FillModelConfig',
-    'HonestyViolation', 'LookAheadViolation', 'ParityViolation',
-    'PerformanceViolation', 'SanityViolation', 'SimulatedVenueAdapter',
-    'StopContractViolation', 'install_cache',
-]
+__all__ = ['BacktestLauncher', 'BacktestMarketDataPoller', 'BinanceSpotFilters', 'ClickHouseConfig', 'ClickHouseFeed', 'ConservationViolation', 'DeterminismViolation', 'FeeSchedule', 'FillModelConfig', 'HonestyViolation', 'LookAheadViolation', 'ParityViolation', 'PerformanceViolation', 'SanityViolation', 'SimulatedVenueAdapter', 'StopContractViolation', 'install_cache']

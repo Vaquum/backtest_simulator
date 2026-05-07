@@ -1,5 +1,4 @@
 """Shared pipeline glue for `bts run` / `bts sweep` (preflight, training, picking)."""
-
 from __future__ import annotations
 
 import fcntl
@@ -17,12 +16,10 @@ from typing import TYPE_CHECKING, Final, cast
 
 if TYPE_CHECKING:
     import polars as pl
-
 os.environ.setdefault('CLICKHOUSE_HOST', '127.0.0.1')
 os.environ.setdefault('CLICKHOUSE_PORT', '18123')
 os.environ.setdefault('CLICKHOUSE_USER', 'default')
 os.environ.setdefault('CLICKHOUSE_DATABASE', 'origo')
-
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _DOTENV_PATH: Final[Path] = _REPO_ROOT / '.env'
 
@@ -38,44 +35,27 @@ def _hydrate_environ_from_dotenv() -> None:
         val = v.strip()
         if not key:
             continue
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+        if len(val) >= 2 and val[0] == val[-1] and (val[0] in ('"', "'")):
             val = val[1:-1]
         os.environ.setdefault(key, val)
-
 _hydrate_environ_from_dotenv()
 
 def _require_password() -> str:
     pw = os.environ.get('CLICKHOUSE_PASSWORD')
     if pw:
         return pw
-    msg = (
-        'ClickHouse password unavailable. Set CLICKHOUSE_PASSWORD in '
-        f'your shell or add `CLICKHOUSE_PASSWORD=...` to {_DOTENV_PATH} '
-        '(the project-root .env file is gitignored). Without one of '
-        'these, `bts run` / `bts sweep` cannot reach the tdw database.'
-    )
+    msg = f'ClickHouse password unavailable. Set CLICKHOUSE_PASSWORD in your shell or add `CLICKHOUSE_PASSWORD=...` to {_DOTENV_PATH} (the project-root .env file is gitignored). Without one of these, `bts run` / `bts sweep` cannot reach the tdw database.'
     raise RuntimeError(msg)
-
 SYMBOL: Final[str] = 'BTCUSDT'
 EXP_DIR: Final[Path] = Path('/tmp/bts_sweep/experiments')
 WORK_DIR: Final[Path] = Path('/tmp/bts_sweep/run')
-
 _OP_SFD_CACHE: Final[Path] = WORK_DIR / 'op_sfds'
 _OP_SFD_MODULE_PREFIX: Final[str] = '_bts_op_'
-
-_NUMERIC_COLS: Final[tuple[str, ...]] = (
-    'backtest_trades_count',
-    'backtest_mean_kelly_pct',
-    'backtest_total_return_net_pct',
-    'confusion_tp_mean_return_pct',
-    'fpr',
-)
+_NUMERIC_COLS: Final[tuple[str, ...]] = ('backtest_trades_count', 'backtest_mean_kelly_pct', 'backtest_total_return_net_pct', 'confusion_tp_mean_return_pct', 'fpr')
 
 def _atomic_write_bytes(path: Path, content: bytes) -> None:
     import uuid
-    tmp = path.with_name(
-        f'{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp',
-    )
+    tmp = path.with_name(f'{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp')
     try:
         tmp.write_bytes(content)
         tmp.replace(path)
@@ -95,24 +75,19 @@ def _exclusive_dir_lock(lock_path: Path) -> Iterator[None]:
 def _snapshot_exp_code(exp_code_path: Path) -> tuple[str, Path]:
     exp_code_path = exp_code_path.expanduser().resolve()
     if not exp_code_path.is_file():
-        msg = (
-            f'_snapshot_exp_code: --exp-code file not found: '
-            f'{exp_code_path}.'
-        )
+        msg = f'_snapshot_exp_code: --exp-code file not found: {exp_code_path}.'
         raise FileNotFoundError(msg)
     content = exp_code_path.read_bytes()
     digest = hashlib.sha256(content).hexdigest()[:16]
     module_name = f'{_OP_SFD_MODULE_PREFIX}{digest}'
     _OP_SFD_CACHE.mkdir(parents=True, exist_ok=True)
     snapshot_path = _OP_SFD_CACHE / f'{module_name}.py'
-    if not snapshot_path.is_file() or hashlib.sha256(
-        snapshot_path.read_bytes(),
-    ).hexdigest()[:16] != digest:
+    if not snapshot_path.is_file() or hashlib.sha256(snapshot_path.read_bytes()).hexdigest()[:16] != digest:
         _atomic_write_bytes(snapshot_path, content)
     sys_path_entry = str(_OP_SFD_CACHE)
     if sys_path_entry not in sys.path:
         sys.path.insert(0, sys_path_entry)
-    return module_name, snapshot_path
+    return (module_name, snapshot_path)
 
 def op_sfd_pythonpath() -> str:
     return str(_OP_SFD_CACHE)
@@ -126,85 +101,44 @@ def preflight_tunnel() -> None:
     import socket
 
     import clickhouse_connect
-
     password = _require_password()
     host = os.environ['CLICKHOUSE_HOST']
     port = int(os.environ['CLICKHOUSE_PORT'])
     user = os.environ['CLICKHOUSE_USER']
     database = os.environ['CLICKHOUSE_DATABASE']
-
     try:
         sock = socket.create_connection((host, port), timeout=2.0)
     except OSError as exc:
-        msg = (
-            f'ClickHouse tunnel unreachable at {host}:{port} ({exc!r}). '
-            f'Open the tunnel with: '
-            f'ssh -fN -L {port}:127.0.0.1:8123 root@<clickhouse-host>'
-        )
+        msg = f'ClickHouse tunnel unreachable at {host}:{port} ({exc!r}). Open the tunnel with: ssh -fN -L {port}:127.0.0.1:8123 root@<clickhouse-host>'
         raise RuntimeError(msg) from exc
     sock.close()
-
     try:
-        client = clickhouse_connect.get_client(
-            host=host, port=port, username=user, password=password,
-            database=database,
-        )
-        rows = client.query(
-            'SELECT toString(datetime) FROM origo.binance_daily_spot_trades '
-            'ORDER BY datetime DESC LIMIT 1',
-        ).result_rows
+        client = clickhouse_connect.get_client(host=host, port=port, username=user, password=password, database=database)
+        rows = client.query('SELECT toString(datetime) FROM origo.binance_daily_spot_trades ORDER BY datetime DESC LIMIT 1').result_rows
     except Exception as exc:
-        msg = (
-            f'ClickHouse query failed against {host}:{port}/{database} '
-            f'({exc!r}). The tunnel is reachable (socket probe OK) but '
-            f'auth or database access was refused — verify '
-            f'CLICKHOUSE_PASSWORD matches what the server expects.'
-        )
+        msg = f'ClickHouse query failed against {host}:{port}/{database} ({exc!r}). The tunnel is reachable (socket probe OK) but auth or database access was refused — verify CLICKHOUSE_PASSWORD matches what the server expects.'
         raise RuntimeError(msg) from exc
     if not rows:
-        msg = (
-            f'origo.binance_daily_spot_trades returned zero rows on '
-            f'{host}:{port}; the tdw table is empty or filtered out.'
-        )
+        msg = f'origo.binance_daily_spot_trades returned zero rows on {host}:{port}; the tdw table is empty or filtered out.'
         raise RuntimeError(msg)
 
 def seed_price_at(ts: datetime) -> Decimal:
     import clickhouse_connect
-    client = clickhouse_connect.get_client(
-        host=os.environ['CLICKHOUSE_HOST'],
-        port=int(os.environ['CLICKHOUSE_PORT']),
-        username=os.environ['CLICKHOUSE_USER'],
-        password=_require_password(),
-        database=os.environ['CLICKHOUSE_DATABASE'],
-    )
-    rows = client.query(
-        'SELECT price FROM origo.binance_daily_spot_trades '
-        'WHERE datetime >= %(s)s ORDER BY datetime LIMIT 1',
-        parameters={'s': ts.strftime('%Y-%m-%d %H:%M:%S.%f')},
-    ).result_rows
+    client = clickhouse_connect.get_client(host=os.environ['CLICKHOUSE_HOST'], port=int(os.environ['CLICKHOUSE_PORT']), username=os.environ['CLICKHOUSE_USER'], password=_require_password(), database=os.environ['CLICKHOUSE_DATABASE'])
+    rows = client.query('SELECT price FROM origo.binance_daily_spot_trades WHERE datetime >= %(s)s ORDER BY datetime LIMIT 1', parameters={'s': ts.strftime('%Y-%m-%d %H:%M:%S.%f')}).result_rows
     if not rows:
         msg = f'No ClickHouse tick at or after {ts.isoformat()} for seed price.'
         raise RuntimeError(msg)
     return Decimal(str(rows[0][0]))
 
-def ensure_trained_from_exp_code(
-    exp_code_path: Path, n_permutations: int,
-) -> Path:
+def ensure_trained_from_exp_code(exp_code_path: Path, n_permutations: int) -> Path:
     exp_code_path = exp_code_path.expanduser().resolve()
     if not exp_code_path.is_file():
-        msg = (
-            f'ensure_trained_from_exp_code: --exp-code file not '
-            f'found: {exp_code_path}. The operator must supply a '
-            f'self-contained UEL-compliant Python file; bts has no '
-            f'fallback code path.'
-        )
+        msg = f'ensure_trained_from_exp_code: --exp-code file not found: {exp_code_path}. The operator must supply a self-contained UEL-compliant Python file; bts has no fallback code path.'
         raise FileNotFoundError(msg)
     op_module_name, snapshot_path = _snapshot_exp_code(exp_code_path)
     file_hash = hashlib.sha256(exp_code_path.read_bytes()).hexdigest()
-    cache_dir = (
-        WORK_DIR / 'fresh'
-        / f'{exp_code_path.stem}_n{n_permutations}_{file_hash[:16]}'
-    )
+    cache_dir = WORK_DIR / 'fresh' / f'{exp_code_path.stem}_n{n_permutations}_{file_hash[:16]}'
     cache_dir.parent.mkdir(parents=True, exist_ok=True)
     lock_path = cache_dir.parent / f'.{cache_dir.name}.lock'
     with _exclusive_dir_lock(lock_path):
@@ -216,15 +150,10 @@ def ensure_trained_from_exp_code(
         from backtest_simulator.pipeline import ExperimentPipeline
         pipe = ExperimentPipeline(experiment_dir=cache_dir)
         loaded = pipe.load_from_file(snapshot_path)
-        pipe.run(
-            loaded, experiment_name=exp_code_path.stem,
-            n_permutations=n_permutations, seed=42,
-        )
+        pipe.run(loaded, experiment_name=exp_code_path.stem, n_permutations=n_permutations, seed=42)
     return cache_dir
 
-def row_params(
-    row: dict[str, object], keys: tuple[str, ...],
-) -> dict[str, object]:
+def row_params(row: dict[str, object], keys: tuple[str, ...]) -> dict[str, object]:
     out: dict[str, object] = {}
     for k in keys:
         v = row.get(k)
@@ -243,20 +172,10 @@ def _coerce_param_string(s: str) -> int | float | str:
         except (ValueError, InvalidOperation):
             return s
 
-def train_single_decoder(
-    sub_dir: Path,
-    params: dict[str, object],
-    exp_code_path: Path,
-    op_param_keys: tuple[str, ...],
-) -> None:
+def train_single_decoder(sub_dir: Path, params: dict[str, object], exp_code_path: Path, op_param_keys: tuple[str, ...]) -> None:
     sub_dir.mkdir(parents=True, exist_ok=True)
     op_module_name, _snapshot_path = _snapshot_exp_code(exp_code_path)
-    body_lines: list[str] = [
-        f'from {op_module_name} import manifest',
-        '',
-        'def params():',
-        '    return {',
-    ]
+    body_lines: list[str] = [f'from {op_module_name} import manifest', '', 'def params():', '    return {']
     for k in op_param_keys:
         body_lines.append(f'        {k!r}: [{params[k]!r}],')
     body_lines.append('    }')
@@ -265,9 +184,7 @@ def train_single_decoder(
     pd_module_name = f'_bts_pd_{pd_digest}'
     _OP_SFD_CACHE.mkdir(parents=True, exist_ok=True)
     pd_snapshot_path = _OP_SFD_CACHE / f'{pd_module_name}.py'
-    if not pd_snapshot_path.is_file() or hashlib.sha256(
-        pd_snapshot_path.read_bytes(),
-    ).hexdigest()[:16] != pd_digest:
+    if not pd_snapshot_path.is_file() or hashlib.sha256(pd_snapshot_path.read_bytes()).hexdigest()[:16] != pd_digest:
         _atomic_write_text(pd_snapshot_path, body)
     lock_path = sub_dir.parent / f'.{sub_dir.name}.lock'
     with _exclusive_dir_lock(lock_path):
@@ -282,17 +199,13 @@ def train_single_decoder(
         loaded = pipe.load_from_file(pd_snapshot_path)
         pipe.run(loaded, experiment_name='single', n_permutations=1, seed=42)
 
-def _cache_dir_matches_expected_module(
-    cache_dir: Path, expected_module_name: str,
-) -> bool:
+def _cache_dir_matches_expected_module(cache_dir: Path, expected_module_name: str) -> bool:
     results_csv = cache_dir / 'results.csv'
     metadata_path = cache_dir / 'metadata.json'
     if not (results_csv.is_file() and metadata_path.is_file()):
         return False
     try:
-        metadata: object = json.loads(
-            metadata_path.read_text(encoding='utf-8'),
-        )
+        metadata: object = json.loads(metadata_path.read_text(encoding='utf-8'))
     except json.JSONDecodeError:
         return False
     if not isinstance(metadata, dict):
@@ -303,74 +216,16 @@ def _cache_dir_matches_expected_module(
     snapshot_path = _OP_SFD_CACHE / f'{expected_module_name}.py'
     return snapshot_path.is_file()
 
-def train_decoder_by_id_from_csv(
-    csv_path: Path, exp_code_path: Path, decoder_id: int,
-) -> tuple[int, Decimal, Path, int]:
+def pick_decoders(n: int, *, exp_code_path: Path, n_permutations: int, trades_q_range: tuple[float, float] | None=None, tp_min_q: float | None=None, fpr_max_q: float | None=None, kelly_min_q: float | None=None, trade_count_min_q: float | None=None, net_return_min_q: float | None=None, input_from_file: str | None=None) -> tuple[list[tuple[int, Decimal, Path, int]], int]:
     import polars as pl
-    csv_path = Path(csv_path).expanduser().resolve()
-    if not csv_path.is_file():
-        msg = f'train_decoder_by_id_from_csv: {csv_path} does not exist'
-        raise FileNotFoundError(msg)
-    op_param_keys = derive_op_param_keys(exp_code_path)
-    results = pl.read_csv(csv_path)
-    if 'id' not in results.columns or 'backtest_mean_kelly_pct' not in results.columns:
-        msg = (
-            f'{csv_path} missing required columns `id` and / or '
-            f'`backtest_mean_kelly_pct`'
-        )
-        raise ValueError(msg)
-    row_df = results.filter(pl.col('id') == decoder_id)
-    if row_df.height == 0:
-        msg = f'decoder_id={decoder_id} not found in {csv_path}'
-        raise ValueError(msg)
-    row = {k: row_df[k][0] for k in op_param_keys}
-    params = row_params(row, op_param_keys)
-    kelly_raw = row_df['backtest_mean_kelly_pct'][0]
-    kelly = Decimal(str(kelly_raw))
-    exp_code_content_hash = hashlib.sha256(exp_code_path.read_bytes()).hexdigest()
-    cache_input = json.dumps({
-        'params': {k: str(v) for k, v in sorted(params.items())},
-        'exp_code_path': str(exp_code_path),
-        'exp_code_sha256': exp_code_content_hash,
-    }, sort_keys=True)
-    cache_hash = hashlib.sha256(cache_input.encode('utf-8')).hexdigest()
-    sub_dir = (
-        WORK_DIR / 'trained_from_file'
-        / f'{csv_path.stem}_{exp_code_path.stem}_id_{decoder_id}_{cache_hash}'
-    )
-    train_single_decoder(sub_dir, params, exp_code_path, op_param_keys)
-    return (0, kelly, sub_dir, decoder_id)
-
-def pick_decoders(
-    n: int, *,
-    exp_code_path: Path,
-    n_permutations: int,
-    trades_q_range: tuple[float, float] | None = None,
-    tp_min_q: float | None = None,
-    fpr_max_q: float | None = None,
-    kelly_min_q: float | None = None,
-    trade_count_min_q: float | None = None,
-    net_return_min_q: float | None = None,
-    input_from_file: str | None = None,
-) -> tuple[list[tuple[int, Decimal, Path, int]], int]:
-    import polars as pl
-
     exp_code_path = exp_code_path.expanduser().resolve()
     if not exp_code_path.is_file():
-        msg = (
-            f'pick_decoders: --exp-code file not found: {exp_code_path}. '
-            f'bts requires a self-contained UEL-compliant Python file '
-            f'with module-level `params()` and `manifest()` callables; '
-            f'there is no fallback code path.'
-        )
+        msg = f'pick_decoders: --exp-code file not found: {exp_code_path}. bts requires a self-contained UEL-compliant Python file with module-level `params()` and `manifest()` callables; there is no fallback code path.'
         raise FileNotFoundError(msg)
-
     op_param_keys: tuple[str, ...] = derive_op_param_keys(exp_code_path)
-
     file_path: Path | None = None
     cache_dir: Path | None = None
     source: str
-
     if input_from_file is not None:
         file_path = Path(input_from_file).expanduser()
         if not file_path.is_file():
@@ -380,58 +235,28 @@ def pick_decoders(
         available_cols = list(results.columns)
         missing_cols = [k for k in op_param_keys if k not in available_cols]
         if missing_cols:
-            msg = (
-                f'--input-from-file {file_path.name} is missing columns '
-                f'the operator\'s params() declares: {missing_cols}. The '
-                f'CSV must have one column per param key. Available '
-                f'columns: {available_cols}.'
-            )
+            msg = f"--input-from-file {file_path.name} is missing columns the operator's params() declares: {missing_cols}. The CSV must have one column per param key. Available columns: {available_cols}."
             raise ValueError(msg)
         source = str(file_path)
-        print(
-            f'  loaded filter pool from {file_path.name}: {results.height} '
-            f'rows  (exp-code: {exp_code_path.name})',
-            flush=True,
-        )
+        print(f'  loaded filter pool from {file_path.name}: {results.height} rows  (exp-code: {exp_code_path.name})', flush=True)
     else:
         cache_dir = ensure_trained_from_exp_code(exp_code_path, n_permutations)
         from backtest_simulator.pipeline import ExperimentPipeline
         pipe = ExperimentPipeline(experiment_dir=cache_dir)
         results = pipe.read_results()
         source = str(cache_dir)
-    casts = [
-        pl.col(c).str.strip_chars().cast(pl.Float64, strict=False).alias(c)
-        for c in _NUMERIC_COLS
-        if c in results.columns and results[c].dtype == pl.Utf8
-    ]
+    casts = [pl.col(c).str.strip_chars().cast(pl.Float64, strict=False).alias(c) for c in _NUMERIC_COLS if c in results.columns and results[c].dtype == pl.Utf8]
     if casts:
         results = results.with_columns(casts)
     rank_by = ['backtest_mean_kelly_pct', 'backtest_total_return_net_pct']
-    clean_cols = [
-        c for c in (*rank_by, 'backtest_mean_kelly_pct')
-        if c in results.columns
-    ]
+    clean_cols = [c for c in (*rank_by, 'backtest_mean_kelly_pct') if c in results.columns]
     before = results.height
-    results = results.drop_nulls(subset=clean_cols).filter(
-        pl.all_horizontal([pl.col(c).is_not_nan() for c in clean_cols]),
-    )
+    results = results.drop_nulls(subset=clean_cols).filter(pl.all_horizontal([pl.col(c).is_not_nan() for c in clean_cols]))
     dropped = before - results.height
     if dropped > 0:
-        print(
-            f'  dropped {dropped} row(s) with null/NaN in rank+kelly columns '
-            f'({results.height} usable)',
-            flush=True,
-        )
+        print(f'  dropped {dropped} row(s) with null/NaN in rank+kelly columns ({results.height} usable)', flush=True)
     if results.height == 0:
-        msg = (
-            f'pick_decoders: 0 usable rows in {source}. The cast '
-            f'to Float64 returned null for every value in '
-            f'{clean_cols}. Common causes: the column is non-'
-            f'numeric (string labels), the CSV uses an '
-            f'unrecognised number format, or the column is '
-            f'genuinely all-null. Inspect the first few rows of '
-            f'those columns and re-export.'
-        )
+        msg = f'pick_decoders: 0 usable rows in {source}. The cast to Float64 returned null for every value in {clean_cols}. Common causes: the column is non-numeric (string labels), the CSV uses an unrecognised number format, or the column is genuinely all-null. Inspect the first few rows of those columns and re-export.'
         raise RuntimeError(msg)
     range_quantiles: dict[str, tuple[float, float]] = {}
     if trades_q_range is not None:
@@ -464,7 +289,6 @@ def pick_decoders(
         if dtype == pl.Utf8:
             return pl.col(col).cast(pl.Float64, strict=False)
         return pl.col(col)
-
     expr = pl.lit(True)
     report_lines: list[str] = []
     for col, (lo_pct, hi_pct) in range_quantiles.items():
@@ -473,10 +297,7 @@ def pick_decoders(
         axis_expr = (_numeric_col(col) >= lo_val) & (_numeric_col(col) <= hi_val)
         kept = results.filter(axis_expr).height
         expr = expr & axis_expr
-        report_lines.append(
-            f'    {col} ∈ [q{int(lo_pct*100)}={lo_val:.4g}, q{int(hi_pct*100)}={hi_val:.4g}]'
-            f'   {kept}/{results.height}',
-        )
+        report_lines.append(f'    {col} ∈ [q{int(lo_pct * 100)}={lo_val:.4g}, q{int(hi_pct * 100)}={hi_val:.4g}]   {kept}/{results.height}')
     for col, op, q in one_sided:
         val = _q(col, q)
         if op == '>':
@@ -492,37 +313,22 @@ def pick_decoders(
             raise ValueError(msg)
         kept = results.filter(axis_expr).height
         expr = expr & axis_expr
-        report_lines.append(
-            f'    {col} {op} q{int(q*100)}={val:.4g}   {kept}/{results.height}',
-        )
+        report_lines.append(f'    {col} {op} q{int(q * 100)}={val:.4g}   {kept}/{results.height}')
     filtered = results.filter(expr)
     if report_lines:
         print('  filter (axis kept / total):', flush=True)
         for line in report_lines:
             print(line, flush=True)
-        print(
-            f'    AND combined   {filtered.height}/{results.height} decoders',
-            flush=True,
-        )
+        print(f'    AND combined   {filtered.height}/{results.height} decoders', flush=True)
     else:
-        print(
-            f'  no filters given — ranking all {results.height} decoders as-is',
-            flush=True,
-        )
+        print(f'  no filters given — ranking all {results.height} decoders as-is', flush=True)
     if filtered.height == 0:
-        msg = (
-            'No decoders passed the combined quantile filter. '
-            'Loosen --trades-q-range / --tp-min-q / --fpr-max-q, or train '
-            'more candidates with --n-permutations and rm -rf the cache.'
-        )
+        msg = 'No decoders passed the combined quantile filter. Loosen --trades-q-range / --tp-min-q / --fpr-max-q, or train more candidates with --n-permutations and rm -rf the cache.'
         raise RuntimeError(msg)
     ranked = filtered.sort(rank_by, descending=[True, True])
     take = min(n, ranked.height)
     if take < n:
-        print(
-            f'NOTE: requested {n} decoders, only {take} pass the filter.',
-            flush=True,
-        )
+        print(f'NOTE: requested {n} decoders, only {take} pass the filter.', flush=True)
     picks: list[tuple[int, Decimal, Path, int]] = []
     if input_from_file is not None:
         assert file_path is not None
@@ -532,22 +338,10 @@ def pick_decoders(
             kelly = Decimal(str(ranked['backtest_mean_kelly_pct'][i]))
             row = {k: ranked[k][i] for k in op_param_keys}
             params = row_params(row, op_param_keys)
-            exp_code_content_hash = hashlib.sha256(
-                exp_code_path.read_bytes(),
-            ).hexdigest()
-            cache_input = json.dumps({
-                'params': {k: str(v) for k, v in sorted(params.items())},
-                'exp_code_path': str(exp_code_path),
-                'exp_code_sha256': exp_code_content_hash,
-            }, sort_keys=True)
-            cache_hash = hashlib.sha256(
-                cache_input.encode('utf-8'),
-            ).hexdigest()
-            sub_dir = (
-                WORK_DIR / 'trained_from_file'
-                / f'{file_path.stem}_{exp_code_path.stem}_id_'
-                f'{file_id}_{cache_hash}'
-            )
+            exp_code_content_hash = hashlib.sha256(exp_code_path.read_bytes()).hexdigest()
+            cache_input = json.dumps({'params': {k: str(v) for k, v in sorted(params.items())}, 'exp_code_path': str(exp_code_path), 'exp_code_sha256': exp_code_content_hash}, sort_keys=True)
+            cache_hash = hashlib.sha256(cache_input.encode('utf-8')).hexdigest()
+            sub_dir = WORK_DIR / 'trained_from_file' / f'{file_path.stem}_{exp_code_path.stem}_id_{file_id}_{cache_hash}'
             work_items.append((file_id, kelly, sub_dir, params, exp_code_path))
         import time as _time
         _t_train = _time.perf_counter()
@@ -557,9 +351,7 @@ def pick_decoders(
             _file_id, _kelly, _sub_dir, _params, _exp_code_path = item
             _t_one = _time.perf_counter()
             _was_cached = _sub_dir.is_dir() and (_sub_dir / 'results.csv').is_file()
-            train_single_decoder(
-                _sub_dir, _params, _exp_code_path, op_param_keys,
-            )
+            train_single_decoder(_sub_dir, _params, _exp_code_path, op_param_keys)
             _dt_one = _time.perf_counter() - _t_one
             if _was_cached and _dt_one < 0.5:
                 n_cache_hits += 1
@@ -567,24 +359,15 @@ def pick_decoders(
             else:
                 n_trained += 1
                 _status = 'trained'
-            print(
-                f'[{_dt_one:7.2f}s] decoder {_file_id:<6} {_status} '
-                f'(kelly={_kelly})',
-                flush=True,
-            )
+            print(f'[{_dt_one:7.2f}s] decoder {_file_id:<6} {_status} (kelly={_kelly})', flush=True)
         n_workers = 1
         for file_id, kelly, sub_dir, _params, _exp_code_path in work_items:
             picks.append((0, kelly, sub_dir, file_id))
-        print(
-            f'[{_time.perf_counter()-_t_train:7.2f}s] '
-            f'filter pool training done '
-            f'({len(work_items)} decoder(s), {n_workers} worker(s))',
-            flush=True,
-        )
+        print(f'[{_time.perf_counter() - _t_train:7.2f}s] filter pool training done ({len(work_items)} decoder(s), {n_workers} worker(s))', flush=True)
     else:
         for i in range(take):
             file_id = int(ranked['id'][i])
             kelly = Decimal(str(ranked['backtest_mean_kelly_pct'][i]))
             assert cache_dir is not None
             picks.append((file_id, kelly, cache_dir, file_id))
-    return picks, before
+    return (picks, before)

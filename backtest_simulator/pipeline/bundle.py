@@ -6,28 +6,18 @@ import ast
 import contextlib
 import dataclasses
 import fcntl
-import importlib.util
 import json
-import sys
 import zipfile
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
 from typing import cast
 
 import limen
 from limen.experiment import Manifest as LimenManifest
 from limen.experiment.manifest_core import DataSourceConfig
 
-from backtest_simulator.pipeline.experiment import ExperimentFile
-
-_RUNTIME_BODY_MARKERS: frozenset[str] = frozenset({
-    'HistoricalData',
-    'get_spot_klines',
-    'UniversalExperimentLoop',
-    'run',
-})
+_RUNTIME_BODY_MARKERS: frozenset[str] = frozenset({'HistoricalData', 'get_spot_klines', 'UniversalExperimentLoop', 'run'})
 
 @dataclass(frozen=True)
 class BundleSpec:
@@ -54,11 +44,7 @@ def extract_bundle(bundle_zip: Path, work_dir: Path) -> BundleSpec:
     json_names = [n for n in names if n.endswith('.json')]
     csv_names = [n for n in names if n.endswith('.csv')]
     if len(py_names) != 1 or len(json_names) != 1 or len(csv_names) != 1:
-        msg = (
-            f'extract_bundle: {bundle_zip} must contain exactly one .py, '
-            f'one .json, and one .csv; got py={py_names!r} '
-            f'json={json_names!r} csv={csv_names!r}'
-        )
+        msg = f'extract_bundle: {bundle_zip} must contain exactly one .py, one .json, and one .csv; got py={py_names!r} json={json_names!r} csv={csv_names!r}'
         raise ValueError(msg)
     py_path = work_dir / py_names[0]
     json_path = work_dir / json_names[0]
@@ -66,41 +52,20 @@ def extract_bundle(bundle_zip: Path, work_dir: Path) -> BundleSpec:
     meta = json.loads(json_path.read_text(encoding='utf-8'))
     sfd_identifier = meta.get('sfd_identifier')
     if not isinstance(sfd_identifier, str) or not sfd_identifier:
-        msg = (
-            f'extract_bundle: {json_path}::sfd_identifier must be a '
-            f'non-empty string, got {sfd_identifier!r}'
-        )
+        msg = f'extract_bundle: {json_path}::sfd_identifier must be a non-empty string, got {sfd_identifier!r}'
         raise ValueError(msg)
     if not sfd_identifier.isidentifier():
-        msg = (
-            f'extract_bundle: {json_path}::sfd_identifier must be a valid '
-            f'Python identifier, got {sfd_identifier!r}'
-        )
+        msg = f'extract_bundle: {json_path}::sfd_identifier must be a valid Python identifier, got {sfd_identifier!r}'
         raise ValueError(msg)
     data_source = meta.get('data_source')
     if not isinstance(data_source, dict):
-        msg = (
-            f'extract_bundle: {json_path}::data_source must be a JSON '
-            f'object, got {type(data_source).__name__}'
-        )
+        msg = f'extract_bundle: {json_path}::data_source must be a JSON object, got {type(data_source).__name__}'
         raise ValueError(msg)
     uel_run = meta.get('uel_run')
     if not isinstance(uel_run, dict):
-        msg = (
-            f'extract_bundle: {json_path}::uel_run must be a JSON object, '
-            f'got {type(uel_run).__name__}'
-        )
+        msg = f'extract_bundle: {json_path}::uel_run must be a JSON object, got {type(uel_run).__name__}'
         raise ValueError(msg)
-    return BundleSpec(
-        bundle_path=bundle_zip,
-        work_dir=work_dir,
-        py_path=py_path,
-        json_path=json_path,
-        csv_path=csv_path,
-        sfd_identifier=sfd_identifier,
-        data_source=cast('dict[str, object]', data_source),
-        uel_run=cast('dict[str, object]', uel_run),
-    )
+    return BundleSpec(bundle_path=bundle_zip, work_dir=work_dir, py_path=py_path, json_path=json_path, csv_path=csv_path, sfd_identifier=sfd_identifier, data_source=cast('dict[str, object]', data_source), uel_run=cast('dict[str, object]', uel_run))
 
 def _strip_runtime_body(source: str) -> str:
     tree = ast.parse(source)
@@ -131,154 +96,38 @@ def _expr_calls_runtime_marker(node: ast.AST) -> bool:
             if isinstance(func, ast.Name) and func.id in _RUNTIME_BODY_MARKERS:
                 return True
         for child in ast.iter_child_nodes(current):
-            if isinstance(child, (
-                ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda,
-            )):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
                 continue
             stack.append(child)
     return False
 
-def load_bundled_experiment(spec: BundleSpec) -> ExperimentFile:
-    module = _exec_stripped_module(spec)
-    sfd_class = _get_sfd_class(module, spec)
-    params_fn_raw, base_manifest_fn = _get_sfd_callables(sfd_class, spec)
-
-    def validated_params() -> dict[str, list[object]]:
-        return _validate_params_shape(params_fn_raw(), spec.sfd_identifier)
-
-    def manifest_with_override() -> object:
-        base = base_manifest_fn()
-        if not isinstance(base, LimenManifest):
-            msg = (
-                f'{spec.sfd_identifier}.manifest() must return Manifest, '
-                f'got {type(base).__name__}'
-            )
-            raise TypeError(msg)
-        return _override_data_source(base, spec.data_source)
-
-    return ExperimentFile(
-        source_path=spec.py_path,
-        module=module,
-        params=validated_params,
-        manifest=manifest_with_override,
-    )
-
-def _exec_stripped_module(spec: BundleSpec) -> ModuleType:
-    stripped = _strip_runtime_body(spec.py_path.read_text(encoding='utf-8'))
-    module_name = f'_bts_bundle_{spec.py_path.stem.replace("-", "_")}'
-    spec_obj = importlib.util.spec_from_loader(module_name, loader=None)
-    if spec_obj is None:
-        msg = f'load_bundled_experiment: failed to build module spec for {module_name}'
-        raise ImportError(msg)
-    module = importlib.util.module_from_spec(spec_obj)
-    sys.modules[module_name] = module
-    exec(compile(stripped, str(spec.py_path), 'exec'), module.__dict__)
-    return module
-
-def _get_sfd_class(module: ModuleType, spec: BundleSpec) -> object:
-    sfd_class = getattr(module, spec.sfd_identifier, None)
-    if sfd_class is None:
-        msg = (
-            f'SFD class {spec.sfd_identifier!r} not found in {spec.py_path}'
-        )
-        raise AttributeError(msg)
-    return sfd_class
-
-def _get_sfd_callables(
-    sfd_class: object, spec: BundleSpec,
-) -> tuple[Callable[[], object], Callable[[], object]]:
-    params_fn = getattr(sfd_class, 'params', None)
-    manifest_fn = getattr(sfd_class, 'manifest', None)
-    if not callable(params_fn) or not callable(manifest_fn):
-        msg = (
-            f'{spec.sfd_identifier} must expose callable `params` and `manifest`'
-        )
-        raise TypeError(msg)
-    return (
-        cast('Callable[[], object]', params_fn),
-        cast('Callable[[], object]', manifest_fn),
-    )
-
-def _validate_params_shape(
-    result: object, sfd_identifier: str,
-) -> dict[str, list[object]]:
-    if not isinstance(result, dict):
-        msg = (
-            f'{sfd_identifier}.params() must return dict, '
-            f'got {type(result).__name__}'
-        )
-        raise TypeError(msg)
-    typed: dict[str, list[object]] = {}
-    for k, v in cast('dict[object, object]', result).items():
-        if not isinstance(k, str):
-            msg = f'{sfd_identifier}.params() keys must be str'
-            raise TypeError(msg)
-        if not isinstance(v, list):
-            msg = (
-                f'{sfd_identifier}.params()[{k!r}] must be list, '
-                f'got {type(v).__name__}'
-            )
-            raise TypeError(msg)
-        typed[k] = cast('list[object]', v)
-    return typed
-
-def _override_data_source(
-    base: LimenManifest, override: dict[str, object],
-) -> LimenManifest:
+def _override_data_source(base: LimenManifest, override: dict[str, object]) -> LimenManifest:
     method_name = override.get('method')
     if not isinstance(method_name, str) or not method_name:
-        msg = (
-            f'data_source.method must be a non-empty string, '
-            f'got {method_name!r}'
-        )
+        msg = f'data_source.method must be a non-empty string, got {method_name!r}'
         raise ValueError(msg)
     raw_params = override.get('params', {})
     if not isinstance(raw_params, dict):
-        msg = (
-            f'data_source.params must be a JSON object, '
-            f'got {type(raw_params).__name__}'
-        )
+        msg = f'data_source.params must be a JSON object, got {type(raw_params).__name__}'
         raise ValueError(msg)
     historical = limen.HistoricalData()
     method = getattr(historical, method_name, None)
     if not callable(method):
         msg = f'limen.HistoricalData has no method {method_name!r}'
         raise AttributeError(msg)
-    return dataclasses.replace(
-        base,
-        data_source_config=DataSourceConfig(
-            method=method,
-            params=cast('dict[str, object]', raw_params),
-        ),
-    )
+    return dataclasses.replace(base, data_source_config=DataSourceConfig(method=method, params=cast('dict[str, object]', raw_params)))
+_SHIM_TEMPLATE: str = '\nfrom backtest_simulator.pipeline.bundle import _override_data_source as _bts_override\n\n_BTS_DATA_SOURCE = {data_source!r}\n_BTS_SFD_CLASS = {sfd_identifier}\n\nparams = _BTS_SFD_CLASS.params\n\ndef manifest():\n    return _bts_override(_BTS_SFD_CLASS.manifest(), _BTS_DATA_SOURCE)\n'
 
-_SHIM_TEMPLATE: str = '''
-from backtest_simulator.pipeline.bundle import _override_data_source as _bts_override
-
-_BTS_DATA_SOURCE = {data_source!r}
-_BTS_SFD_CLASS = {sfd_identifier}
-
-params = _BTS_SFD_CLASS.params
-
-def manifest():
-    return _bts_override(_BTS_SFD_CLASS.manifest(), _BTS_DATA_SOURCE)
-'''
-
-def materialize_bundle_for_cli(
-    bundle_zip: Path, work_dir: Path,
-) -> tuple[Path, Path, BundleSpec]:
+def materialize_bundle_for_cli(bundle_zip: Path, work_dir: Path) -> tuple[Path, Path, BundleSpec]:
     work_dir.mkdir(parents=True, exist_ok=True)
     lock_path = work_dir / '.bundle.lock'
     with _exclusive_dir_lock(lock_path):
         spec = extract_bundle(bundle_zip, work_dir)
         stripped = _strip_runtime_body(spec.py_path.read_text(encoding='utf-8'))
-        shim_source = stripped + _SHIM_TEMPLATE.format(
-            data_source=spec.data_source,
-            sfd_identifier=spec.sfd_identifier,
-        )
+        shim_source = stripped + _SHIM_TEMPLATE.format(data_source=spec.data_source, sfd_identifier=spec.sfd_identifier)
         shim_path = work_dir / f'{spec.py_path.stem}__bts_shim.py'
         shim_path.write_text(shim_source, encoding='utf-8')
-        return shim_path, spec.csv_path, spec
+        return (shim_path, spec.csv_path, spec)
 
 @contextlib.contextmanager
 def _exclusive_dir_lock(lock_path: Path) -> Iterator[None]:
@@ -289,12 +138,9 @@ def _exclusive_dir_lock(lock_path: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-
 N_PERMUTATIONS_DEFAULT: int = 30
 
-def materialize_bundle_on_args(
-    args: argparse.Namespace, work_root: Path,
-) -> None:
+def materialize_bundle_on_args(args: argparse.Namespace, work_root: Path) -> None:
     bundle = getattr(args, 'bundle', None)
     if bundle is None:
         if getattr(args, 'n_permutations', None) is None:
