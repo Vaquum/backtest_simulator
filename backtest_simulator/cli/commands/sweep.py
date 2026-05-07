@@ -1,10 +1,4 @@
 """`bts sweep` — run the backtest pipeline over N decoders by M days."""
-
-# Migration of the operator-driven `/tmp/bts_sweep.py` orchestration into
-# the package. Each window runs in a fresh Python subprocess (see
-# `backtest_simulator.cli._run_window`) so state bleed between windows is
-# impossible. Per-run output is the one-line summary defined in
-# `backtest_simulator.cli._metrics.print_run`.
 from __future__ import annotations
 
 import argparse
@@ -18,8 +12,6 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Final, cast
 
-# tqdm removed — sweep emits one log line per phase + one per window
-# completion. Progress bars muddied the parallel-batch output.
 from backtest_simulator.cli._metrics import (
     STARTING_CAPITAL,
     Trade,
@@ -33,15 +25,6 @@ from backtest_simulator.cli._pipeline import (
     preflight_tunnel,
     seed_price_at,
 )
-
-# Re-exported at module scope so test fixtures can `monkeypatch.setattr(
-# sweep, 'read_kline_size_from_experiment_dir', …)` and
-# `monkeypatch.setattr(sweep, 'run_window_in_subprocess', …)`. The
-# Python runtime emits a runpy `RuntimeWarning` because `cli/__init__.py`
-# loads sweep.py (which in turn loads `_run_window`) before the
-# subprocess does `python -m backtest_simulator.cli._run_window` — the
-# warning is cosmetic, not a behavioural issue, and shadowing it would
-# break public API contracts for monkey-patching tests.
 from backtest_simulator.cli._run_window import (
     read_kline_size_from_experiment_dir as read_kline_size_from_experiment_dir,
 )
@@ -82,29 +65,10 @@ _SECOND_WEEK_APRIL_END: Final = datetime(2026, 4, 12, tzinfo=UTC).date()
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
-
 def assert_sweep_signals_parity_ran(
     sweep_signals_parity_total: int,
     *, n_picks: int, n_days: int,
 ) -> None:
-    """Raise `ParityViolation` if no per-window parity ran across the sweep.
-
-    Codex (post-auditor-4) P1: per-window
-    `try: run_window_in_subprocess() except Exception: continue`
-    swallowed child-window failures. Even with the per-window
-    `assert_signals_parity` mandatory and the per-entry strictness
-    in the helper, a sweep where EVERY window failed at the
-    subprocess level would print "OK n_compared=0" cheerfully
-    (codex's repro produced exactly that with `rc=0`).
-
-    The post-window swallow is now ALSO closed (`raise ... from
-    exc`), but this post-loop guard is the belt-and-braces
-    second line of defence. Reaching this function with `total
-    == 0` means: the sweep DID run, no per-window exception was
-    raised, AND yet zero parity comparisons happened. That can
-    only mean the parity body was bypassed somehow — a future
-    silent regression. Loud, not silent.
-    """
     if sweep_signals_parity_total > 0:
         return
     from backtest_simulator.exceptions import ParityViolation
@@ -119,18 +83,9 @@ def assert_sweep_signals_parity_ran(
     )
     raise ParityViolation(msg)
 
-
 def _resolve_grid_interval(
     picks: list[tuple[int, Decimal, Path, int]],
 ) -> int:
-    """Pick the single `interval_seconds` for the sweep's parity grid.
-
-    A single `bts sweep` invocation runs against ONE exp_code or ONE
-    bundle, so every pick's experiment_dir derives from the same SFD
-    manifest and shares one `kline_size`. We assert this — a mismatch
-    means picks were assembled from heterogeneous training pools and
-    the shared parity grid is not well-defined.
-    """
     seen: dict[int, Path] = {}
     for _, _, exp_dir, _ in picks:
         ks = read_kline_size_from_experiment_dir(exp_dir)
@@ -147,24 +102,11 @@ def _resolve_grid_interval(
         raise ValueError(msg)
     return next(iter(seen))
 
-
 def _runtime_tick_timestamps(
     *,
     days: list[datetime], hours_start: dtime, hours_end: dtime,
     interval_seconds: int,
 ) -> list[datetime]:
-    """Mirror `launcher/clock.py`'s timer firing schedule per-day.
-
-    For each `day` in `days`, find every epoch-aligned
-    `interval_seconds` boundary that falls in
-    `(window_start, window_end]`. The "next boundary AFTER
-    window_start" semantics match `clock.py:99-104` —
-    `next_boundary = (elapsed_whole // interval_seconds + 1) *
-    interval_seconds`. When `window_start` itself sits exactly on
-    a boundary, the FIRST tick is one interval later (matching
-    runtime: a strategy started at exactly 08:00:00 with
-    interval_seconds=3600 fires its first signal at 09:00:00).
-    """
     ticks: list[datetime] = []
     for day in days:
         window_start = datetime.combine(day.date(), hours_start, tzinfo=UTC)
@@ -177,23 +119,11 @@ def _runtime_tick_timestamps(
             t += timedelta(seconds=interval_seconds)
     return ticks
 
-
 def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
     p = add_parser(
         'sweep',
         'Run the backtest pipeline over N decoders x M days.',
     )
-    # --exp-code is REQUIRED: bts has no fallback SFD. The
-    # operator's file must be a self-contained UEL-compliant
-    # Python file with module-level `params()` and `manifest()`
-    # callables. Operator convention is to define an SFD class
-    # (e.g. `class Round3SFD: @staticmethod def params(): ...`)
-    # and expose its static methods at module level via
-    # `params = Round3SFD.params; manifest = Round3SFD.manifest`.
-    # Any uel.run boilerplate must be guarded by
-    # `if __name__ == '__main__':` so importing the file has no
-    # side effects — bts drives uel itself with bts-controlled
-    # n_permutations + experiment_name.
     exp_group = p.add_mutually_exclusive_group(required=True)
     exp_group.add_argument('--exp-code', type=Path,
                    help=(
@@ -273,12 +203,6 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
                        'http://127.0.0.1:8910/ lists sessions in a '
                        'dropdown for switching between live + completed runs.'
                    ))
-    # Slice #17 Task 17 (CPCV portion). Operator-controllable
-    # CSCV partitioning. Defaults C(4,2)=6 paths so the math runs
-    # on every default sweep that has enough clean days; otherwise
-    # the line skips with reason. purge/embargo default 0 so the
-    # operator opts in to label-leakage protection — non-zero
-    # values drop train days adjacent to test-group boundaries.
     p.add_argument('--cpcv-n-groups', type=int, default=4,
                    help=(
                        'CPCV (CSCV) total group count for day-aligned '
@@ -306,23 +230,8 @@ def register(add_parser: Callable[[str, str], argparse.ArgumentParser]) -> None:
     add_verbosity_arg(p)
     p.set_defaults(func=_run)
 
-
 def _run(args: argparse.Namespace) -> int:
     configure(args.verbose)
-    # Session-scoped outputs first — the dashboard's `index.json` poll
-    # needs to see this session within 2s of `bts sweep` starting,
-    # before the heavy filter-pool training / SignalsTable build runs.
-    # Layout:
-    #   ~/sweep/sessions/<id>/sweep.log            (caller redirects)
-    #   ~/sweep/sessions/<id>/sweep_per_window.csv (live per-window)
-    #   ~/sweep/sessions/<id>/sweep_per_tick.csv   (live per-tick preds)
-    #   ~/sweep/sessions/index.json                (dashboard manifest)
-    # `--session-id` is registered as `required=True` via argparse, so a
-    # real CLI invocation always carries it. Unit tests in `tests/cli/`
-    # construct `argparse.Namespace` directly (bypassing argparse) and
-    # may omit it; we tolerate that by routing those callers to a
-    # tempdir and skipping the manifest. Operator-facing CLI behaviour
-    # is unchanged.
     _session_id = getattr(args, 'session_id', None)
     if _session_id is None:
         import tempfile as _tmp
@@ -331,12 +240,6 @@ def _run(args: argparse.Namespace) -> int:
     else:
         sessions_root = Path.home() / 'sweep' / 'sessions'
         sessions_root.mkdir(parents=True, exist_ok=True)
-        # Path-traversal guard: session-id must be a single safe segment
-        # so `sessions_root / session_id` cannot escape
-        # `~/sweep/sessions/`. `..`, absolute paths, embedded slashes,
-        # NUL bytes and shell metacharacters all rejected. Allowed:
-        # ASCII letters, digits, dash, underscore, dot (no leading dot,
-        # no `..`).
         _SESSION_ID_RE = _re_session_id_pattern()
         if not _SESSION_ID_RE.fullmatch(_session_id) or _session_id == '..':
             sys.stderr.write(
@@ -346,10 +249,6 @@ def _run(args: argparse.Namespace) -> int:
             )
             return 2
         session_dir = sessions_root / _session_id
-        # Reject any pre-existing session_dir, even if
-        # `sweep_per_window.csv` is missing (Copilot P1: prior guard
-        # let `~/sweep/sessions/<id>/` with leftover artefacts
-        # overwrite a partially-cleaned run).
         if session_dir.exists():
             sys.stderr.write(
                 f'bts sweep: --session-id {_session_id!r} already has '
@@ -378,51 +277,22 @@ def _run(args: argparse.Namespace) -> int:
         _sid_for_closure = _session_id
 
         def _append_session(sessions: list[dict[str, object]]) -> None:
-            # De-duplicate by `id` — if a prior partial run left a
-            # stale entry for this session-id (the directory guard
-            # above is belt-and-braces; operators occasionally rm -rf
-            # the dir but leave the manifest entry), replace in place.
             sessions[:] = [
                 s for s in sessions if s.get('id') != _sid_for_closure
             ]
             sessions.append(_new_entry)
         _atomic_index_update(_index_path, _append_session)
-        # Stamp `ended_at` on EVERY exit path — clean return,
-        # ParityViolation, RuntimeError("sweep aborted: …"), sys.exit,
-        # Ctrl-C — so the dashboard never shows a session stuck
-        # `live` after the process is gone. atexit fires even on
-        # raised exceptions; only `os._exit` would bypass it (we use
-        # that in subprocess children, never the parent).
         atexit.register(_finalize_session, _index_path, _session_id)
         print(
             f'[{0.0:7.2f}s] session {_session_id} → {session_dir}',
             flush=True,
         )
-    # Silence noisy third-party INFO logs so the sweep log stays uniform
-    # `[X.XXs] message` lines. `limen.experiment.trainer.trainer` emits
-    # `INFO ... Trained sensor for permutation 0` per training call —
-    # for an N-decoder filter pool that's N raw lines without our
-    # duration prefix. Operators can re-enable by passing `-vv`
-    # (configure() honours verbosity for our own logs); Limen / Praxis /
-    # Nexus stay at WARNING regardless.
     import logging as _logging
     for _name in (
         'limen', 'limen.experiment.trainer.trainer',
         'praxis', 'nexus',
     ):
         _logging.getLogger(_name).setLevel(_logging.WARNING)
-    # Install the parquet cache patch on `HistoricalData.get_spot_klines`
-    # FOR THE PARENT before `pick_decoders` runs filter-pool training.
-    # Without this, every `train_single_decoder(...)` invocation calls
-    # Limen's pipeline → `manifest.fetch_data()` → `get_spot_klines` →
-    # full HuggingFace stream (~40 s each). With N decoders that's
-    # N x ~40 s of pure HF refetching just for the filter pool. The
-    # patch is idempotent (guarded by `HistoricalData._bts_cache_installed`)
-    # so it composes with the same install in the per-window
-    # subprocesses (`_run_window._child_main`). The 48h freshness check
-    # downstream (in the SignalsTable build phase) refreshes the
-    # parquet if stale; once the parquet is on disk every parent /
-    # subprocess code path reads it via this patch.
     from backtest_simulator._limen_cache import install_cache
     install_cache()
     from backtest_simulator.cli._pipeline import WORK_DIR
@@ -445,7 +315,6 @@ def _run(args: argparse.Namespace) -> int:
         return 2
     hours_start, hours_end = _resolve_hours(args)
     days = _resolve_days(args)
-    # `--trades-tape` short-circuits CH; default flow preflights as before.
     _operator_tape: Path | None = Path(args.trades_tape).expanduser().resolve() if args.trades_tape else None
     if _operator_tape is None:
         preflight_tunnel()
@@ -472,13 +341,6 @@ def _run(args: argparse.Namespace) -> int:
         input_from_file=args.input_from_file,
     )
     if not picks:
-        # `pick_decoders` returned 0 — every candidate failed the
-        # `--*-min-q` / `--trades-q-range` filters, or `--n-decoders`
-        # is 0, or `--input-from-file` had no usable rows. Without
-        # picks the parallel batch's `n_workers = min(0, …, 8) == 0`
-        # would crash `ThreadPoolExecutor` with `max_workers must be
-        # greater than 0` straight out of stdlib (bit-mis P1). Fail
-        # loudly instead with the cause named.
         sys.stderr.write(
             f'bts sweep: pick_decoders returned 0 picks from a '
             f'candidate pool of {candidate_pool_size}. Either relax '
@@ -489,23 +351,7 @@ def _run(args: argparse.Namespace) -> int:
             f'--n-decoders. There is no work to dispatch.\n',
         )
         return 2
-    # Header line removed — the same numbers (decoders x days = runs) are
-    # already implicit in the per-window log lines and the `replay
-    # launching … window(s) on … worker(s)` line right before the batch.
     total_runs = len(picks) * len(days)
-    # Slice #17 Task 16: build SignalsTable per picked decoder via
-    # per-tick runtime replay (Nexus's exact recipe). Tick instants
-    # match `launcher/clock.py`'s epoch-aligned next-boundary timer
-    # firing schedule (codex round-4 P0); iterating klines instead
-    # of ticks over-emits when interval_seconds < kline_size, and
-    # always over-emits across non-trading hours.
-    #
-    # Cadence anchor: the runtime PredictLoop's Timer fires every
-    # `kline_size` seconds (set in `_run_window.py` from the SAME
-    # `read_kline_size_from_experiment_dir`). The parity grid must
-    # use the SAME cadence — otherwise different-kline_size bundles
-    # (e.g. 7200 in the LogReg-Placeholder bundle vs 3600 in earlier
-    # exp-codes) raise ParityViolation on every fire.
     interval_seconds = _resolve_grid_interval(picks)
     replay_start = datetime.combine(days[0].date(), hours_start, tzinfo=UTC)
     replay_end = datetime.combine(days[-1].date(), hours_end, tzinfo=UTC)
@@ -522,87 +368,33 @@ def _run(args: argparse.Namespace) -> int:
             else int(raw_lookback_for_signals)
         ),
     )
-    # `_print_sweep_signals_summary` removed — its `n_decoders / expected_bars
-    # / coverage` line just restated `len(picks)` and `len(tick_timestamps)`,
-    # both already known. Coverage is a downstream parity concern handled
-    # by `assert_signals_parity` per-window. `signals_per_decoder` is still
-    # consumed by that check below.
     t_total = time.perf_counter()
-    # Accumulators for the sweep-level slippage summary printed
-    # after all runs finish. The per-run cost_bps is the
-    # side-normalized mean for that run; for the sweep aggregate
-    # we want to weight each run by its sample count so a run with
-    # 100 fills doesn't get the same vote as one with 2.
     sweep_slip_costs_weighted: list[tuple[Decimal, int]] = []
     sweep_slip_gaps_weighted: list[tuple[Decimal, int]] = []
     sweep_n_samples_total = 0
     sweep_n_excluded_total = 0
     sweep_n_uncal_total = 0
     sweep_runs_with_slip = 0
-    # Maker-fill telemetry across the sweep. Counts are zero when
-    # no run uses --maker; non-zero when LIMIT orders engaged the
-    # maker engine.
     sweep_n_limit_total = 0
     sweep_n_limit_full = 0
     sweep_n_limit_partial = 0
     sweep_n_limit_zero = 0
     sweep_n_limit_taker = 0
     sweep_efficiencies_weighted: list[tuple[Decimal, int]] = []
-    # Sweep-level market-impact accumulators. The per-run
-    # `realised_bps` is a mean across that run's calibrated
-    # samples; the cross-run aggregate is a sample-weighted
-    # mean (heavier runs vote more — same shape as the
-    # sweep-level slippage cost aggregate). `n_samples` /
-    # `n_flagged` / `n_uncalibrated` are simple totals.
     sweep_impact_bps_weighted: list[tuple[Decimal, int]] = []
     sweep_impact_n_samples_total = 0
     sweep_impact_n_flagged_total = 0
     sweep_impact_n_uncalibrated_total = 0
     sweep_impact_n_rejected_total = 0
-    # Slice #17 Task 11 — book-gap aggregates. max-of-max across
-    # runs (the worst stop-cross latency the sweep observed) plus
-    # total stops (denominator). p95 is intentionally NOT
-    # aggregated from per-run p95s — that would require carrying
-    # raw samples or a mergeable histogram (codex round 1).
     sweep_book_gap_max_seconds = 0.0
     sweep_book_gap_total_stops = 0
-    # Auditor (post-v2.0.2) "make it real": running tally of how
-    # many runtime-vs-SignalsTable per-tick comparisons succeeded
-    # across the whole sweep. The actual mismatch detection is
-    # `assert_signals_parity` raising `ParityViolation` per-window;
-    # this counter gives the operator a positive indicator that
-    # the parity check WAS exercised (vs zero comparisons silently
-    # because the runtime never produced predictions).
     sweep_signals_parity_total = 0
-    # Slice #17 Task 17 (DSR + PBO + SPA portion). Per-decoder
-    # daily-return scalars feed `compute_sweep_stats` after the
-    # sweep finishes. Stored per (decoder, day_idx) so day-aligned
-    # stats can drop only the days where ANY decoder had trailing
-    # inventory (codex round 2 P1: misaligned per-decoder lists
-    # let DSR/PBO truncate-by-position over different dates,
-    # producing clean-looking but wrong stats). CPCV is deferred
-    # until Task 16's path-aware `SignalsTable.lookup` is wired
-    # into the live predict path; without it CPCV math would be
-    # decorative.
     decoder_day_returns: dict[str, dict[int, float]] = {}
     n_runs_with_trailing_inventory = 0
-    # Per-window CSV: one row per (perm, day) appended live so the
-    # dashboard streams updates while the sweep runs. `session_dir` was
-    # set up at the very top of `_run` (before filter-pool training)
-    # so the dashboard's `index.json` poll picks the session up
-    # immediately; we just reuse it here.
     import csv as _csv
     csv_dir = session_dir
     csv_path = csv_dir / 'sweep_per_window.csv'
     csv_fp = csv_path.open('w', newline='', encoding='utf-8')
-    # atexit close so an exception inside the parallel batch / post-
-    # processing never leaves the CSV file handle dangling (Copilot
-    # P1). The success path also closes explicitly (~line 1120) so
-    # the operator's `tail` of the file isn't blocked on process
-    # teardown; the atexit close becomes a no-op on the second
-    # invocation. Per-row `csv_fp.flush()` calls keep buffers on
-    # disk, so even a hard-kill leaves the rows that were written
-    # at the point of failure.
     atexit.register(csv_fp.close)
     csv_writer = _csv.writer(csv_fp)
     csv_writer.writerow([
@@ -611,9 +403,6 @@ def _run(args: argparse.Namespace) -> int:
         'prob_min', 'prob_max',
     ])
     csv_fp.flush()
-    # Per-tick CSV: every captured kline-tick prediction across the
-    # sweep. One row per (perm, day, timestamp). Diagnostic for
-    # whether `_probs` actually varies tick-to-tick within a window.
     tick_csv_path = csv_dir / 'sweep_per_tick.csv'
     tick_csv_fp = tick_csv_path.open('w', newline='', encoding='utf-8')
     atexit.register(tick_csv_fp.close)
@@ -622,24 +411,9 @@ def _run(args: argparse.Namespace) -> int:
         'display_id', 'date', 'timestamp', 'pred', 'prob',
     ])
     tick_csv_fp.flush()
-    # Parallelize per-window subprocess spawns. Each window pays a
-    # ~5s boot for Praxis Trading + Nexus StartupSequencer + Trainer;
-    # running them concurrently amortises wall-time over CPU/IO. Each
-    # subprocess is independent (own work_dir, own EventSpine sqlite,
-    # own venue adapter), so there's no shared mutable state to
-    # serialise on. ClickHouse is reached over a shared SSH tunnel so
-    # we cap concurrency at `min(cpu/2, len, 8)` — enough to amortise
-    # boot, low enough to avoid swamping the tunnel with simultaneous
-    # 30-min trade slice queries during slippage calibration.
     import concurrent.futures as _cf
     import os as _os
 
-    # ONE ClickHouse fetch for the whole sweep — covers slippage
-    # calibration (30-min pre-window slice), per-submit market-impact
-    # bucket fetches (1-min pre-submit slice), and the per-submit fill
-    # walk (capped at 600s). Subprocesses receive the parquet path and
-    # wrap it in `InMemoryTradesFeed`, eliminating per-submit network
-    # round-trips that were costing 3-6s each over the SSH tunnel.
     from backtest_simulator.feed.clickhouse import (
         ClickHouseConfig as _ChCfg,
     )
@@ -657,10 +431,6 @@ def _run(args: argparse.Namespace) -> int:
             sys.stderr.write(f'{exc}\n')
             return 2
     else:
-        # `_ChCfg.from_env()` raises `RuntimeError` on any missing CH
-        # var; catch it narrowly so unit-test contexts that mock
-        # `run_window_in_subprocess` reach the parity-check assertions
-        # instead of crashing on env init.
         try:
             _ch_config = _ChCfg.from_env()
         except RuntimeError as _ch_exc:
@@ -687,10 +457,6 @@ def _run(args: argparse.Namespace) -> int:
             _trades_parquet_path = str(_trades_parquet)
     _raw_max_alloc = getattr(args, 'max_allocation_per_trade_pct', None)
     _raw_lookback = getattr(args, 'predict_lookback', None)
-    # Captured by `_run_one_window` below as concrete typed values so
-    # `run_window_in_subprocess` is called with named arguments and
-    # pyright can check each one. Avoids the `dict[str, object]`
-    # unpacking that the typing-budget ratchet rejected.
     _maker_preference = bool(getattr(args, 'maker', False))
     _strict_impact = bool(getattr(args, 'strict_impact', False))
     _max_alloc_decimal: Decimal | None = (
@@ -699,9 +465,6 @@ def _run(args: argparse.Namespace) -> int:
     _predict_lookback_int: int | None = (
         None if _raw_lookback is None else int(_raw_lookback)
     )
-    # Typed spec for one (perm, day) window. NamedTuple gives every
-    # downstream unpack site full pyright visibility — was previously
-    # `tuple[...]` losing types on `_p, _k, _ed, …` destructuring.
     from typing import NamedTuple as _NamedTuple
     class _WindowSpec(_NamedTuple):
         perm_id: int
@@ -727,11 +490,6 @@ def _run(args: argparse.Namespace) -> int:
     def _run_one_window(spec: _WindowSpec) -> tuple[object, float]:
         (_perm_id, _kelly, _exp_dir, _display_id,
          _day_idx, _day, _ws, _we) = spec
-        # Measure WORK time only — the wall-clock from when this thread
-        # actually picks up the spec to when the subprocess returns.
-        # Capturing at submission time would include queue-wait time
-        # and inflate later windows' "duration" with the wait of every
-        # window ahead of it in the pool's queue.
         _t_work_start = time.perf_counter()
         _result = run_window_in_subprocess(
             _perm_id, _kelly, _ws, _we, _exp_dir,
@@ -758,12 +516,6 @@ def _run(args: argparse.Namespace) -> int:
     parallel_results: dict[tuple[int, int, str], object] = {}
 
     def _write_csv_row_now(_did: int, _label: str, _res: object) -> None:
-        """Compute + write the per-window CSV row as soon as the window
-        completes, so the dashboard streams updates instead of waiting
-        for the whole 140-window batch to finish before any row appears.
-        Computation mirrors the ordered post-processing block below
-        (kept as the single source of truth for sweep-wide stats and
-        the per-line `print_run`)."""
         if not isinstance(_res, dict):
             return
         from typing import cast as _cast2
@@ -771,8 +523,6 @@ def _run(args: argparse.Namespace) -> int:
         from backtest_simulator.cli._run_window import (
             WindowResult as _WR2,
         )
-        # Use the symbol (not the string form) so vulture sees the
-        # import as live; pyright + cast both accept the bare class.
         _r = _cast2(_WR2, _res)
         _trades_raw = _r.get('trades', [])
         _stops_raw = _r.get('declared_stops', {})
@@ -873,9 +623,6 @@ def _run(args: argparse.Namespace) -> int:
         flush=True,
     )
 
-    # Now iterate windows in stable per-(perm,day) order for
-    # post-processing — same logic as before, just lifting the result
-    # from `parallel_results` instead of calling `run_window_in_subprocess`.
     for perm_id, kelly, exp_dir, display_id in picks:
         for day_idx, day in enumerate(days):
             window_start = datetime.combine(day.date(), hours_start, tzinfo=UTC)
@@ -887,8 +634,6 @@ def _run(args: argparse.Namespace) -> int:
             from backtest_simulator.cli._run_window import (
                 WindowResult as _WR,
             )
-            # Use the symbol (not the string form) so vulture sees the
-            # import as live; pyright + cast both accept the bare class.
             result = _cast(_WR, result_obj)
             trades_raw = result['trades']
             stops_raw = result['declared_stops']
@@ -936,19 +681,6 @@ def _run(args: argparse.Namespace) -> int:
             impact_rejected = int(result.get(
                 'market_impact_n_rejected', 0,
             ))
-            # Auditor (post-v2.0.3) "parity must not silently skip":
-            # the prior round's `if runtime_preds_raw:` guard let a
-            # broken capture hook or missing payload reach the
-            # final "no comparisons made" print and exit cleanly,
-            # leaving the mandatory SignalsTable path UNVALIDATED.
-            # Now the call ALWAYS runs; the helper raises
-            # `ParityViolation` when it produces 0 comparisons,
-            # making the silent-skip path impossible. The runtime
-            # predictions list comes from `_run_window`'s wrapped
-            # `produce_signal` hook; if it's empty or non-list,
-            # that's itself a capture-side bug surfaced as a
-            # ParityViolation (the Five Principles: bts work that
-            # exists must do real work or fail loudly).
             decoder_key = str(display_id)
             table = signals_per_decoder.get(decoder_key)
             if table is None:
@@ -965,15 +697,6 @@ def _run(args: argparse.Namespace) -> int:
                 )
                 raise _ParityViolation(msg_no_table)
             runtime_preds_list = result.get('runtime_predictions', [])
-            # Codex (post-auditor-4 round-3): pass PER-WINDOW
-            # expected ticks, NOT the whole sweep grid. A first-
-            # window check must reject a captured second-day tick
-            # (and vice versa). The slice matches
-            # `_runtime_tick_timestamps`'s `(window_start,
-            # window_end]` semantics — INCLUSIVE at end (the
-            # PredictLoop fires AT window_end if it sits on a
-            # boundary; that's the LAST tick of THIS window, not
-            # the first of the next).
             window_expected_ticks = [
                 t for t in tick_timestamps
                 if window_start < t <= window_end
@@ -1009,52 +732,23 @@ def _run(args: argparse.Namespace) -> int:
                 market_impact_n_flagged=impact_flagged,
                 market_impact_n_uncalibrated=impact_uncal,
             )
-            # Book-gap aggregation: max-of-max + total stops.
             run_book_gap_max = float(result.get('book_gap_max_seconds', 0.0))
             run_book_gap_n = int(result.get('book_gap_n_observed', 0))
             if run_book_gap_max > sweep_book_gap_max_seconds:
                 sweep_book_gap_max_seconds = run_book_gap_max
             sweep_book_gap_total_stops += run_book_gap_n
-            # Accumulate per (decoder, day_idx) daily return for
-            # Task 17 post-sweep stats. None means trailing
-            # inventory at window close — don't pretend unrealised
-            # PnL is a 0 return; codex round 1 P1. Storing per
-            # day_idx keeps decoders alignable later — if ANY
-            # decoder has trailing on day X, day X is dropped from
-            # all decoders so DSR/PBO/SPA see same-date returns
-            # (codex round 2 P1).
             day_return = daily_return_for_run(trades, declared_stops)
             if day_return is None:
                 n_runs_with_trailing_inventory += 1
             else:
                 decoder_day_returns[str(display_id)][day_idx] = day_return
-            # Per-window + per-tick CSV writes happen live inside the
-            # parallel-batch `as_completed` loop above
-            # (`_write_csv_row_now`) so the dashboard streams rows as
-            # windows finish, instead of waiting for the whole batch.
-            # The duplicated `pair_trades` / `pair_metrics` /
-            # `max_drawdown_pct` computations that used to live here
-            # were dead — the live writer is the single source of
-            # truth for sweep CSV output.
             sweep_n_limit_total += n_limit
             sweep_n_limit_full += n_limit_full
             sweep_n_limit_partial += n_limit_partial
             sweep_n_limit_zero += n_limit_zero
             sweep_n_limit_taker += n_limit_taker
-            # Weight by `n_passive` (count of passive LIMITs in
-            # this run), NOT `n_limit` (which includes marketable
-            # takers — runs with mostly takers would over-weight
-            # their unrelated p50 in the cross-run mean). The
-            # per-run efficiency was computed only across passive
-            # LIMITs, so the denominator must match. Codex round
-            # 4 P2 caught the prior n_limit weighting.
             if eff_mean is not None and n_passive > 0:
                 sweep_efficiencies_weighted.append((eff_mean, n_passive))
-            # Market-impact aggregation: weight per-run mean by
-            # sample count so a 200-order run doesn't get drowned
-            # by a 2-order run. Uncalibrated submits are tracked
-            # separately so the operator can spot calibration
-            # gaps in the sweep summary.
             if impact_bps is not None and impact_n > 0:
                 sweep_impact_bps_weighted.append((impact_bps, impact_n))
             sweep_impact_n_samples_total += impact_n
@@ -1068,11 +762,6 @@ def _run(args: argparse.Namespace) -> int:
                 sweep_n_uncal_total += slip_uncal
                 if slip_n > 0:
                     sweep_slip_costs_weighted.append((slip_cost, slip_n))
-                # Gap is the mean over fills where BOTH realised and
-                # predicted are available. Use the adapter's own
-                # n_predicted_samples (count of fills with non-None
-                # prediction) as the weight, so a run with many
-                # uncalibrated_predict fills doesn't get over-weighted.
                 if slip_gap is not None and slip_predicted_n > 0:
                     sweep_slip_gaps_weighted.append(
                         (slip_gap, slip_predicted_n),
@@ -1083,15 +772,6 @@ def _run(args: argparse.Namespace) -> int:
     print(f'\ndone   {total_runs} run(s) in {t_wall:.1f}s')
     print(f'sweep csv        {csv_path}')
     print(f'sweep tick csv   {tick_csv_path}')
-    # Honesty contract: every BUY filled inside a window MUST close
-    # before the window ends. Open inventory at window close means
-    # the day's PnL is unrealized and the day gets silently dropped
-    # from DSR/SPA/PBO via `daily_return_for_run` returning None.
-    # Stats compiled on the surviving subset are not honest — they
-    # represent the leftover after the most informative days were
-    # excluded. If force-flatten failed for ANY window, the operator
-    # cannot trust the sweep result, so we abort loud rather than
-    # print a numeric verdict on a partial sample.
     if n_runs_with_trailing_inventory > 0:
         from backtest_simulator.exceptions import (
             ParityViolation as _ParityViolation,
@@ -1135,12 +815,6 @@ def _run(args: argparse.Namespace) -> int:
         max_seconds=sweep_book_gap_max_seconds,
         total_stops=sweep_book_gap_total_stops,
     )
-    # Auditor (post-v2.0.3) + codex (post-auditor-4): require AT
-    # LEAST ONE window's parity to have actually run across the
-    # whole sweep. Closes the silent-skip path through the
-    # per-window `try: run_window_in_subprocess() except
-    # Exception: continue` block above (subprocess failure for
-    # every window would otherwise print "OK n_compared=0").
     assert_sweep_signals_parity_ran(
         sweep_signals_parity_total,
         n_picks=len(picks), n_days=len(days),
@@ -1150,9 +824,6 @@ def _run(args: argparse.Namespace) -> int:
         f'OK n_compared={sweep_signals_parity_total} '
         f'(runtime Sensor.predict matches SignalsTable per-tick)',
     )
-    # Align decoders by day: drop any day where ANY decoder had
-    # trailing inventory. This guarantees DSR/PBO/SPA see same-
-    # date returns for every decoder (codex round 2 P1).
     all_decoder_ids = list(decoder_day_returns.keys())
     clean_day_indices = [
         day_idx for day_idx in range(len(days))
@@ -1165,11 +836,6 @@ def _run(args: argparse.Namespace) -> int:
         for d in all_decoder_ids
     }
     clean_days = [days[i] for i in clean_day_indices]
-    # n_search_trials = max(operator's --n-permutations, the
-    # actual candidate pool size from `pick_decoders`). The pool
-    # size handles cached-mode + --input-from-file where
-    # `args.n_permutations` doesn't reflect the real search
-    # space (codex round 2 P1).
     n_search_trials = max(
         int(args.n_permutations), int(candidate_pool_size),
     )
@@ -1187,12 +853,7 @@ def _run(args: argparse.Namespace) -> int:
         purge_seconds=int(args.cpcv_purge_seconds),
         embargo_seconds=int(args.cpcv_embargo_seconds),
     )
-    # Reaches here only on the success path — `_finalize_session`
-    # (registered via atexit at session-creation time) handles BOTH
-    # success and failure paths so the dashboard never shows a
-    # session stuck `live` after the process exits.
     return 0
-
 
 def _build_and_save_signals_tables(
     picks: list[tuple[int, Decimal, Path, int]],
@@ -1201,24 +862,6 @@ def _build_and_save_signals_tables(
     replay_start: datetime, replay_end: datetime,
     predict_lookback: int | None = None,
 ) -> dict[str, SignalsTable]:
-    """Build + save SignalsTable per picked decoder.
-
-    Slice #17 Task 16. Walks each picked decoder's experiment dir
-    via Limen `Trainer`, retrains the Pass-2 (1,0,0) Sensor (the
-    runtime predictor), fetches klines via the same source the
-    launcher's poller uses (`HistoricalData.get_spot_klines`), and
-    runs per-bar replay over the sweep's replay window.
-
-    Trainer init is amortised per `exp_dir` so the ~20 s ClickHouse
-    fetch only happens once per experiment, not per decoder.
-
-    Auditor (post-v2.0.2): now returns ONLY the tables (klines were
-    a residual return value from the bar-level CPCV that v2.0.2
-    replaced with day-level deployed-strategy returns). The tables
-    are the sweep-time PARITY REFERENCE for runtime predictions —
-    `assert_signals_parity` in `_signals_builder.py` checks them
-    against the captured `produce_signal` outputs per window.
-    """
     import importlib
     import json as _json
 
@@ -1227,26 +870,12 @@ def _build_and_save_signals_tables(
     for perm_id, _, exp_dir, display_id in picks:
         by_exp_dir.setdefault(exp_dir, []).append((perm_id, display_id))
     if not by_exp_dir:
-        # Caller (`_run`) guards against `len(picks) == 0` upstream and
-        # exits before reaching this helper. Belt-and-braces: an empty
-        # mapping here would hit `next(iter(...))` with StopIteration —
-        # surface it as a clear ValueError instead so the message names
-        # the cause (Copilot P1, defensive narrow that's reachable only
-        # via mis-call from a future entry point).
         msg = (
             '_build_and_save_signals_tables: no picks → no SignalsTable '
             'to build. Caller must short-circuit on empty picks.'
         )
         raise ValueError(msg)
     historical = HistoricalData()
-    # Mode-2 picks share the same data_source_config (same bundle), so
-    # we read the manifest from the FIRST exp_dir's metadata.json
-    # WITHOUT instantiating Trainer (Trainer.__init__ pulls data
-    # internally), fetch klines ONCE, then hand the same DataFrame to
-    # every Trainer via the `data=` kwarg so they skip their internal
-    # fetch_data(). Without this, klines would be pulled N+1 times:
-    # once per Trainer (one per decoder-group) plus our explicit
-    # get_spot_klines call.
     first_exp_dir = next(iter(by_exp_dir))
     _tm = time.perf_counter()
     with (first_exp_dir / 'metadata.json').open('r') as _mf:
@@ -1294,14 +923,6 @@ def _build_and_save_signals_tables(
             f'{type(ds_start_obj).__name__}={ds_start_obj!r}'
         )
         raise TypeError(msg)
-    # Internal data handler with 48h staleness threshold:
-    #   1. Local parquet exists AND its max datetime is < 48h behind
-    #      `datetime.now(UTC)` → use the local file, skip the fetch.
-    #   2. Otherwise (file missing OR last bar > 48h old) → call
-    #      `get_spot_klines` and atomically replace the local file.
-    # The cache path matches `_limen_cache._cache_path` so the
-    # subprocess pollers (which call `install_cache()` and read the
-    # same parquet) see the up-to-date data.
     import polars as _pl
     _cp = (
         Path.home() / '.cache' / 'backtest_simulator' / 'limen_klines'
@@ -1314,10 +935,6 @@ def _build_and_save_signals_tables(
     _t_klines = time.perf_counter()
     if _cp.is_file():
         cached = _pl.read_parquet(_cp)
-        # `polars.Series.max()` is typed as `PythonLiteral | None`;
-        # at runtime on a `Datetime[us, UTC]` column it's a `datetime`
-        # (or `None` when empty). Narrow explicitly so the tz-aware
-        # comparison below is type-safe.
         _cached_max_obj: object = cached['datetime'].max()
         if isinstance(_cached_max_obj, datetime):
             _cached_max_aware = (
@@ -1335,16 +952,6 @@ def _build_and_save_signals_tables(
                     flush=True,
                 )
     if not _use_cache:
-        # `install_cache` (registered in `_run` for the filter-pool
-        # training pass) wraps `HistoricalData.get_spot_klines` to
-        # return the cached parquet whenever the file exists — so a
-        # naive refetch call here would re-load the SAME stale data
-        # we already rejected. Delete the parquet first; the wrapper
-        # then sees a cache miss, fetches fresh from HuggingFace, and
-        # writes the new file back to disk under its own atomic
-        # `_cp.tmp` → `_cp` move. The subprocesses (which install the
-        # same wrapper) read the refreshed parquet on their next call.
-        # Copilot P1.
         if _cp.is_file():
             _cp.unlink()
         klines_shared = historical.get_spot_klines(
@@ -1352,29 +959,14 @@ def _build_and_save_signals_tables(
             kline_size=kline_size,
             start_date_limit=ds_start_obj,
         )
-        # The wrapper writes the parquet itself on its miss path; no
-        # explicit `klines_shared.write_parquet(...)` call needed.
-        # Copilot P1: prior code passed n_rows implicitly None, which
-        # bypassed the bundle's declared row cap and risked pulling the
-        # full dataset (memory + parity drift vs the runtime poller).
         print(
             f'[{time.perf_counter()-_t_klines:7.2f}s] '
             f'klines refetched from HuggingFace ({klines_shared.height} rows)',
             flush=True,
         )
     if klines_shared is None:
-        # Defensive narrow — the cache hit and refetch branches above
-        # both assign `klines_shared`, so this is unreachable in
-        # practice. Pyright needs the explicit `is None` check to
-        # drop the `DataFrame | None` annotation that lingers after
-        # the `_use_cache` branching.
         msg = 'sweep signals: klines_shared not populated'
         raise RuntimeError(msg)
-    # Normalize the polars `.max()` to a tz-aware UTC datetime before
-    # the staleness boundary compare (zero-bang P1: cache-hit path's
-    # `_cached_max_aware` already does this; the post-fetch path
-    # reused the raw `.max()` and would `TypeError` if Polars returned
-    # tz-naive on the refetched parquet).
     _klines_max_dt_raw: object = klines_shared['datetime'].max()
     if not isinstance(_klines_max_dt_raw, datetime):
         msg = (
@@ -1403,13 +995,6 @@ def _build_and_save_signals_tables(
     _t_build_all = time.perf_counter()
     n_total = sum(len(d) for d in by_exp_dir.values())
     for exp_dir, decoders in by_exp_dir.items():
-        # The two heavy steps in the SignalsTable build are SHARED across
-        # all decoders that share an `exp_dir`: `Trainer(exp_dir, data=…)`
-        # constructs the manifest + scaler factory; `trainer.train([…])`
-        # fits N sklearn classifiers in one pass. Their wall time was
-        # previously hidden — the per-decoder line started AFTER this
-        # block, so 10 x 0.12s did not equal the outer summary's seconds.
-        # Logging it here makes the math add up.
         _t_trainer = time.perf_counter()
         trainer = Trainer(exp_dir, data=klines_shared)
         manifest = trainer._manifest
@@ -1431,15 +1016,8 @@ def _build_and_save_signals_tables(
                 tick_timestamps=tick_timestamps,
                 round_params=round_params, decoder_id=decoder_id,
                 predict_lookback=predict_lookback,
-                # Mirror the bundle's `data_source.params['n_rows']`
-                # the runtime poller reads (zero-bang on PR #43): without
-                # this, replay tails 5000 rows where the runtime tails
-                # the bundle's declared count, features diverge for any
-                # bundle declaring n_rows > 5000, and assert_signals_parity
-                # fires ParityViolation.
                 n_rows=ds_n_rows_obj,
             )
-            # Load-bearing gates — wired so neither stays decorative.
             table.assert_split_alignment(manifest.split_config)
             table.assert_window_covers(replay_start, replay_end)
             table.save(exp_dir / 'signals_tables')
@@ -1457,7 +1035,6 @@ def _build_and_save_signals_tables(
     )
     return tables
 
-
 def _print_cpcv_pbo_summary(
     *,
     per_decoder_returns: dict[str, list[float]],
@@ -1467,23 +1044,6 @@ def _print_cpcv_pbo_summary(
     purge_seconds: int,
     embargo_seconds: int,
 ) -> None:
-    """Slice #17 Task 17 — day-level CSCV PBO over deployed-strategy returns.
-
-    Lopez de Prado §11 directly: each path picks `n_test_groups`
-    of `n_groups` as OOS, the rest as IS. The deployed-strategy
-    daily returns (`daily_return_for_run` output, already
-    feeding DSR/SPA) are partitioned by group and Sharpe is
-    computed per IS / OOS subset.
-
-    Auditor (post-v2.0.1): the prior bar-level implementation
-    used `pred * close_to_next_close_return` — a signal-return
-    proxy that ignored stops, slippage, impact, maker-fill, and
-    trailing-inventory exclusions. `per_decoder_returns` IS the
-    deployed strategy path, so the PBO surface ranks what
-    `bts sweep` actually trades.
-
-    Skips with reason when the input shape is too thin.
-    """
     if not per_decoder_returns or len(per_decoder_returns) < 2:
         print(
             f'sweep cpcv_pbo   skipped: need >=2 decoders, have '
@@ -1511,11 +1071,6 @@ def _print_cpcv_pbo_summary(
             f'purge_s={purge_seconds} embargo_s={embargo_seconds})',
         )
         return
-    # Codex round-7 follow-up: with n_decoders=2 the OOS rank is
-    # binary (1 or 2), so PBO collapses to 0.0 or 1.0. The number
-    # is still computed honestly — but the precision shown can
-    # mislead. Surface the constraint so the operator knows to
-    # widen --n-decoders for a continuous PBO.
     binary_warning = (
         '  WARN: n_decoders=2 -> PBO is structurally binary (0.0 or '
         '1.0); widen --n-decoders for finer resolution'
@@ -1531,24 +1086,12 @@ def _print_cpcv_pbo_summary(
         f'{binary_warning}',
     )
 
-
 def _print_sweep_stats_summary(
     per_decoder_returns: dict[str, list[float]],
     days: list[datetime], hours_start: dtime, hours_end: dtime,
     *, n_search_trials: int, n_runs_with_trailing_inventory: int,
     seed_price_at: Callable[[datetime], Decimal],
 ) -> None:
-    """Slice #17 Task 17 — DSR + PBO + SPA summary lines.
-
-    Each line either reports the result OR a `skipped: <reason>`
-    string so the operator knows WHY a stat didn't fire. `days`
-    here is the day-aligned subset (codex round 2 P1: only days
-    where ALL decoders cleanly closed feed the stats — otherwise
-    DSR/PBO truncate-by-position over different dates).
-    `n_runs_with_trailing_inventory` is the per-(decoder, day)
-    pair count of runs with open positions at window close — the
-    primary "what's been excluded" signal.
-    """
     n_clean_days = len(days)
     if not per_decoder_returns or n_clean_days < 2:
         print(
@@ -1589,28 +1132,10 @@ def _print_sweep_stats_summary(
             f'p_value={stats.spa.p_value:.3f}  '
             f'n_candidates={stats.spa.n_candidates}',
         )
-    # Legacy half/half `sweep pbo` line removed (codex round 5 P1):
-    # the underlying primitive (`probability_of_backtest_overfitting`)
-    # picks the IS winner via deterministic `max()` on tied Sharpes,
-    # which fabricates `pbo=0.000` on zero-return splits even when
-    # the full per-decoder series differ. `sweep cpcv_pbo` is the
-    # honest replacement (printed below) — it skips per-path on IS
-    # and OOS rank ties and consumes `CpcvPaths` directly.
-
 
 def _print_sweep_book_gap_summary(
     *, max_seconds: float, total_stops: int,
 ) -> None:
-    """Slice #17 Task 11 — book-gap one-line sweep summary.
-
-    Surfaces the worst stop-cross-to-trade latency observed across
-    all (decoder, day) runs in the sweep. `total_stops` is the
-    denominator. When 0, no STOP/TP order fired anywhere in this
-    sweep — print a skip line so the operator knows the metric
-    didn't have data, not that it observed zero gap (codex round 1
-    P1 wording: phrase as "no STOP/TP trigger fills observed",
-    not "no risk events").
-    """
     if total_stops <= 0:
         print(
             'sweep book_gap   skipped: no STOP/TP trigger fills '
@@ -1624,7 +1149,6 @@ def _print_sweep_book_gap_summary(
         f'total_stops={total_stops}',
     )
 
-
 def _print_sweep_impact_summary(
     weighted_bps: list[tuple[Decimal, int]],
     n_samples_total: int,
@@ -1633,24 +1157,7 @@ def _print_sweep_impact_summary(
     n_rejected_total: int,
     total_runs: int,
 ) -> None:
-    """Print the sweep-level market-impact summary line.
-
-    Silent when the sweep saw zero impact samples AND zero
-    uncalibrated submits (the model was either off or no
-    orders fired). Active otherwise — the operator gets:
-      - sample-weighted mean impact bps across all calibrated
-        submits (heavier runs vote more, matching the
-        slippage-cost aggregator's weighting).
-      - total samples + flagged-as-too-large counts.
-      - uncalibrated count and a WARN suffix when
-        `n_uncalibrated / (n_samples + n_uncalibrated) > 10%`
-        — the operator's "calibration window is too narrow"
-        signal, mirroring the slippage coverage gap WARN.
-      - flagged-fraction WARN when >= 5% of submitted orders
-        crossed the `threshold_fraction` of bucket volume —
-        the operator must down-size before live.
-    """
-    del total_runs  # reserved for future per-run normalisation
+    del total_runs
     if n_samples_total == 0 and n_uncalibrated_total == 0:
         return
     if weighted_bps and n_samples_total > 0:
@@ -1695,7 +1202,6 @@ def _print_sweep_impact_summary(
             )
     print(line)
 
-
 def _print_sweep_maker_summary(
     n_total: int,
     n_full: int,
@@ -1704,22 +1210,6 @@ def _print_sweep_maker_summary(
     n_taker: int,
     weighted_efficiencies: list[tuple[Decimal, int]],
 ) -> None:
-    """Sweep-level maker-fill summary.
-
-    Silent when no LIMIT orders ran across the sweep (the
-    default MARKET-strategy case). Active under `--maker` mode,
-    when the strategy template emits LIMIT orders. The
-    `mkt_taker` count separates marketable LIMITs (limit price
-    crossed at submit → taker) from passive LIMITs that engaged
-    the maker engine. `fill_eff_mean` is the passive-count-
-    weighted arithmetic mean of per-run efficiency means — a
-    true cross-run mean fraction filled across passive LIMITs.
-
-    Aggregation contract:
-      - `weighted_efficiencies` is `[(per_run_eff_mean, n_passive_in_run), ...]`.
-      - Sum of (eff * n) / sum of n = passive-count-weighted mean.
-      - Empty list → `n/a` (no passive LIMITs ran in the sweep).
-    """
     if n_total == 0:
         return
     n_passive = n_total - n_taker
@@ -1753,7 +1243,6 @@ def _print_sweep_maker_summary(
             )
     print(line)
 
-
 def _print_sweep_slippage_summary(
     weighted_costs: list[tuple[Decimal, int]],
     weighted_gaps: list[tuple[Decimal, int]],
@@ -1763,22 +1252,6 @@ def _print_sweep_slippage_summary(
     runs_with_slip: int,
     total_runs: int,
 ) -> None:
-    """Print a sweep-level slippage summary line + coverage warning.
-
-    The per-run line gave the operator one number per run. The
-    sweep aggregate makes slippage a first-class sweep decision
-    metric:
-      - sample-weighted mean cost across all measured fills
-        (heavier runs vote more — a run with 200 fills shouldn't
-        be drowned by a run with 2).
-      - total samples and excluded across the sweep.
-      - coverage gap warning when excluded / (samples + excluded)
-        crosses 10 % — widening the calibration window or
-        increasing `dt_seconds` is the operator's response.
-      - explicit "all runs slip-off" message when no run had a
-        model attached, so the operator can tell "no slippage
-        signal" from "slippage signal of zero".
-    """
     if runs_with_slip == 0:
         print(
             'sweep slippage  off — no run produced a calibrated '
@@ -1786,10 +1259,6 @@ def _print_sweep_slippage_summary(
         )
         return
     if n_samples_total == 0:
-        # Some runs had a model but no fills were measured. If
-        # there are any excluded fills, that's a 100% coverage
-        # gap — emit the WARN explicitly. Codex flagged the
-        # earlier "return early without WARN" regression.
         line = (
             f'sweep slippage  no fills measured across {runs_with_slip} '
             f'slip-on run(s); excluded={n_excluded_total}'
@@ -1829,21 +1298,10 @@ def _print_sweep_slippage_summary(
             'or increase dt_seconds'
         )
     print(line)
-    # Calibration-loop summary: realised - predicted gap. The
-    # gap denominator is the count of fills where BOTH realised
-    # AND predicted succeeded — NOT n_samples_total (which
-    # includes uncalibrated_predict fills the gap can't cover).
-    # Codex / auditor pinned this weighting bug.
     n_predicted_samples_total = sum(
         n for _, n in weighted_gaps
     )
     if n_predicted_samples_total == 0:
-        # No successful predictions across the entire sweep.
-        # Don't fabricate a "gap = 0" — that would imply
-        # "calibration matched reality" when the truth is "no
-        # calibration signal at all." Distinct messages for the
-        # two states (no slippage model vs model attached but
-        # zero successful predictions).
         if n_uncal_total > 0:
             print(
                 'sweep calibration  no successful predictions  '
@@ -1851,8 +1309,6 @@ def _print_sweep_slippage_summary(
                 '(buckets do not cover this run\'s qty distribution)'
                 '  WARN: cannot evaluate calibration loop',
             )
-        # else: no model engaged on the predict side; the slippage
-        # summary above already conveyed the off/no-fills state.
         return
     gap_total = sum(
         (g * Decimal(n) for g, n in weighted_gaps),
@@ -1875,7 +1331,6 @@ def _print_sweep_slippage_summary(
         )
     print(gap_line)
 
-
 def _resolve_hours(args: argparse.Namespace) -> tuple[dtime, dtime]:
     if args.trading_hours_start is None:
         return dtime(0, 0), dtime(23, 59)
@@ -1885,7 +1340,6 @@ def _resolve_hours(args: argparse.Namespace) -> tuple[dtime, dtime]:
         msg = f'trading-hours-end ({end}) must be > start ({start}) within one day'
         raise ValueError(msg)
     return start, end
-
 
 def _resolve_days(args: argparse.Namespace) -> list[datetime]:
     if args.replay_period_start is None:
