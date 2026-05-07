@@ -13,8 +13,8 @@
       "covered_branches": 1
     },
     "backtest_simulator/cli/__init__.py": {
-      "num_statements": 20,
-      "covered_lines": 20,
+      "num_statements": 22,
+      "covered_lines": 22,
       "num_branches": 2,
       "covered_branches": 2
     },
@@ -25,14 +25,14 @@
       "covered_branches": 29
     },
     "backtest_simulator/cli/_pipeline.py": {
-      "num_statements": 263,
-      "covered_lines": 171,
+      "num_statements": 264,
+      "covered_lines": 169,
       "num_branches": 52,
-      "covered_branches": 26
+      "covered_branches": 28
     },
     "backtest_simulator/cli/_run_window.py": {
       "num_statements": 210,
-      "covered_lines": 195,
+      "covered_lines": 196,
       "num_branches": 30,
       "covered_branches": 19
     },
@@ -56,7 +56,7 @@
     },
     "backtest_simulator/cli/_verbosity.py": {
       "num_statements": 50,
-      "covered_lines": 44,
+      "covered_lines": 42,
       "num_branches": 12,
       "covered_branches": 10
     },
@@ -206,7 +206,7 @@
     },
     "backtest_simulator/pipeline/experiment.py": {
       "num_statements": 85,
-      "covered_lines": 64,
+      "covered_lines": 53,
       "num_branches": 8,
       "covered_branches": 2
     },

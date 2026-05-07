@@ -39,7 +39,7 @@
   "backtest_simulator/pipeline/_strategy_templates/long_on_signal.py": 291,
   "backtest_simulator/sensors/__init__.py": 10,
   "backtest_simulator/sensors/precompute.py": 151,
-  "backtest_simulator/cli/__init__.py": 22,
+  "backtest_simulator/cli/__init__.py": 23,
   "backtest_simulator/cli/_verbosity.py": 51,
   "backtest_simulator/cli/_pipeline.py": 273,
   "backtest_simulator/cli/_metrics.py": 121,

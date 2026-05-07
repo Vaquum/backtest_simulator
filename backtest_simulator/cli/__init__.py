@@ -22,6 +22,8 @@ def _build_parser() -> argparse.ArgumentParser:
     return ap
 
 def main(argv: list[str] | None=None) -> int:
+    from backtest_simulator.cli._pipeline import init_clickhouse_env
+    init_clickhouse_env()
     ap = _build_parser()
     args = ap.parse_args(argv)
     return int(args.func(args))

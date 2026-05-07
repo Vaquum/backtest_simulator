@@ -14,10 +14,6 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Final, cast
 
-os.environ.setdefault('CLICKHOUSE_HOST', '127.0.0.1')
-os.environ.setdefault('CLICKHOUSE_PORT', '18123')
-os.environ.setdefault('CLICKHOUSE_USER', 'default')
-os.environ.setdefault('CLICKHOUSE_DATABASE', 'origo')
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _DOTENV_PATH: Final[Path] = _REPO_ROOT / '.env'
 
@@ -30,7 +26,13 @@ def _hydrate_environ_from_dotenv() -> None:
         key = k.strip()
         val = v.strip()
         os.environ.setdefault(key, val)
-_hydrate_environ_from_dotenv()
+
+def init_clickhouse_env() -> None:
+    os.environ.setdefault('CLICKHOUSE_HOST', '127.0.0.1')
+    os.environ.setdefault('CLICKHOUSE_PORT', '18123')
+    os.environ.setdefault('CLICKHOUSE_USER', 'default')
+    os.environ.setdefault('CLICKHOUSE_DATABASE', 'origo')
+    _hydrate_environ_from_dotenv()
 
 def _require_password() -> str:
     os.environ.get('CLICKHOUSE_PASSWORD')
