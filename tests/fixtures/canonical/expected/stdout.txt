@@ -32,14 +32,6 @@
 [<dur>] session <session-id> → <session-path>
 [<dur>] trades tape ready: trades.parquet (operator-supplied)
 done   6 run(s) in <wall>s
-sweep book_gap   skipped: no STOP/TP trigger fills observed (default long_on_signal template uses MARKET orders; this metric activates when strategies emit STOP/TP orders)
-sweep calibration  predict-vs-realised gap -1.56bp across 8 predicted fills  uncalibrated_predict=0  WARN: gap >1bp — calibration window or qty buckets do not match this run; recalibrate
-sweep cpcv_pbo   skipped: every path lost its IS or OOS pool to purge/embargo or predictions are degenerate (n_groups=4 test_groups=2 purge_s=0 embargo_s=0)
 sweep csv        <session-path>
-sweep dsr        sharpe_best=0.577  decoder=17  n_trials=5000  deflated=-6.059  p_value=0.000
-sweep impact     mean=+0.08bp  n=8 flagged=0  rejected=0  uncalibrated=0
 sweep signals parity  OK n_compared=30 (runtime Sensor.predict matches SignalsTable per-tick)
-sweep slippage  cost -0.98bp  n=8 fills across 6 run(s)  excluded=0 (0.0% coverage gap)
-sweep spa        statistic=1.152  p_value=0.067  n_candidates=2
-sweep stats      n_runs_excluded_open_position=0  clean_days=3
 sweep tick csv   <session-path>
