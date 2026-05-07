@@ -256,6 +256,8 @@ min_confidence = 80
 
 [tool.coverage.run]
 branch = true
+parallel = true
+concurrency = ["multiprocessing", "thread"]
 source = ["backtest_simulator"]
 
 [tool.coverage.report]

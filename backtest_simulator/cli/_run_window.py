@@ -950,6 +950,11 @@ def _child_main() -> int:
     # and read by the parent before the child's exit signal lands.
     sys.stdout.flush()
     sys.stderr.flush()
+    if os.environ.get('COVERAGE_PROCESS_START'):
+        import coverage
+        _cov = coverage.Coverage.current()
+        if _cov is not None:
+            _cov.save()
     os._exit(0)
 
 
