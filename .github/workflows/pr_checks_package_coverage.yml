@@ -44,4 +44,6 @@ jobs:
           echo 'import coverage; coverage.process_startup()' \
             > .venv/lib/python3.12/site-packages/_bts_coverage_subprocess.pth
       - name: Run package coverage gate
-        run: .venv/bin/python tools/check_package_coverage.py
+        run: |
+          export PATH="$PWD/.venv/bin:$PATH"
+          .venv/bin/python tools/check_package_coverage.py
