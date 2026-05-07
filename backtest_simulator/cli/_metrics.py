@@ -41,6 +41,8 @@ def pair_metrics(pair: tuple[Trade, Trade], declared_stop: Decimal | None) -> tu
     net = (sell.price - buy.price) * qty - (buy.fee + sell.fee)
     notional = buy.price * qty
     return_pct = Decimal('0') if notional == 0 else net / notional * Decimal('100')
+    if declared_stop is None:
+        return (net, return_pct, None)
     risk = abs(buy.price - declared_stop) * qty
     return (net, return_pct, None if risk == 0 else net / risk)
 

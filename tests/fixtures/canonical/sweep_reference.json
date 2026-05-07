@@ -19,10 +19,10 @@
       "covered_branches": 0
     },
     "backtest_simulator/cli/_metrics.py": {
-      "num_statements": 111,
-      "covered_lines": 106,
-      "num_branches": 34,
-      "covered_branches": 28
+      "num_statements": 113,
+      "covered_lines": 107,
+      "num_branches": 36,
+      "covered_branches": 29
     },
     "backtest_simulator/cli/_pipeline.py": {
       "num_statements": 266,
@@ -37,7 +37,7 @@
       "covered_branches": 19
     },
     "backtest_simulator/cli/_session_manifest.py": {
-      "num_statements": 52,
+      "num_statements": 53,
       "covered_lines": 35,
       "num_branches": 6,
       "covered_branches": 2
@@ -79,8 +79,8 @@
       "covered_branches": 0
     },
     "backtest_simulator/feed/lookahead.py": {
-      "num_statements": 20,
-      "covered_lines": 18,
+      "num_statements": 17,
+      "covered_lines": 15,
       "num_branches": 2,
       "covered_branches": 1
     },
@@ -109,10 +109,10 @@
       "covered_branches": 9
     },
     "backtest_simulator/honesty/conservation.py": {
-      "num_statements": 48,
-      "covered_lines": 46,
-      "num_branches": 4,
-      "covered_branches": 4
+      "num_statements": 44,
+      "covered_lines": 42,
+      "num_branches": 2,
+      "covered_branches": 2
     },
     "backtest_simulator/honesty/deflated_sharpe.py": {
       "num_statements": 22,
@@ -127,7 +127,7 @@
       "covered_branches": 12
     },
     "backtest_simulator/honesty/maker_fill.py": {
-      "num_statements": 56,
+      "num_statements": 57,
       "covered_lines": 26,
       "num_branches": 8,
       "covered_branches": 0
@@ -139,9 +139,9 @@
       "covered_branches": 2
     },
     "backtest_simulator/honesty/risk.py": {
-      "num_statements": 12,
+      "num_statements": 14,
       "covered_lines": 11,
-      "num_branches": 0,
+      "num_branches": 2,
       "covered_branches": 0
     },
     "backtest_simulator/honesty/slippage.py": {

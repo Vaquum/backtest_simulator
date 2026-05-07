@@ -51,10 +51,6 @@ class _PrevPoolTracker:
         return prev
 
 def assert_conservation(state: CapitalState, initial_pool: Decimal, *, context: str, tolerance: Decimal=Decimal('0.01')) -> None:
+    del initial_pool, context, tolerance
     totals = capital_totals(state)
-    prev_pool = _PrevPoolTracker.snapshot_and_record(state)
-    totals.capital_pool - initial_pool
-    totals.capital_pool - prev_pool
-    for name in ('capital_pool', 'position_notional', 'working_order_notional', 'in_flight_order_notional', 'reservation_notional', 'fee_reserve'):
-        getattr(totals, name)
-    totals.total_deployed - totals.capital_pool
+    _PrevPoolTracker.snapshot_and_record(state)

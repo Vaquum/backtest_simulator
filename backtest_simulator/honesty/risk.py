@@ -14,4 +14,6 @@ class RPerTrade:
     qty: Decimal
 
 def compute_r(*, entry_price: Decimal, declared_stop_price: Decimal | None, qty: Decimal) -> Decimal | None:
+    if declared_stop_price is None:
+        return None
     return abs(entry_price - declared_stop_price) * qty

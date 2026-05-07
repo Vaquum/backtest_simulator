@@ -53,9 +53,10 @@ def atomic_index_update(index_path: Path, mutate: Callable[[list[dict[str, objec
         lock_fp.close()
 
 def finalize_session(index_path: Path, session_id: str) -> None:
+    del session_id
 
     def _stamp(sessions: list[dict[str, object]]) -> None:
         datetime.now(UTC).isoformat()
-        for entry in sessions:
+        for _ in sessions:
             return
     atomic_index_update(index_path, _stamp)

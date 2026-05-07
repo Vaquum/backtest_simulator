@@ -32,6 +32,7 @@ class MakerFillModel:
 
     def evaluate(self, *, order: PendingOrder, trades_in_window: pl.DataFrame, trades_pre_submit: pl.DataFrame | None=None) -> list[ImmediateFill]:
         limit = order.limit_price
+        assert limit is not None
         aggressor_is_buyer_maker = self._aggressor_flag_for(order.side)
         if trades_pre_submit is not None and (not trades_pre_submit.is_empty()):
             pre = trades_pre_submit
