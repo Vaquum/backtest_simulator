@@ -72,3 +72,18 @@ jobs:
         # two-run determinism cross-check failed.
         run: |
           .venv/bin/python -m pytest tests/golden/test_bts_sweep_canonical.py -v --tb=short
+      - name: Upload normalized run-A outputs (always)
+        # Regenerated outputs from CI's Linux Python — fetched via
+        # `gh run download` when fixtures need refreshing after an
+        # upstream sibling-lib version bump shifts byte-equal output.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-run-a-normalized
+          path: |
+            /tmp/pytest-of-runner/pytest-0/canonical_sweep_runs0/A/normalized/stdout.txt
+            /tmp/pytest-of-runner/pytest-0/canonical_sweep_runs0/A/normalized/stderr.txt
+            /tmp/pytest-of-runner/pytest-0/canonical_sweep_runs0/A/normalized/sweep_per_window.csv
+            /tmp/pytest-of-runner/pytest-0/canonical_sweep_runs0/A/normalized/sweep_per_tick.csv
+          retention-days: 14
+          if-no-files-found: warn
