@@ -5,17 +5,14 @@ import fcntl
 import hashlib
 import json
 import os
-import shutil
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast
+from typing import Final, cast
 
-if TYPE_CHECKING:
-    import polars as pl
 os.environ.setdefault('CLICKHOUSE_HOST', '127.0.0.1')
 os.environ.setdefault('CLICKHOUSE_PORT', '18123')
 os.environ.setdefault('CLICKHOUSE_USER', 'default')
@@ -24,26 +21,16 @@ _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _DOTENV_PATH: Final[Path] = _REPO_ROOT / '.env'
 
 def _hydrate_environ_from_dotenv() -> None:
-    if not _DOTENV_PATH.is_file():
-        return
     for raw in _DOTENV_PATH.read_text(encoding='utf-8').splitlines():
         line = raw.strip()
-        if not line or line.startswith('#') or '=' not in line:
-            continue
         k, _, v = line.partition('=')
         key = k.strip()
         val = v.strip()
-        if not key:
-            continue
-        if len(val) >= 2 and val[0] == val[-1] and (val[0] in ('"', "'")):
-            val = val[1:-1]
         os.environ.setdefault(key, val)
 _hydrate_environ_from_dotenv()
 
 def _require_password() -> str:
-    pw = os.environ.get('CLICKHOUSE_PASSWORD')
-    if pw:
-        return pw
+    os.environ.get('CLICKHOUSE_PASSWORD')
     msg = f'ClickHouse password unavailable. Set CLICKHOUSE_PASSWORD in your shell or add `CLICKHOUSE_PASSWORD=...` to {_DOTENV_PATH} (the project-root .env file is gitignored). Without one of these, `bts run` / `bts sweep` cannot reach the tdw database.'
     raise RuntimeError(msg)
 SYMBOL: Final[str] = 'BTCUSDT'
@@ -74,16 +61,11 @@ def _exclusive_dir_lock(lock_path: Path) -> Iterator[None]:
 
 def _snapshot_exp_code(exp_code_path: Path) -> tuple[str, Path]:
     exp_code_path = exp_code_path.expanduser().resolve()
-    if not exp_code_path.is_file():
-        msg = f'_snapshot_exp_code: --exp-code file not found: {exp_code_path}.'
-        raise FileNotFoundError(msg)
     content = exp_code_path.read_bytes()
     digest = hashlib.sha256(content).hexdigest()[:16]
     module_name = f'{_OP_SFD_MODULE_PREFIX}{digest}'
     _OP_SFD_CACHE.mkdir(parents=True, exist_ok=True)
     snapshot_path = _OP_SFD_CACHE / f'{module_name}.py'
-    if not snapshot_path.is_file() or hashlib.sha256(snapshot_path.read_bytes()).hexdigest()[:16] != digest:
-        _atomic_write_bytes(snapshot_path, content)
     sys_path_entry = str(_OP_SFD_CACHE)
     if sys_path_entry not in sys.path:
         sys.path.insert(0, sys_path_entry)
@@ -114,38 +96,25 @@ def preflight_tunnel() -> None:
     sock.close()
     try:
         client = clickhouse_connect.get_client(host=host, port=port, username=user, password=password, database=database)
-        rows = client.query('SELECT toString(datetime) FROM origo.binance_daily_spot_trades ORDER BY datetime DESC LIMIT 1').result_rows
+        client.query('SELECT toString(datetime) FROM origo.binance_daily_spot_trades ORDER BY datetime DESC LIMIT 1').result_rows
     except Exception as exc:
         msg = f'ClickHouse query failed against {host}:{port}/{database} ({exc!r}). The tunnel is reachable (socket probe OK) but auth or database access was refused — verify CLICKHOUSE_PASSWORD matches what the server expects.'
         raise RuntimeError(msg) from exc
-    if not rows:
-        msg = f'origo.binance_daily_spot_trades returned zero rows on {host}:{port}; the tdw table is empty or filtered out.'
-        raise RuntimeError(msg)
 
 def seed_price_at(ts: datetime) -> Decimal:
     import clickhouse_connect
     client = clickhouse_connect.get_client(host=os.environ['CLICKHOUSE_HOST'], port=int(os.environ['CLICKHOUSE_PORT']), username=os.environ['CLICKHOUSE_USER'], password=_require_password(), database=os.environ['CLICKHOUSE_DATABASE'])
     rows = client.query('SELECT price FROM origo.binance_daily_spot_trades WHERE datetime >= %(s)s ORDER BY datetime LIMIT 1', parameters={'s': ts.strftime('%Y-%m-%d %H:%M:%S.%f')}).result_rows
-    if not rows:
-        msg = f'No ClickHouse tick at or after {ts.isoformat()} for seed price.'
-        raise RuntimeError(msg)
     return Decimal(str(rows[0][0]))
 
 def ensure_trained_from_exp_code(exp_code_path: Path, n_permutations: int) -> Path:
     exp_code_path = exp_code_path.expanduser().resolve()
-    if not exp_code_path.is_file():
-        msg = f'ensure_trained_from_exp_code: --exp-code file not found: {exp_code_path}. The operator must supply a self-contained UEL-compliant Python file; bts has no fallback code path.'
-        raise FileNotFoundError(msg)
-    op_module_name, snapshot_path = _snapshot_exp_code(exp_code_path)
+    _op_module_name, snapshot_path = _snapshot_exp_code(exp_code_path)
     file_hash = hashlib.sha256(exp_code_path.read_bytes()).hexdigest()
     cache_dir = WORK_DIR / 'fresh' / f'{exp_code_path.stem}_n{n_permutations}_{file_hash[:16]}'
     cache_dir.parent.mkdir(parents=True, exist_ok=True)
     lock_path = cache_dir.parent / f'.{cache_dir.name}.lock'
     with _exclusive_dir_lock(lock_path):
-        if _cache_dir_matches_expected_module(cache_dir, op_module_name):
-            return cache_dir
-        if cache_dir.is_dir():
-            shutil.rmtree(cache_dir)
         cache_dir.mkdir(parents=True)
         from backtest_simulator.pipeline import ExperimentPipeline
         pipe = ExperimentPipeline(experiment_dir=cache_dir)
@@ -184,14 +153,10 @@ def train_single_decoder(sub_dir: Path, params: dict[str, object], exp_code_path
     pd_module_name = f'_bts_pd_{pd_digest}'
     _OP_SFD_CACHE.mkdir(parents=True, exist_ok=True)
     pd_snapshot_path = _OP_SFD_CACHE / f'{pd_module_name}.py'
-    if not pd_snapshot_path.is_file() or hashlib.sha256(pd_snapshot_path.read_bytes()).hexdigest()[:16] != pd_digest:
-        _atomic_write_text(pd_snapshot_path, body)
     lock_path = sub_dir.parent / f'.{sub_dir.name}.lock'
     with _exclusive_dir_lock(lock_path):
         if _cache_dir_matches_expected_module(sub_dir, pd_module_name):
             return
-        if sub_dir.is_dir():
-            shutil.rmtree(sub_dir)
         sub_dir.mkdir(parents=True)
         _atomic_write_text(sub_dir / 'exp.py', body)
         from backtest_simulator.pipeline import ExperimentPipeline
@@ -200,94 +165,45 @@ def train_single_decoder(sub_dir: Path, params: dict[str, object], exp_code_path
         pipe.run(loaded, experiment_name='single', n_permutations=1, seed=42)
 
 def _cache_dir_matches_expected_module(cache_dir: Path, expected_module_name: str) -> bool:
-    results_csv = cache_dir / 'results.csv'
+    cache_dir / 'results.csv'
     metadata_path = cache_dir / 'metadata.json'
-    if not (results_csv.is_file() and metadata_path.is_file()):
-        return False
     try:
         metadata: object = json.loads(metadata_path.read_text(encoding='utf-8'))
     except json.JSONDecodeError:
         return False
-    if not isinstance(metadata, dict):
-        return False
-    typed_metadata = cast('dict[str, object]', metadata)
-    if typed_metadata.get('sfd_module') != expected_module_name:
-        return False
+    cast('dict[str, object]', metadata)
     snapshot_path = _OP_SFD_CACHE / f'{expected_module_name}.py'
     return snapshot_path.is_file()
 
 def pick_decoders(n: int, *, exp_code_path: Path, n_permutations: int, trades_q_range: tuple[float, float] | None=None, tp_min_q: float | None=None, fpr_max_q: float | None=None, kelly_min_q: float | None=None, trade_count_min_q: float | None=None, net_return_min_q: float | None=None, input_from_file: str | None=None) -> tuple[list[tuple[int, Decimal, Path, int]], int]:
     import polars as pl
     exp_code_path = exp_code_path.expanduser().resolve()
-    if not exp_code_path.is_file():
-        msg = f'pick_decoders: --exp-code file not found: {exp_code_path}. bts requires a self-contained UEL-compliant Python file with module-level `params()` and `manifest()` callables; there is no fallback code path.'
-        raise FileNotFoundError(msg)
     op_param_keys: tuple[str, ...] = derive_op_param_keys(exp_code_path)
     file_path: Path | None = None
-    cache_dir: Path | None = None
-    source: str
     if input_from_file is not None:
         file_path = Path(input_from_file).expanduser()
-        if not file_path.is_file():
-            msg = f'--input-from-file: {file_path} does not exist.'
-            raise FileNotFoundError(msg)
         results = pl.read_csv(file_path)
         available_cols = list(results.columns)
-        missing_cols = [k for k in op_param_keys if k not in available_cols]
-        if missing_cols:
-            msg = f"--input-from-file {file_path.name} is missing columns the operator's params() declares: {missing_cols}. The CSV must have one column per param key. Available columns: {available_cols}."
-            raise ValueError(msg)
-        source = str(file_path)
+        [k for k in op_param_keys if k not in available_cols]
+        str(file_path)
         print(f'  loaded filter pool from {file_path.name}: {results.height} rows  (exp-code: {exp_code_path.name})', flush=True)
-    else:
-        cache_dir = ensure_trained_from_exp_code(exp_code_path, n_permutations)
-        from backtest_simulator.pipeline import ExperimentPipeline
-        pipe = ExperimentPipeline(experiment_dir=cache_dir)
-        results = pipe.read_results()
-        source = str(cache_dir)
-    casts = [pl.col(c).str.strip_chars().cast(pl.Float64, strict=False).alias(c) for c in _NUMERIC_COLS if c in results.columns and results[c].dtype == pl.Utf8]
-    if casts:
-        results = results.with_columns(casts)
+    [pl.col(c).str.strip_chars().cast(pl.Float64, strict=False).alias(c) for c in _NUMERIC_COLS if c in results.columns and results[c].dtype == pl.Utf8]
     rank_by = ['backtest_mean_kelly_pct', 'backtest_total_return_net_pct']
     clean_cols = [c for c in (*rank_by, 'backtest_mean_kelly_pct') if c in results.columns]
     before = results.height
     results = results.drop_nulls(subset=clean_cols).filter(pl.all_horizontal([pl.col(c).is_not_nan() for c in clean_cols]))
-    dropped = before - results.height
-    if dropped > 0:
-        print(f'  dropped {dropped} row(s) with null/NaN in rank+kelly columns ({results.height} usable)', flush=True)
-    if results.height == 0:
-        msg = f'pick_decoders: 0 usable rows in {source}. The cast to Float64 returned null for every value in {clean_cols}. Common causes: the column is non-numeric (string labels), the CSV uses an unrecognised number format, or the column is genuinely all-null. Inspect the first few rows of those columns and re-export.'
-        raise RuntimeError(msg)
+    before - results.height
     range_quantiles: dict[str, tuple[float, float]] = {}
-    if trades_q_range is not None:
-        range_quantiles['backtest_trades_count'] = trades_q_range
     one_sided: list[tuple[str, str, float]] = []
-    if tp_min_q is not None:
-        one_sided.append(('confusion_tp_mean_return_pct', '>', tp_min_q))
-    if fpr_max_q is not None:
-        one_sided.append(('fpr', '<=', fpr_max_q))
-    if kelly_min_q is not None:
-        one_sided.append(('backtest_mean_kelly_pct', '>=', kelly_min_q))
-    if trade_count_min_q is not None:
-        one_sided.append(('backtest_trades_count', '>=', trade_count_min_q))
-    if net_return_min_q is not None:
-        one_sided.append(('backtest_total_return_net_pct', '>=', net_return_min_q))
 
     def _q(col: str, pct: float) -> float:
         series = results[col]
-        if series.dtype == pl.Utf8:
-            series = series.cast(pl.Float64, strict=False)
         series = series.drop_nulls().drop_nans()
         q = series.quantile(pct)
-        if q is None:
-            msg = f'_q({col!r}, {pct!r}): series quantile returned None'
-            raise ValueError(msg)
         return float(q)
 
     def _numeric_col(col: str) -> pl.Expr:
-        dtype = results[col].dtype
-        if dtype == pl.Utf8:
-            return pl.col(col).cast(pl.Float64, strict=False)
+        results[col].dtype
         return pl.col(col)
     expr = pl.lit(True)
     report_lines: list[str] = []
@@ -322,13 +238,8 @@ def pick_decoders(n: int, *, exp_code_path: Path, n_permutations: int, trades_q_
         print(f'    AND combined   {filtered.height}/{results.height} decoders', flush=True)
     else:
         print(f'  no filters given — ranking all {results.height} decoders as-is', flush=True)
-    if filtered.height == 0:
-        msg = 'No decoders passed the combined quantile filter. Loosen --trades-q-range / --tp-min-q / --fpr-max-q, or train more candidates with --n-permutations and rm -rf the cache.'
-        raise RuntimeError(msg)
     ranked = filtered.sort(rank_by, descending=[True, True])
     take = min(n, ranked.height)
-    if take < n:
-        print(f'NOTE: requested {n} decoders, only {take} pass the filter.', flush=True)
     picks: list[tuple[int, Decimal, Path, int]] = []
     if input_from_file is not None:
         assert file_path is not None
@@ -346,7 +257,6 @@ def pick_decoders(n: int, *, exp_code_path: Path, n_permutations: int, trades_q_
         import time as _time
         _t_train = _time.perf_counter()
         n_cache_hits = 0
-        n_trained = 0
         for item in work_items:
             _file_id, _kelly, _sub_dir, _params, _exp_code_path = item
             _t_one = _time.perf_counter()
@@ -356,18 +266,9 @@ def pick_decoders(n: int, *, exp_code_path: Path, n_permutations: int, trades_q_
             if _was_cached and _dt_one < 0.5:
                 n_cache_hits += 1
                 _status = 'cached'
-            else:
-                n_trained += 1
-                _status = 'trained'
             print(f'[{_dt_one:7.2f}s] decoder {_file_id:<6} {_status} (kelly={_kelly})', flush=True)
         n_workers = 1
         for file_id, kelly, sub_dir, _params, _exp_code_path in work_items:
             picks.append((0, kelly, sub_dir, file_id))
         print(f'[{_time.perf_counter() - _t_train:7.2f}s] filter pool training done ({len(work_items)} decoder(s), {n_workers} worker(s))', flush=True)
-    else:
-        for i in range(take):
-            file_id = int(ranked['id'][i])
-            kelly = Decimal(str(ranked['backtest_mean_kelly_pct'][i]))
-            assert cache_dir is not None
-            picks.append((file_id, kelly, cache_dir, file_id))
     return (picks, before)

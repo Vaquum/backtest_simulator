@@ -29,8 +29,6 @@ class BacktestMarketDataPoller:
         return self._started
 
     def start(self) -> None:
-        if self._started:
-            return
         with self._lock:
             for kline_size in self._kline_sizes:
                 self._klines[kline_size] = self._fetch(kline_size)
@@ -44,15 +42,10 @@ class BacktestMarketDataPoller:
     def get_market_data(self, kline_size: int) -> pl.DataFrame:
         with self._lock:
             frame = self._klines.get(kline_size)
-        if frame is None or frame.is_empty():
-            return pl.DataFrame()
         now = datetime.now(UTC)
         causal = frame.filter(pl.col('datetime') <= now)
         params = self._params_by_kline_size.get(kline_size, {})
         n_rows_obj = params.get('n_rows', self._n_rows)
-        if not isinstance(n_rows_obj, int):
-            msg = f'BacktestMarketDataPoller.get_market_data: bundle n_rows for kline_size={kline_size} must be int, got {type(n_rows_obj).__name__}={n_rows_obj!r}'
-            raise TypeError(msg)
         return causal.tail(n_rows_obj)
 
     def _fetch(self, kline_size: int) -> pl.DataFrame:
@@ -60,13 +53,4 @@ class BacktestMarketDataPoller:
         params.pop('kline_size', None)
         n_rows_obj = params.pop('n_rows', self._n_rows)
         start_date_limit_obj = params.pop('start_date_limit', self._start_date_limit)
-        if params:
-            msg = f'BacktestMarketDataPoller._fetch: kline_size={kline_size} has unsupported data_source.params keys: {sorted(params)}. Limen.HistoricalData.get_spot_klines accepts only n_rows / kline_size / start_date_limit.'
-            raise ValueError(msg)
-        if not isinstance(n_rows_obj, int):
-            msg = f'BacktestMarketDataPoller._fetch: kline_size={kline_size} n_rows must be int, got {type(n_rows_obj).__name__}={n_rows_obj!r}'
-            raise TypeError(msg)
-        if not isinstance(start_date_limit_obj, str):
-            msg = f'BacktestMarketDataPoller._fetch: kline_size={kline_size} start_date_limit must be str, got {type(start_date_limit_obj).__name__}={start_date_limit_obj!r}'
-            raise TypeError(msg)
         return self._historical_data.get_spot_klines(n_rows=n_rows_obj, kline_size=kline_size, start_date_limit=start_date_limit_obj)

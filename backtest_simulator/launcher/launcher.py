@@ -221,8 +221,6 @@ def _install_capital_adapter_wrapper(adapter: VenueAdapter, tracker: CapitalLife
         if command_id is None:
             if side.name == 'SELL' and status_name in ('FILLED', 'PARTIALLY_FILLED') and result.immediate_fills:
                 _finalize_sell_close(ctx, result, client_order_id or 'unknown')
-            else:
-                _log.info('capital lifecycle: no pending command matches client_order_id=%s; pending_count=%d', client_order_id, tracker.pending_count)
             return result
         if status_name in ('REJECTED', 'EXPIRED'):
             if status_name == 'EXPIRED':

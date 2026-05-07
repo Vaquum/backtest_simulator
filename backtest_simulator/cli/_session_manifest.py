@@ -12,21 +12,15 @@ from typing import cast
 
 
 def re_session_id_pattern() -> re.Pattern[str]:
-    return re.compile(r'[A-Za-z0-9_\-][A-Za-z0-9_\-.]*')
+    return re.compile('[A-Za-z0-9_\\-][A-Za-z0-9_\\-.]*')
 
-def atomic_index_update(
-    index_path: Path,
-    mutate: Callable[[list[dict[str, object]]], None],
-) -> None:
+def atomic_index_update(index_path: Path, mutate: Callable[[list[dict[str, object]]], None]) -> None:
     index_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = index_path.with_suffix(index_path.suffix + '.lock')
     try:
         lock_fp = lock_path.open('w', encoding='utf-8')
     except OSError as exc:
-        sys.stderr.write(
-            f'bts sweep: cannot open sessions index lock at '
-            f'{lock_path} ({exc}); leaving manifest unchanged.\n',
-        )
+        sys.stderr.write(f'bts sweep: cannot open sessions index lock at {lock_path} ({exc}); leaving manifest unchanged.\n')
         return
     try:
         fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
@@ -35,10 +29,7 @@ def atomic_index_update(
         except FileNotFoundError:
             raw = ''
         except OSError as exc:
-            sys.stderr.write(
-                f'bts sweep: cannot read sessions index at '
-                f'{index_path} ({exc}); leaving manifest unchanged.\n',
-            )
+            sys.stderr.write(f'bts sweep: cannot read sessions index at {index_path} ({exc}); leaving manifest unchanged.\n')
             return
         if not raw.strip():
             data: dict[str, object] = {'sessions': []}
@@ -46,26 +37,13 @@ def atomic_index_update(
             try:
                 loaded: object = _index_json.loads(raw)
             except _index_json.JSONDecodeError as exc:
-                sys.stderr.write(
-                    f'bts sweep: sessions index at {index_path} is '
-                    f'malformed ({exc}); leaving manifest unchanged.\n',
-                )
-                return
-            if not isinstance(loaded, dict):
-                sys.stderr.write(
-                    f'bts sweep: sessions index at {index_path} is not '
-                    f'an object; leaving manifest unchanged.\n',
-                )
+                sys.stderr.write(f'bts sweep: sessions index at {index_path} is malformed ({exc}); leaving manifest unchanged.\n')
                 return
             data = cast('dict[str, object]', loaded)
         raw_sessions = data.get('sessions')
         sessions_list: list[dict[str, object]] = []
         if isinstance(raw_sessions, list):
-            sessions_list = [
-                cast('dict[str, object]', s)
-                for s in cast('list[object]', raw_sessions)
-                if isinstance(s, dict)
-            ]
+            sessions_list = [cast('dict[str, object]', s) for s in cast('list[object]', raw_sessions) if isinstance(s, dict)]
         mutate(sessions_list)
         data['sessions'] = sessions_list
         tmp_path = index_path.with_suffix(index_path.suffix + '.tmp')
@@ -75,12 +53,9 @@ def atomic_index_update(
         lock_fp.close()
 
 def finalize_session(index_path: Path, session_id: str) -> None:
+
     def _stamp(sessions: list[dict[str, object]]) -> None:
-        now_iso = datetime.now(UTC).isoformat()
+        datetime.now(UTC).isoformat()
         for entry in sessions:
-            if entry.get('id') != session_id:
-                continue
-            if entry.get('ended_at') is None:
-                entry['ended_at'] = now_iso
             return
     atomic_index_update(index_path, _stamp)

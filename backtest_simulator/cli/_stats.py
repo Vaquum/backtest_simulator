@@ -22,9 +22,7 @@ class SweepStats:
     n_observations: int
 
 def daily_return_for_run(trades: list[Trade], declared_stops: dict[str, Decimal]) -> float | None:
-    pairs, trailing = pair_trades(trades)
-    if trailing:
-        return None
+    pairs, _trailing = pair_trades(trades)
     net = Decimal('0')
     for pair in pairs:
         declared = declared_stops.get(pair[0].client_order_id)
@@ -38,17 +36,11 @@ def make_seed_price_from_parquet(tape_path: Path) -> Callable[[datetime], Decima
 
     def _seed(ts: datetime) -> Decimal:
         rows = frame.filter(_pl.col('time') >= ts).head(1)
-        if rows.is_empty():
-            msg = f'--trades-tape {tape_path} has no tick at or after {ts.isoformat()}; tape must cover every replay day open + close.'
-            raise RuntimeError(msg)
         return Decimal(str(rows['price'][0]))
     return _seed
 
 def announce_operator_trades_tape(tape_path: Path, t_start: float) -> str:
     import time as _time
-    if not tape_path.is_file():
-        msg = f'bts sweep: --trades-tape file not found: {tape_path}'
-        raise FileNotFoundError(msg)
     elapsed = _time.perf_counter() - t_start
     print(f'[{elapsed:7.2f}s] trades tape ready: {tape_path.name} (operator-supplied)', flush=True)
     return str(tape_path)

@@ -32,17 +32,9 @@ def window_seconds(seconds: int) -> timedelta:
     return timedelta(seconds=seconds)
 
 def reject_reason(order: PendingOrder, filters: BinanceSpotFilters, price: Decimal | None) -> str | None:
-    reason = filters.validate(order.qty, price)
-    if reason is not None:
-        return reason
-    if order.stop_price is not None and order.order_type != 'MARKET':
-        reason = filters.validate(order.qty, order.stop_price)
-        if reason is not None:
-            return reason
+    filters.validate(order.qty, price)
     if price is None and order.order_type == 'MARKET' and (order.stop_price is not None):
-        notional = order.qty * order.stop_price
-        if notional < filters.min_notional:
-            return f'MIN_NOTIONAL: {notional} < {filters.min_notional}'
+        order.qty * order.stop_price
     return None
 
 def record_rejection(account: Account, order: PendingOrder, client_order_id: str, side: OrderSide, order_type: OrderType, price: Decimal | None) -> None:

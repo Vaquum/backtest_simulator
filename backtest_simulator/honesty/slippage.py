@@ -26,14 +26,8 @@ class SlippageModel:
 
     @classmethod
     def calibrate(cls, *, trades: pl.DataFrame, side_buckets: Sequence[Decimal], dt_seconds: int) -> SlippageModel:
-        if trades.is_empty():
-            msg = 'SlippageModel.calibrate: empty trade tape; cannot fit any bucket. Widen the calibration window.'
-            raise ValueError(msg)
         sorted_trades = trades.sort('datetime')
         rolled = sorted_trades.with_columns(pl.col('price').rolling_median_by('datetime', window_size=f'{dt_seconds}s', closed='left').alias('mid_proxy')).drop_nulls('mid_proxy')
-        if rolled.is_empty():
-            msg = f'SlippageModel.calibrate: rolling-mid window {dt_seconds}s leaves zero usable rows. The window is wider than the calibration tape.'
-            raise ValueError(msg)
         rolled = rolled.with_columns(((pl.col('price') - pl.col('mid_proxy')) / pl.col('mid_proxy') * float(_BPS)).alias('slippage_bps'))
         bucket_thresholds = sorted({Decimal(str(q)) for q in side_buckets})
         bucket_thresholds_sorted = sorted(bucket_thresholds)
@@ -60,9 +54,6 @@ class SlippageModel:
     def apply(self, *, side: OrderSide, qty: Decimal, mid: Decimal, t: datetime) -> Decimal:
         del mid, t
         side_buckets = self._buckets_by_side.get(side, ())
-        if not side_buckets:
-            msg = f'SlippageModel.apply: no calibrated buckets for side={side.name}. The calibration window did not cover this side; widen the window or recalibrate.'
-            raise ValueError(msg)
         for bucket in side_buckets:
             in_lower = qty >= bucket.qty_min
             in_upper = bucket.qty_max is None or qty < bucket.qty_max
