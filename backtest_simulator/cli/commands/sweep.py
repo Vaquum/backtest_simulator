@@ -341,7 +341,7 @@ def _run(args: argparse.Namespace) -> int:
             impact_uncal = int(result.get('market_impact_n_uncalibrated', 0))
             impact_rejected = int(result.get('market_impact_n_rejected', 0))
             decoder_key = str(display_id)
-            table = signals_per_decoder.get(decoder_key)
+            table = signals_per_decoder[decoder_key]
             runtime_preds_list = result.get('runtime_predictions', [])
             window_expected_ticks = [t for t in tick_timestamps if window_start < t <= window_end]
             n_signals_compared = assert_signals_parity(decoder_id=decoder_key, table=table, runtime_predictions=runtime_preds_list, expected_ticks=window_expected_ticks, interval_seconds=interval_seconds)
@@ -424,8 +424,6 @@ def _build_and_save_signals_tables(picks: list[tuple[int, Decimal, Path, int]], 
                 klines_shared = cached
                 _use_cache = True
                 print(f'[{time.perf_counter() - _t_klines:7.2f}s] klines cache HIT (age={age_h:.1f}h, {cached.height} rows)', flush=True)
-    _klines_max_dt_raw: object = klines_shared['datetime'].max()
-    _klines_max_dt = _klines_max_dt_raw if _klines_max_dt_raw.tzinfo is not None else _klines_max_dt_raw.replace(tzinfo=UTC)
     tables: dict[str, SignalsTable] = {}
     _t_build_all = time.perf_counter()
     n_total = sum(len(d) for d in by_exp_dir.values())

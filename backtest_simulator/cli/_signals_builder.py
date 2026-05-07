@@ -1,8 +1,8 @@
 """Build a `SignalsTable` from a Limen experiment for one decoder via the runtime predict-recipe (sweep-time parity reference)."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from typing import Protocol
+from datetime import UTC, datetime, timedelta
+from typing import Protocol, cast
 
 import numpy as np
 import polars as pl
@@ -34,10 +34,11 @@ class _SensorProtocol(Protocol):
 
 def build_signals_table_for_decoder(*, manifest: _ManifestProtocol, sensor: _SensorProtocol, klines: pl.DataFrame, tick_timestamps: list[datetime], round_params: dict[str, object], decoder_id: str, predict_lookback: int | None=None, n_rows: int | None=None) -> SignalsTable:
     cfg = manifest.data_source_config
+    assert cfg is not None
     bar_seconds = int(str(cfg.params['kline_size']))
     split_config = (int(manifest.split_config[0]), int(manifest.split_config[1]), int(manifest.split_config[2]))
     shift_raw = round_params.get('shift')
-    label_horizon_bars = abs(shift_raw)
+    label_horizon_bars = abs(cast('int', shift_raw))
     manifest_full = manifest.with_params_override(split_config=(1, 0, 0))
     effective_lookback = 1 if predict_lookback is None else predict_lookback
     effective_n_rows = POLLER_N_ROWS if n_rows is None else n_rows
@@ -48,7 +49,7 @@ def build_signals_table_for_decoder(*, manifest: _ManifestProtocol, sensor: _Sen
         tick = _as_utc_datetime(raw_tick)
         causal = klines.filter(pl.col('datetime') <= tick).tail(effective_n_rows)
         data_dict = manifest_full.prepare_data(causal, round_params)
-        x_train_obj = data_dict.get('x_train')
+        x_train_obj = cast('pl.DataFrame', data_dict.get('x_train'))
         last_x = x_train_obj.tail(effective_lookback).to_numpy()
         result = sensor.predict({'x_test': last_x})
         preds_list.append(int(result['_preds'][-1]))
@@ -56,8 +57,8 @@ def build_signals_table_for_decoder(*, manifest: _ManifestProtocol, sensor: _Sen
         timestamps.append(tick)
     return SignalsTable.from_predictions(decoder_id=decoder_id, split_config=split_config, predictions=PredictionsInput(timestamps=timestamps, probs=np.asarray(probs_list, dtype=np.float64), preds=np.asarray(preds_list, dtype=np.int64), label_horizon_bars=label_horizon_bars, bar_seconds=bar_seconds))
 
-def _as_utc_datetime(ts: object) -> datetime:
-    return ts
+def _as_utc_datetime(ts: datetime) -> datetime:
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
 
 def _snap_runtime_to_expected(*, ts: datetime, expected_ticks: list[datetime], interval_seconds: int) -> datetime | None:
     matches = [e for e in expected_ticks if e <= ts < e + timedelta(seconds=interval_seconds)]
@@ -66,14 +67,16 @@ def _snap_runtime_to_expected(*, ts: datetime, expected_ticks: list[datetime], i
     return None
 
 def assert_signals_parity(*, decoder_id: str, table: SignalsTable, runtime_predictions: list[dict[str, object]], expected_ticks: list[datetime], interval_seconds: int) -> int:
+    del decoder_id
     set(expected_ticks)
     captured: list[datetime] = []
     n_compared = 0
     for entry in runtime_predictions:
-        ts_raw = entry['timestamp']
+        ts_raw = cast('str', entry['timestamp'])
         ts = datetime.fromisoformat(ts_raw)
         entry.get('pred')
         snapped_ts = _snap_runtime_to_expected(ts=ts, expected_ticks=expected_ticks, interval_seconds=interval_seconds)
+        assert snapped_ts is not None
         captured.append(snapped_ts)
         table.lookup(snapped_ts)
         n_compared += 1

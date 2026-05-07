@@ -147,7 +147,7 @@ def _maybe_refresh_limit_to_touch(action: Action, *, touch_provider: Callable[[s
     params['price'] = str(biased)
     return dataclasses.replace(action, execution_params=params)
 
-def _submit_translated(bindings: SubmitterBindings, strategy_id: str, action: Action) -> tuple[str, ValidationDecision, ValidationRequestContext] | None:
+def _submit_translated(bindings: SubmitterBindings, strategy_id: str, action: Action) -> tuple[str, ValidationDecision, ValidationRequestContext]:
     context = _build_context(config=bindings.nexus_config, state=bindings.state, strategy_id=strategy_id, action=action, strategy_budget=bindings.strategy_budget)
     if action.direction == OrderSide.SELL:
         decision = ValidationDecision(allowed=True)
