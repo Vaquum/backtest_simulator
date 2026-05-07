@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from nexus.strategy.predict_loop import WiredSensor
+    from nexus.startup.sequencer import WiredSensor
 
     class _FreezerFactory(Protocol):
         def move_to(self, target: datetime) -> None:

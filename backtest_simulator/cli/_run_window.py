@@ -235,8 +235,10 @@ def _child_main() -> int:
     sys.stdout.flush()
     sys.stderr.flush()
     if os.environ.get('COVERAGE_PROCESS_START'):
-        import coverage
-        _cov = coverage.Coverage.current()
+        import importlib
+        _coverage_mod = importlib.import_module('coverage')
+        _coverage_cls = cast('type', getattr(_coverage_mod, 'Coverage'))
+        _cov = _coverage_cls.current()
         if _cov is None:
             msg = (
                 'COVERAGE_PROCESS_START is set but coverage.Coverage.current() '

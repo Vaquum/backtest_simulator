@@ -43,7 +43,7 @@
   "backtest_simulator/cli/_verbosity.py": 51,
   "backtest_simulator/cli/_pipeline.py": 273,
   "backtest_simulator/cli/_metrics.py": 121,
-  "backtest_simulator/cli/_run_window.py": 233,
+  "backtest_simulator/cli/_run_window.py": 235,
   "backtest_simulator/cli/_session_manifest.py": 60,
   "backtest_simulator/cli/commands/__init__.py": 10,
   "backtest_simulator/cli/_signals_builder.py": 76,

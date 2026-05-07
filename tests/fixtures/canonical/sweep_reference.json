@@ -25,14 +25,14 @@
       "covered_branches": 29
     },
     "backtest_simulator/cli/_pipeline.py": {
-      "num_statements": 265,
-      "covered_lines": 170,
-      "num_branches": 54,
-      "covered_branches": 29
+      "num_statements": 263,
+      "covered_lines": 168,
+      "num_branches": 52,
+      "covered_branches": 28
     },
     "backtest_simulator/cli/_run_window.py": {
-      "num_statements": 205,
-      "covered_lines": 191,
+      "num_statements": 207,
+      "covered_lines": 193,
       "num_branches": 30,
       "covered_branches": 19
     },
@@ -61,8 +61,8 @@
       "covered_branches": 10
     },
     "backtest_simulator/cli/commands/sweep.py": {
-      "num_statements": 426,
-      "covered_lines": 407,
+      "num_statements": 427,
+      "covered_lines": 408,
       "num_branches": 72,
       "covered_branches": 56
     },
@@ -199,8 +199,8 @@
       "covered_branches": 0
     },
     "backtest_simulator/pipeline/bundle.py": {
-      "num_statements": 146,
-      "covered_lines": 117,
+      "num_statements": 147,
+      "covered_lines": 118,
       "num_branches": 50,
       "covered_branches": 28
     },

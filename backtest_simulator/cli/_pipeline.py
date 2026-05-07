@@ -259,35 +259,33 @@ def pick_decoders(n: int, *, exp_code_path: Path, n_permutations: int, trades_q_
     ranked = filtered.sort(rank_by, descending=[True, True])
     take = min(n, ranked.height)
     picks: list[tuple[int, Decimal, Path, int]] = []
-    if input_from_file is not None:
-        assert file_path is not None
-        work_items: list[tuple[int, Decimal, Path, dict[str, object], Path]] = []
-        for i in range(take):
-            file_id = int(ranked['id'][i])
-            kelly = Decimal(str(ranked['backtest_mean_kelly_pct'][i]))
-            row = {k: ranked[k][i] for k in op_param_keys}
-            params = row_params(row, op_param_keys)
-            exp_code_content_hash = hashlib.sha256(exp_code_path.read_bytes()).hexdigest()
-            cache_input = json.dumps({'params': {k: str(v) for k, v in sorted(params.items())}, 'exp_code_path': str(exp_code_path), 'exp_code_sha256': exp_code_content_hash}, sort_keys=True)
-            cache_hash = hashlib.sha256(cache_input.encode('utf-8')).hexdigest()
-            sub_dir = WORK_DIR / 'trained_from_file' / f'{file_path.stem}_{exp_code_path.stem}_id_{file_id}_{cache_hash}'
-            work_items.append((file_id, kelly, sub_dir, params, exp_code_path))
-        import time as _time
-        _t_train = _time.perf_counter()
-        n_cache_hits = 0
-        for item in work_items:
-            _file_id, _kelly, _sub_dir, _params, _exp_code_path = item
-            _t_one = _time.perf_counter()
-            _was_cached = _sub_dir.is_dir() and (_sub_dir / 'results.csv').is_file()
-            train_single_decoder(_sub_dir, _params, _exp_code_path, op_param_keys)
-            _dt_one = _time.perf_counter() - _t_one
-            _status = 'fresh'
-            if _was_cached and _dt_one < 0.5:
-                n_cache_hits += 1
-                _status = 'cached'
-            print(f'[{_dt_one:7.2f}s] decoder {_file_id:<6} {_status} (kelly={_kelly})', flush=True)
-        n_workers = 1
-        for file_id, kelly, sub_dir, _params, _exp_code_path in work_items:
-            picks.append((0, kelly, sub_dir, file_id))
-        print(f'[{_time.perf_counter() - _t_train:7.2f}s] filter pool training done ({len(work_items)} decoder(s), {n_workers} worker(s))', flush=True)
+    work_items: list[tuple[int, Decimal, Path, dict[str, object], Path]] = []
+    for i in range(take):
+        file_id = int(ranked['id'][i])
+        kelly = Decimal(str(ranked['backtest_mean_kelly_pct'][i]))
+        row = {k: ranked[k][i] for k in op_param_keys}
+        params = row_params(row, op_param_keys)
+        exp_code_content_hash = hashlib.sha256(exp_code_path.read_bytes()).hexdigest()
+        cache_input = json.dumps({'params': {k: str(v) for k, v in sorted(params.items())}, 'exp_code_path': str(exp_code_path), 'exp_code_sha256': exp_code_content_hash}, sort_keys=True)
+        cache_hash = hashlib.sha256(cache_input.encode('utf-8')).hexdigest()
+        sub_dir = WORK_DIR / 'trained_from_file' / f'{file_path.stem}_{exp_code_path.stem}_id_{file_id}_{cache_hash}'
+        work_items.append((file_id, kelly, sub_dir, params, exp_code_path))
+    import time as _time
+    _t_train = _time.perf_counter()
+    n_cache_hits = 0
+    for item in work_items:
+        _file_id, _kelly, _sub_dir, _params, _exp_code_path = item
+        _t_one = _time.perf_counter()
+        _was_cached = _sub_dir.is_dir() and (_sub_dir / 'results.csv').is_file()
+        train_single_decoder(_sub_dir, _params, _exp_code_path, op_param_keys)
+        _dt_one = _time.perf_counter() - _t_one
+        _status = 'fresh'
+        if _was_cached and _dt_one < 0.5:
+            n_cache_hits += 1
+            _status = 'cached'
+        print(f'[{_dt_one:7.2f}s] decoder {_file_id:<6} {_status} (kelly={_kelly})', flush=True)
+    n_workers = 1
+    for file_id, kelly, sub_dir, _params, _exp_code_path in work_items:
+        picks.append((0, kelly, sub_dir, file_id))
+    print(f'[{_time.perf_counter() - _t_train:7.2f}s] filter pool training done ({len(work_items)} decoder(s), {n_workers} worker(s))', flush=True)
     return (picks, before)

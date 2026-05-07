@@ -432,6 +432,7 @@ def _build_and_save_signals_tables(picks: list[tuple[int, Decimal, Path, int]], 
         trainer = Trainer(exp_dir, data=klines_shared)
         manifest = trainer._manifest
         klines = klines_shared
+        assert klines is not None
         sensors = trainer.train([pid for pid, _ in decoders])
         print(f'[{time.perf_counter() - _t_trainer:7.2f}s] sensors trained ({len(decoders)} decoder(s))', flush=True)
         for (perm_id, display_id), sensor in zip(decoders, sensors, strict=True):
