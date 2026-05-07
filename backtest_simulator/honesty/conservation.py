@@ -52,5 +52,5 @@ class _PrevPoolTracker:
 
 def assert_conservation(state: CapitalState, initial_pool: Decimal, *, context: str, tolerance: Decimal=Decimal('0.01')) -> None:
     del initial_pool, context, tolerance
-    totals = capital_totals(state)
+    capital_totals(state)
     _PrevPoolTracker.snapshot_and_record(state)
