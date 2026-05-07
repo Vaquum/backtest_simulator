@@ -279,7 +279,7 @@ def pick_decoders(n: int, *, exp_code_path: Path, n_permutations: int, trades_q_
         _was_cached = _sub_dir.is_dir() and (_sub_dir / 'results.csv').is_file()
         train_single_decoder(_sub_dir, _params, _exp_code_path, op_param_keys)
         _dt_one = _time.perf_counter() - _t_one
-        _status = 'fresh'
+        _status = 'trained'
         if _was_cached and _dt_one < 0.5:
             n_cache_hits += 1
             _status = 'cached'

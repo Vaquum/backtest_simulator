@@ -1,6 +1,10 @@
 """bts master CLI — `bts sweep` is the only subcommand."""
 from __future__ import annotations
 
+import os as _os
+for _k in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'BLIS_NUM_THREADS', 'NUMEXPR_NUM_THREADS', 'POLARS_MAX_THREADS', 'TOKENIZERS_PARALLELISM'):
+    _os.environ.setdefault(_k, '1')
+
 import argparse
 from typing import Final
 
