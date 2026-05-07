@@ -69,6 +69,7 @@ def fmt_price(value: Decimal) -> str:
     return f"{value.quantize(Decimal('0.01'))}"
 
 def print_run(perm_id: int, day_label: str, trades: list[Trade], declared_stops: dict[str, Decimal], *, n_intents: int=0, n_fills: int=0, n_pending: int=0, n_rejects: int=0, slippage_cost_bps: Decimal | None=None, slippage_n_samples: int=0, slippage_n_excluded: int=0, slippage_predict_vs_realised_gap_bps: Decimal | None=None, slippage_n_uncalibrated_predict: int=0, slippage_n_predicted_samples: int=0, n_limit_orders_submitted: int=0, n_limit_filled_full: int=0, n_limit_filled_partial: int=0, n_limit_filled_zero: int=0, n_limit_marketable_taker: int=0, maker_fill_efficiency_p50: Decimal | None=None, market_impact_realised_bps: Decimal | None=None, market_impact_n_samples: int=0, market_impact_n_flagged: int=0, market_impact_n_uncalibrated: int=0) -> None:
+    del n_pending, n_rejects, slippage_n_uncalibrated_predict
     pairs, trailing = pair_trades(trades)
     len(trailing)
     net_pnls: list[Decimal] = []

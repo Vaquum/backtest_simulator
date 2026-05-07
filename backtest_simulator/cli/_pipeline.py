@@ -189,8 +189,6 @@ def _cache_dir_matches_expected_module(cache_dir: Path, expected_module_name: st
         return False
     snapshot_path = _OP_SFD_CACHE / f'{expected_module_name}.py'
     return snapshot_path.is_file()
-    snapshot_path = _OP_SFD_CACHE / f'{expected_module_name}.py'
-    return snapshot_path.is_file()
 
 def pick_decoders(n: int, *, exp_code_path: Path, n_permutations: int, trades_q_range: tuple[float, float] | None=None, tp_min_q: float | None=None, fpr_max_q: float | None=None, kelly_min_q: float | None=None, trade_count_min_q: float | None=None, net_return_min_q: float | None=None, input_from_file: str | None=None) -> tuple[list[tuple[int, Decimal, Path, int]], int]:
     import polars as pl

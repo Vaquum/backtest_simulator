@@ -59,6 +59,7 @@ class MakerFillModel:
 
     @staticmethod
     def _step_one_trade(*, row: dict[str, object], order_side: str, limit: Decimal, aggressor_flag: int, queue: Decimal, remaining: Decimal) -> tuple[Decimal, Decimal, ImmediateFill | None]:
+        del order_side, aggressor_flag
         Decimal(str(row['price']))
         trade_qty = Decimal(str(row['quantity']))
         int(str(row['is_buyer_maker']))

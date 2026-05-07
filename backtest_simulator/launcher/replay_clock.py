@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
     class _FreezerFactory(Protocol):
         def move_to(self, target_datetime: datetime, /) -> None:
-            ...
+            del target_datetime
 
 _log = logging.getLogger(__name__)
 _REAL_TIME_CAP_SECONDS_DEFAULT = 600.0
