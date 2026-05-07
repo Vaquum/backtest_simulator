@@ -48,8 +48,10 @@ jobs:
         # appear in one install. uv's resolver unifies the two URLs onto
         # the same package - same path Praxis and Nexus use in their own CI.
         uses: astral-sh/setup-uv@v4
-      - name: Set up golden-sweep venv
-        run: python -m venv .venv-golden
+      - name: Set up venv
+        # Test hardcodes `_REPO_ROOT/.venv/bin/{bts,python}` — workflow
+        # honours that contract.
+        run: python -m venv .venv
       - name: Install project + integration deps
         # Editable install of `backtest_simulator` plus the `[integration]`
         # extra (Praxis / Nexus / Limen sibling libs). The canonical sweep
@@ -60,8 +62,8 @@ jobs:
         run: |
           git config --global credential.helper store
           echo "https://x-access-token:${{ secrets.SIBLING_INSTALL_TOKEN }}@github.com" > ~/.git-credentials
-          uv pip install --python .venv-golden/bin/python -e '.[integration]'
-          uv pip install --python .venv-golden/bin/python pytest
+          uv pip install --python .venv/bin/python -e '.[integration]'
+          uv pip install --python .venv/bin/python pytest
       - name: Run canonical golden sweep gate
         # No `CLICKHOUSE_*` env exported - the test asserts the sweep
         # runs end-to-end without them (`--trades-tape` short-circuits
@@ -69,4 +71,4 @@ jobs:
         # `bts sweep`'s output drifted vs the locked fixtures OR the
         # two-run determinism cross-check failed.
         run: |
-          .venv-golden/bin/python -m pytest tests/golden/test_bts_sweep_canonical.py -v --tb=short
+          .venv/bin/python -m pytest tests/golden/test_bts_sweep_canonical.py -v --tb=short
