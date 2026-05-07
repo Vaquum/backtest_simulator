@@ -25,6 +25,7 @@ def configure(verbosity: int) -> None:
         _silence_tqdm_and_structlog(level)
 
 def _silence_tqdm_and_structlog(level: int) -> None:
+    import sys
     from collections.abc import Iterable, Iterator
 
     import structlog
@@ -47,5 +48,11 @@ def _silence_tqdm_and_structlog(level: int) -> None:
             return None
         def set_postfix(self, *_: object, **__: object) -> None:
             return None
+    _real_tqdm = _tqdm.tqdm
     _tqdm.tqdm = _NoopTqdm
+    for _mod in list(sys.modules.values()):
+        if _mod is _tqdm:
+            continue
+        if getattr(_mod, 'tqdm', None) is _real_tqdm:
+            setattr(_mod, 'tqdm', _NoopTqdm)
     structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(level))
