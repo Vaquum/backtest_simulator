@@ -96,13 +96,16 @@ jobs:
         # canonical-sweep coverage flows through pr_checks_package_coverage
         # (separate workflow) using subprocess-tracking; this gate
         # measures the unit-test coverage that pytest can drive directly.
-        # Continue past pytest failures — check_coverage_floor.py is
-        # the gate, and it handles "no coverage.json" as a vacuous
-        # pass under the canonical-sweep architecture (tracked in slice).
+        # The Python wrapper around `coverage json` lets the gate handle
+        # the no-data case as a vacuous pass (under the canonical-sweep
+        # architecture, tests/tools/ doesn't import backtest_simulator,
+        # so coverage produces no data) — we don't suppress the exit
+        # of the gate itself, only of `coverage json`'s "No data to
+        # report" path.
         run: |
           .venv-lint/bin/python -m coverage run --branch --source=backtest_simulator \
-            -m pytest tests/ -q --ignore=tests/golden || true
-          .venv-lint/bin/python -m coverage json -o coverage.json || true
+            -m pytest tests/ -q --ignore=tests/golden
+          .venv-lint/bin/python -c "import subprocess as s; s.run(['coverage', 'json', '-o', 'coverage.json'], check=False)"
           .venv-lint/bin/python tools/check_coverage_floor.py
 
       - name: Budget-raise ratchet gate
