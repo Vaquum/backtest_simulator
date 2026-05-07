@@ -21,6 +21,8 @@ _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _DOTENV_PATH: Final[Path] = _REPO_ROOT / '.env'
 
 def _hydrate_environ_from_dotenv() -> None:
+    if not _DOTENV_PATH.is_file():
+        return
     for raw in _DOTENV_PATH.read_text(encoding='utf-8').splitlines():
         line = raw.strip()
         k, _, v = line.partition('=')
