@@ -134,12 +134,14 @@ class CapitalLifecycleTracker:
     def record_sent(self, command_id: str, venue_order_id: str) -> None:
         with self._lock:
             pending = self._pending.get(command_id)
+            assert pending is not None
             self._controller.send_order(pending.reservation_id, venue_order_id)
             pending.sent = True
 
     def record_ack_and_fill(self, command_id: str, venue_order_id: str, fill_notional: Decimal, fees: Decimal, *, release_residual: bool=False) -> None:
         with self._lock:
             pending = self._pending.get(command_id)
+            assert pending is not None
             if not pending.acked:
                 self._controller.order_ack(venue_order_id)
                 pending.acked = True
@@ -152,6 +154,7 @@ class CapitalLifecycleTracker:
     def record_rejection(self, command_id: str, venue_order_id: str) -> None:
         with self._lock:
             pending = self._pending.pop(command_id, None)
+            assert pending is not None
             if pending.sent:
                 self._controller.order_reject(venue_order_id)
             else:

@@ -4,21 +4,13 @@ from __future__ import annotations
 import base64
 import json
 import sqlite3
-from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import cast
 
 
 class ParityTolerance(Enum):
     STRICT = auto()
     CLOCK_NORMALIZED = auto()
-
-@dataclass(frozen=True)
-class _ParityFailure:
-    line_no: int
-    backtest_line: str
-    paper_line: str
 
 def dump_event_spine_to_jsonl(*, sqlite_path: Path, jsonl_path: Path, epoch_id: int | None=None) -> int:
     conn = sqlite3.connect(sqlite_path)
@@ -26,6 +18,8 @@ def dump_event_spine_to_jsonl(*, sqlite_path: Path, jsonl_path: Path, epoch_id: 
         conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='events'")
         if epoch_id is None:
             cursor = conn.execute('SELECT epoch_id, event_seq, timestamp, event_type, CAST(payload AS BLOB) AS payload_blob FROM events ORDER BY epoch_id, event_seq')
+        else:
+            cursor = conn.execute('SELECT epoch_id, event_seq, timestamp, event_type, CAST(payload AS BLOB) AS payload_blob FROM events WHERE epoch_id = ? ORDER BY event_seq', (epoch_id,))
         jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         count = 0
         with jsonl_path.open('w', encoding='utf-8') as f:
@@ -38,15 +32,8 @@ def dump_event_spine_to_jsonl(*, sqlite_path: Path, jsonl_path: Path, epoch_id: 
         conn.close()
 _REJECT_EVENT_TYPES = frozenset({'OrderRejected', 'OrderExpired', 'OrderCanceled', 'OrderSubmitFailed'})
 
-def _trade_outcome_is_pending(payload_blob: object) -> bool:
-    try:
-        payload_obj = json.loads(payload_blob)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return False
-    payload = cast('dict[str, object]', payload_obj)
-    return payload.get('status') == 'PENDING'
-
 def _classify_spine_event(event_type: str, payload_blob: object, counts: dict[str, int]) -> None:
+    del payload_blob
     counts['total'] += 1
     if event_type == 'OrderSubmitIntent':
         counts['intents'] += 1
@@ -61,6 +48,8 @@ def count_event_spine_events(*, sqlite_path: Path, epoch_id: int | None=None) ->
     try:
         if epoch_id is None:
             cursor = conn.execute('SELECT event_type, CAST(payload AS BLOB) FROM events')
+        else:
+            cursor = conn.execute('SELECT event_type, CAST(payload AS BLOB) FROM events WHERE epoch_id = ?', (epoch_id,))
         for event_type, payload_blob in cursor:
             _classify_spine_event(event_type, payload_blob, counts)
         return counts

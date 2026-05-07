@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import polars as pl
 import pyarrow as pa
@@ -66,7 +67,7 @@ class ClickHouseFeed:
         start_str = _format_datetime64(start)
         end_str = _format_datetime64(end)
         arrow = _query_arrow(client, query, parameters={'start': start_str, 'end': end_str})
-        frame = pl.from_arrow(arrow)
+        frame = cast('pl.DataFrame', pl.from_arrow(arrow))
         frame = frame.rename({'datetime': 'time', 'quantity': 'qty'}).with_columns(pl.col('time').cast(pl.Datetime('us', 'UTC')), pl.col('is_buyer_maker').cast(pl.Boolean), pl.col('trade_id').cast(pl.UInt64), pl.col('price').cast(pl.Float64), pl.col('qty').cast(pl.Float64))
         assert_window_causal(frame, symbol=symbol, column='time', venue_lookahead_seconds=venue_lookahead_seconds)
         return frame

@@ -42,10 +42,12 @@ class BacktestMarketDataPoller:
     def get_market_data(self, kline_size: int) -> pl.DataFrame:
         with self._lock:
             frame = self._klines.get(kline_size)
+        assert frame is not None
         now = datetime.now(UTC)
         causal = frame.filter(pl.col('datetime') <= now)
         params = self._params_by_kline_size.get(kline_size, {})
         n_rows_obj = params.get('n_rows', self._n_rows)
+        assert isinstance(n_rows_obj, int)
         return causal.tail(n_rows_obj)
 
     def _fetch(self, kline_size: int) -> pl.DataFrame:
@@ -53,4 +55,6 @@ class BacktestMarketDataPoller:
         params.pop('kline_size', None)
         n_rows_obj = params.pop('n_rows', self._n_rows)
         start_date_limit_obj = params.pop('start_date_limit', self._start_date_limit)
+        assert isinstance(n_rows_obj, int)
+        assert isinstance(start_date_limit_obj, str)
         return self._historical_data.get_spot_klines(n_rows=n_rows_obj, kline_size=kline_size, start_date_limit=start_date_limit_obj)

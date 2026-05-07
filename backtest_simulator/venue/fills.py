@@ -53,28 +53,8 @@ def _walk_market(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpot
         remaining -= take
     vwap = consumed_notional / consumed_qty
     reason = 'market_stop_halted' if stop_halted else 'market_vwap'
+    assert last_time is not None
     return [FillResult(fill_time=last_time, fill_price=filters.round_price(vwap), fill_qty=filters.round_qty(consumed_qty), is_maker=False, reason=reason)]
-
-def _walk_limit(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFilters, *, maker_model: MakerFillModel | None=None, trades_pre_submit: pl.DataFrame | None=None) -> list[FillResult]:
-    renamed = window.rename({'time': 'datetime', 'qty': 'quantity'})
-    pre = None if trades_pre_submit is None or trades_pre_submit.is_empty() else trades_pre_submit.rename({'time': 'datetime', 'qty': 'quantity'})
-    immediates = maker_model.evaluate(order=order, trades_in_window=renamed, trades_pre_submit=pre)
-    total_qty = sum((imm.fill_qty for imm in immediates), Decimal('0'))
-    total_notional = sum((imm.fill_qty * imm.fill_price for imm in immediates), Decimal('0'))
-    vwap_price = total_notional / total_qty
-    return [FillResult(fill_time=immediates[-1].fill_time, fill_price=filters.round_price(vwap_price), fill_qty=filters.round_qty(total_qty), is_maker=True, reason='limit_maker')]
-
-def _walk_limit_legacy(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFilters) -> list[FillResult]:
-    Decimal(str(window.row(0, named=True)['price']))
-    for row in window.iter_rows(named=True):
-        Decimal(str(row['price']))
-    return []
-
-def _walk_stop(order: PendingOrder, window: pl.DataFrame, filters: BinanceSpotFilters, book_gap_instrument: BookGapInstrument | None=None) -> list[FillResult]:
-    for row in window.iter_rows(named=True):
-        Decimal(str(row['price']))
-        _ts(row['time'])
-    return []
 
 def _ts(value: object) -> datetime:
     if isinstance(value, datetime):

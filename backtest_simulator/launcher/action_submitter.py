@@ -70,7 +70,7 @@ def _convert_enum_field(field_name: str, value: object) -> object:
     praxis_enum = _PRAXIS_ENUM_BY_FIELD.get(field_name)
     if praxis_enum is None or value is None or isinstance(value, praxis_enum):
         return value
-    name = getattr(value, 'name', None)
+    name = cast('str', getattr(value, 'name', None))
     try:
         return praxis_enum[name]
     except KeyError:
@@ -138,11 +138,16 @@ def build_action_submitter(bindings: SubmitterBindings, *, on_reservation: Reser
 def _maybe_refresh_limit_to_touch(action: Action, *, touch_provider: Callable[[str], Decimal | None] | None, tick_provider: Callable[[str], Decimal] | None) -> Action:
     if action.order_type is None or action.order_type.name != 'LIMIT':
         return action
+    if touch_provider is None or tick_provider is None or action.direction is None:
+        return action
     params = dict(action.execution_params or {})
     symbol_raw = params.get('symbol')
-    symbol = symbol_raw if isinstance(symbol_raw, str) else None
-    touch = touch_provider(symbol)
-    tick = tick_provider(symbol)
+    if not isinstance(symbol_raw, str):
+        return action
+    touch = touch_provider(symbol_raw)
+    if touch is None:
+        return action
+    tick = tick_provider(symbol_raw)
     biased = touch - tick if action.direction.name == 'BUY' else touch + tick
     params['price'] = str(biased)
     return dataclasses.replace(action, execution_params=params)
@@ -162,9 +167,6 @@ def _submit_translated(bindings: SubmitterBindings, strategy_id: str, action: Ac
     command_id = bindings.praxis_outbound.send_command(cmd)
     _log.info('backtest action submitted', extra={'strategy_id': strategy_id, 'action_type': action.action_type.value, 'command_id': command_id, 'reservation_id': decision.reservation.reservation_id if decision.reservation else None})
     return (command_id, decision, context)
-
-def _submit_abort(praxis_outbound: PraxisOutbound, config: NexusInstanceConfig, strategy_id: str, action: Action) -> None:
-    praxis_outbound.send_abort(command_id=action.command_id, account_id=config.account_id, reason='backtest_runtime_abort', created_at=datetime.now(UTC))
 
 def _build_context(*, config: NexusInstanceConfig, state: InstanceState, strategy_id: str, action: Action, strategy_budget: Decimal) -> ValidationRequestContext:
     symbol = _extract_symbol(action)

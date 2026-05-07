@@ -11,7 +11,9 @@ from typing import TYPE_CHECKING, Protocol
 if TYPE_CHECKING:
     from nexus.strategy.predict_loop import WiredSensor
 
-    _FreezerFactory = Callable[[datetime], object]
+    class _FreezerFactory(Protocol):
+        def move_to(self, target: datetime) -> None:
+            ...
 
 _log = logging.getLogger(__name__)
 _REAL_TIME_CAP_SECONDS_DEFAULT = 600.0
@@ -56,6 +58,7 @@ class ReplayClock:
         intervals: set[int] = set()
         for wired in wired_sensors:
             interval = getattr(wired, 'interval_seconds', None)
+            assert interval is not None
             intervals.add(int(interval))
         interval_seconds = next(iter(intervals))
         boundaries = compute_kline_boundaries(window_start=window_start, window_end=window_end, interval_seconds=interval_seconds)
