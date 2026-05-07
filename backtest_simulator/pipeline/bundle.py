@@ -17,7 +17,7 @@ import limen
 from limen.experiment import Manifest as LimenManifest
 from limen.experiment.manifest_core import DataSourceConfig
 
-__all__ = ['extract_bundle', 'BundleSpec', 'materialize_bundle_for_cli', 'materialize_bundle_on_args', '_override_data_source', 'N_PERMUTATIONS_DEFAULT']
+__all__ = ['N_PERMUTATIONS_DEFAULT', 'BundleSpec', '_override_data_source', 'extract_bundle', 'materialize_bundle_for_cli', 'materialize_bundle_on_args']
 
 _RUNTIME_BODY_MARKERS: frozenset[str] = frozenset({'HistoricalData', 'get_spot_klines', 'UniversalExperimentLoop', 'run'})
 
