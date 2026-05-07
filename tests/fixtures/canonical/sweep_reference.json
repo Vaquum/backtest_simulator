@@ -19,8 +19,8 @@
       "covered_branches": 2
     },
     "backtest_simulator/cli/_metrics.py": {
-      "num_statements": 113,
-      "covered_lines": 107,
+      "num_statements": 114,
+      "covered_lines": 108,
       "num_branches": 36,
       "covered_branches": 29
     },
@@ -127,7 +127,7 @@
       "covered_branches": 12
     },
     "backtest_simulator/honesty/maker_fill.py": {
-      "num_statements": 57,
+      "num_statements": 58,
       "covered_lines": 26,
       "num_branches": 8,
       "covered_branches": 0
