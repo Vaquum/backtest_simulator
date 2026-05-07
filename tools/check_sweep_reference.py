@@ -21,8 +21,14 @@ from typing import Final
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 SNAPSHOT: Final[Path] = REPO_ROOT / 'tests' / 'fixtures' / 'canonical' / 'sweep_reference.json'
 FIXTURES: Final[Path] = REPO_ROOT / 'tests' / 'fixtures' / 'canonical'
-PYTHON: Final[Path] = REPO_ROOT / '.venv' / 'bin' / 'python'
-BTS: Final[Path] = REPO_ROOT / '.venv' / 'bin' / 'bts'
+PYTHON: Final[Path] = Path(sys.executable)
+_BTS_RESOLVED: Final[str | None] = shutil.which('bts')
+if _BTS_RESOLVED is None:
+    raise RuntimeError(
+        'bts binary not found on PATH. Install the package '
+        '(`uv pip install -e .[integration]`) before running this gate.'
+    )
+BTS: Final[Path] = Path(_BTS_RESOLVED)
 
 
 def _classify(coverage_json: dict) -> dict:
