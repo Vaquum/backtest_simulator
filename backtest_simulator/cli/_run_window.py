@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from backtest_simulator.honesty.maker_fill import MakerFillModel
     from backtest_simulator.honesty.slippage import SlippageModel
 
-from backtest_simulator.cli._pipeline import SYMBOL, WORK_DIR, op_sfd_pythonpath
+from backtest_simulator.cli._pipeline import SYMBOL, WORK_DIR, op_sfd_pythonpath, seed_price_at
 
 
 def _effective_kelly_pct_for_allocation(kelly_pct: Decimal, max_allocation_per_trade_pct: Decimal | None) -> Decimal:
@@ -107,6 +107,8 @@ def run_window_in_process(perm_id: int, kelly_pct: Decimal, window_start: dateti
     if trades_parquet_path is not None:
         from backtest_simulator.cli._stats import make_seed_price_from_parquet
         seed_price = make_seed_price_from_parquet(Path(trades_parquet_path))(window_start)
+    else:
+        seed_price = seed_price_at(window_start)
     suffix_id = perm_id if display_id is None else display_id
     suffix = f'{suffix_id}_{window_start.date().isoformat()}'
     work = _fresh_work_dir(suffix)
@@ -119,6 +121,8 @@ def run_window_in_process(perm_id: int, kelly_pct: Decimal, window_start: dateti
     feed: ClickHouseFeed | InMemoryTradesFeed
     if trades_parquet_path is not None:
         feed = InMemoryTradesFeed(_pl_mod.read_parquet(trades_parquet_path).set_sorted('time'), symbol=SYMBOL)
+    else:
+        feed = ClickHouseFeed(config=ClickHouseConfig.from_env(), symbol=SYMBOL)
     slippage_model = _calibrate_slippage(feed, window_start)
     maker_fill_model = _calibrate_maker_fill(feed, window_start) if maker_preference else None
     adapter = SimulatedVenueAdapter(feed=feed, filters=BinanceSpotFilters.binance_spot(SYMBOL), fees=FeeSchedule(), trade_window_seconds=min(interval_seconds, 600), window_end_clamp=window_end, slippage_model=slippage_model, maker_fill_model=maker_fill_model, market_impact_bucket_minutes=1, market_impact_threshold_fraction=Decimal('0.1'), strict_impact_policy=strict_impact)
